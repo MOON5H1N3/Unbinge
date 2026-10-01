@@ -36,7 +36,8 @@ def inject_shared_template_context():
     else:
         tab = None
     return {'app_version': APP_VERSION, 'active_tab': tab, 'dry_run_active': get_setting('dry_run', '0') == '1',
-            'csrf_token': session.get('csrf_token', ''), 'auth_is_enabled': auth_enabled()}
+            'csrf_token': session.get('csrf_token', ''), 'auth_is_enabled': auth_enabled(),
+            'theme_preference': get_setting('theme_preference', 'auto')}
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +464,7 @@ def init_db():
         'auto_backup_enabled': '0',
         'backup_retention_count': '7',
         'last_auto_backup': '',
+        'theme_preference': 'auto',
     }
     for k, v in defaults.items():
         cursor.execute(f"INSERT OR IGNORE INTO {SETTINGS_TABLE} (key, value) VALUES (?, ?)", (k, v))
@@ -3697,6 +3699,10 @@ def settings_page():
         set_setting('notify_on_failure', '1' if request.form.get('notify_on_failure') == 'on' else '0')
         set_setting('notify_on_missed_run', '1' if request.form.get('notify_on_missed_run') == 'on' else '0')
         set_setting('auto_backup_enabled', '1' if request.form.get('auto_backup_enabled') == 'on' else '0')
+        theme_pref = request.form.get('theme_preference', 'auto')
+        if theme_pref not in ('auto', 'dark', 'light'):
+            theme_pref = 'auto'
+        set_setting('theme_preference', theme_pref)
         try:
             retention = max(1, min(int(request.form.get('backup_retention_count', 7)), 90))
         except (TypeError, ValueError):
@@ -3741,6 +3747,7 @@ def settings_page():
         'auto_backup_enabled': get_setting('auto_backup_enabled', '0') == '1',
         'backup_retention_count': get_setting('backup_retention_count', '7'),
         'last_auto_backup': get_setting('last_auto_backup', ''),
+        'theme_preference': get_setting('theme_preference', 'auto'),
     }
     discord_configured = bool(parse_discord_webhook(settings['discord_webhook_url']))
     discord_message_live = discord_configured and bool(get_setting('schedule_message_id', '').strip())

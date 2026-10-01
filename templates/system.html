@@ -16,7 +16,7 @@
 
 {% block content %}
 <div class="page-header">
-    <h1>system</h1>
+    <h1 class="mast">system</h1>
     <span class="pill {{ 'pill-complete' if overall == 'ok' else ('pill-partial' if overall == 'warn' else 'pill-missing') }}">
         {{ 'all ok' if overall == 'ok' else ('needs attention' if overall == 'warn' else 'error') }}
     </span>

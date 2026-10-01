@@ -4,7 +4,7 @@
 
 {% block content %}
 <div class="page-header">
-    <h1>settings</h1>
+    <h1 class="mast">settings</h1>
 </div>
 
 <div class="panel">
@@ -27,6 +27,16 @@
 
 <form method="POST">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="panel">
+        <h2>{{ icon('image', 14) }}appearance</h2>
+        <p class="panel-hint">auto follows your system's light/dark setting; dark and light override it.</p>
+        <div class="day-checks">
+            <label><input type="radio" name="theme_preference" value="auto" {% if settings.theme_preference == 'auto' %}checked{% endif %}> auto</label>
+            <label><input type="radio" name="theme_preference" value="dark" {% if settings.theme_preference == 'dark' %}checked{% endif %}> dark</label>
+            <label><input type="radio" name="theme_preference" value="light" {% if settings.theme_preference == 'light' %}checked{% endif %}> light</label>
+        </div>
+    </div>
+
     <div class="panel">
         <h2>{{ icon('clock', 14) }}drip schedule</h2>
         <div class="field-row">

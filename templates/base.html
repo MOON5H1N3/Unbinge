@@ -1,16 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en"{% if theme_preference == 'dark' %} data-theme="dark"{% elif theme_preference == 'light' %} data-theme="light"{% endif %}>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Unbinge{% endblock %}</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%233AA6D6%22 stroke-width=%222%22><path d=%22M12 2.5C9 6.5 5.5 10.5 5.5 14.5a6.5 6.5 0 0 0 13 0C18.5 10.5 15 6.5 12 2.5z%22/></svg>">
-    <meta name="theme-color" content="#14161C">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%23D98A4B%22 stroke-width=%222%22><path d=%22M12 2.5C9 6.5 5.5 10.5 5.5 14.5a6.5 6.5 0 0 0 13 0C18.5 10.5 15 6.5 12 2.5z%22/></svg>">
+    <meta name="theme-color" content="#15120F">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,500;0,600;1,500&family=Work+Sans:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     {% block extra_head %}{% endblock %}
 </head>
 <body>
-{% from "icons.html" import icon %}
+{% from "icons.html" import icon, logo_mark %}
 <div class="app-shell">
     <button type="button" class="sidebar-toggle" onclick="document.querySelector('.sidebar').classList.toggle('open')" aria-label="Toggle menu">
         {{ icon('menu', 18) }}
@@ -18,8 +20,8 @@
 
     <nav class="sidebar">
         <div class="sidebar-header">
-            {{ icon('droplet', 20) }}
-            <span class="wordmark">Unbinge</span>
+            {{ logo_mark(20) }}
+            <span class="wordmark mast">Unbinge</span>
             <span class="version">v{{ app_version }}</span>
         </div>
         <div class="sidebar-nav">
