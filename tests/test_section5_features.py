@@ -18,7 +18,7 @@ from contextlib import closing
 from datetime import timedelta
 from unittest.mock import patch, MagicMock
 
-import app as driparr
+import app as unbinge
 
 # The harness fixture in conftest.py stubs send_notification to a no-op for
 # every test, to stop any test from accidentally firing a real webhook. That's
@@ -26,7 +26,7 @@ import app as driparr
 # send_notification's OWN embed logic, need the real implementation. Captured
 # here, at import time, before any fixture has a chance to patch the module
 # attribute.
-_REAL_SEND_NOTIFICATION = driparr.send_notification
+_REAL_SEND_NOTIFICATION = unbinge.send_notification
 
 
 # ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ def test_dry_run_does_not_move_files(harness, client):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    driparr.set_setting('dry_run', '1')
-    driparr.run_drip_job(force_show_id=show_id)
+    unbinge.set_setting('dry_run', '1')
+    unbinge.run_drip_job(force_show_id=show_id)
 
     assert harness.episode_tags(harness.vault / 'Test Show') == {(1, 1)}, \
         "dry run must not move the file"
@@ -51,11 +51,11 @@ def test_dry_run_does_not_mark_episodes_dripped(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    driparr.set_setting('dry_run', '1')
-    driparr.run_drip_job(force_show_id=show_id)
+    unbinge.set_setting('dry_run', '1')
+    unbinge.run_drip_job(force_show_id=show_id)
 
-    with closing(driparr.get_db()) as conn:
-        assert driparr.get_dripped_set(conn, show_id) == set()
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.get_dripped_set(conn, show_id) == set()
 
 
 def test_dry_run_result_is_labelled(harness):
@@ -63,8 +63,8 @@ def test_dry_run_result_is_labelled(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    driparr.set_setting('dry_run', '1')
-    outcome = driparr.run_drip_job(force_show_id=show_id)
+    unbinge.set_setting('dry_run', '1')
+    outcome = unbinge.run_drip_job(force_show_id=show_id)
 
     assert outcome['ran'], "a dry run should still report what it WOULD do"
     _id, _name, result = outcome['ran'][0]
@@ -76,10 +76,10 @@ def test_disabling_dry_run_allows_real_drips_again(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    driparr.set_setting('dry_run', '1')
-    driparr.run_drip_job(force_show_id=show_id)
-    driparr.set_setting('dry_run', '0')
-    driparr.run_drip_job(force_show_id=show_id)
+    unbinge.set_setting('dry_run', '1')
+    unbinge.run_drip_job(force_show_id=show_id)
+    unbinge.set_setting('dry_run', '0')
+    unbinge.run_drip_job(force_show_id=show_id)
 
     assert harness.episode_tags(harness.plex / 'Test Show') == {(1, 1)}, \
         "a real drip after disabling dry run should actually move the file"
@@ -93,7 +93,7 @@ def test_run_drip_job_summary_matches_dry_run_state(harness, client):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    driparr.set_setting('dry_run', '1')
+    unbinge.set_setting('dry_run', '1')
     resp = client.post('/api/run-drip')
     message = resp.get_json()['message'].lower()
     assert 'dry run' in message or 'previewed' in message, \
@@ -105,34 +105,34 @@ def test_run_drip_job_summary_matches_dry_run_state(harness, client):
 # ---------------------------------------------------------------------------
 
 def test_no_notice_when_never_run(harness):
-    assert driparr.detect_missed_run() is None
+    assert unbinge.detect_missed_run() is None
 
 
 def test_no_notice_shortly_after_a_run(harness):
-    driparr.set_setting('last_job_run', driparr.now_local().isoformat())
-    assert driparr.detect_missed_run() is None
+    unbinge.set_setting('last_job_run', unbinge.now_local().isoformat())
+    assert unbinge.detect_missed_run() is None
 
 
 def test_notice_appears_after_a_long_gap(harness):
-    old = (driparr.now_local() - timedelta(hours=40)).isoformat()
-    driparr.set_setting('last_job_run', old)
-    notice = driparr.detect_missed_run()
+    old = (unbinge.now_local() - timedelta(hours=40)).isoformat()
+    unbinge.set_setting('last_job_run', old)
+    notice = unbinge.detect_missed_run()
     assert notice is not None
     assert 'day' in notice.lower()
 
 
 def test_notice_clears_after_a_fresh_run(harness):
-    old = (driparr.now_local() - timedelta(hours=40)).isoformat()
-    driparr.set_setting('last_job_run', old)
-    assert driparr.detect_missed_run() is not None
+    old = (unbinge.now_local() - timedelta(hours=40)).isoformat()
+    unbinge.set_setting('last_job_run', old)
+    assert unbinge.detect_missed_run() is not None
 
-    driparr.set_setting('last_job_run', driparr.now_local().isoformat())
-    assert driparr.detect_missed_run() is None
+    unbinge.set_setting('last_job_run', unbinge.now_local().isoformat())
+    assert unbinge.detect_missed_run() is None
 
 
 def test_missed_run_banner_renders_on_dashboard(harness, client):
-    old = (driparr.now_local() - timedelta(hours=40)).isoformat()
-    driparr.set_setting('last_job_run', old)
+    old = (unbinge.now_local() - timedelta(hours=40)).isoformat()
+    unbinge.set_setting('last_job_run', old)
     resp = client.get('/')
     assert b'may have been missed' in resp.data
 
@@ -142,7 +142,7 @@ def test_missed_run_banner_renders_on_dashboard(harness, client):
 # ---------------------------------------------------------------------------
 
 def test_nothing_undoable_before_any_drip(harness):
-    assert driparr.get_undoable_drip() is None
+    assert unbinge.get_undoable_drip() is None
 
 
 def test_undo_moves_the_file_back(harness, drip):
@@ -151,10 +151,10 @@ def test_undo_moves_the_file_back(harness, drip):
     show_id = harness.add_show('Test Show')
     drip(show_id)
 
-    undoable = driparr.get_undoable_drip()
+    undoable = unbinge.get_undoable_drip()
     assert undoable is not None and undoable['show_name'] == 'Test Show'
 
-    ok, _msg = driparr.undo_drip(undoable['id'])
+    ok, _msg = unbinge.undo_drip(undoable['id'])
     assert ok
     assert harness.episode_tags(harness.vault / 'Test Show') == {(1, 1)}
     assert harness.episode_tags(harness.plex / 'Test Show') == set()
@@ -166,11 +166,11 @@ def test_undo_clears_the_dripped_marker(harness, drip):
     show_id = harness.add_show('Test Show')
     drip(show_id)
 
-    undoable = driparr.get_undoable_drip()
-    driparr.undo_drip(undoable['id'])
+    undoable = unbinge.get_undoable_drip()
+    unbinge.undo_drip(undoable['id'])
 
-    with closing(driparr.get_db()) as conn:
-        assert driparr.get_dripped_set(conn, show_id) == set()
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.get_dripped_set(conn, show_id) == set()
 
 
 def test_redrip_works_cleanly_after_undo(harness, drip):
@@ -178,7 +178,7 @@ def test_redrip_works_cleanly_after_undo(harness, drip):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show')
     drip(show_id)
-    driparr.undo_drip(driparr.get_undoable_drip()['id'])
+    unbinge.undo_drip(unbinge.get_undoable_drip()['id'])
 
     drip(show_id)
 
@@ -191,11 +191,11 @@ def test_second_undo_reports_nothing_to_undo(harness, drip):
     show_id = harness.add_show('Test Show')
     drip(show_id)
 
-    first = driparr.get_undoable_drip()
-    driparr.undo_drip(first['id'])
+    first = unbinge.get_undoable_drip()
+    unbinge.undo_drip(first['id'])
 
-    assert driparr.get_undoable_drip() is None
-    ok, msg = driparr.undo_drip(first['id'])
+    assert unbinge.get_undoable_drip() is None
+    ok, msg = unbinge.undo_drip(first['id'])
     assert not ok
     assert 'already' in msg.lower() or 'nothing' in msg.lower()
 
@@ -211,8 +211,8 @@ def test_undo_reopens_cooldown_if_that_drip_emptied_the_vault(harness, drip):
 
     # The undoable drip is still the original episode move (cooldown itself
     # isn't a 'dripped' action, so it's not what get_undoable_drip returns).
-    undoable = driparr.get_undoable_drip()
-    driparr.undo_drip(undoable['id'])
+    undoable = unbinge.get_undoable_drip()
+    unbinge.undo_drip(undoable['id'])
 
     assert harness.get_show(show_id)['completed_at'] is None, \
         "undoing the drip that emptied the vault should reopen cooldown"
@@ -223,11 +223,11 @@ def test_undo_refuses_for_a_deleted_show(harness, client, drip):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show')
     drip(show_id)
-    undoable = driparr.get_undoable_drip()
+    undoable = unbinge.get_undoable_drip()
 
     client.post(f'/delete/{show_id}')
 
-    ok, msg = driparr.undo_drip(undoable['id'])
+    ok, msg = unbinge.undo_drip(undoable['id'])
     assert not ok
     assert 'no longer active' in msg.lower() or 'deleted' in msg.lower() or 'graduated' in msg.lower()
 
@@ -262,24 +262,24 @@ def test_tvdb_test_connection_uses_form_value_not_saved_setting(harness, client)
     """Regression guard: Test Connection originally read the saved setting,
     not the live form field, so a typed-but-unsaved key silently tested an
     empty string with zero corresponding log output."""
-    assert driparr.get_setting('tvdb_api_key', '') == ''
+    assert unbinge.get_setting('tvdb_api_key', '') == ''
 
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.json = lambda: {'data': {'token': 'test.token'}}
 
-    with patch.object(driparr.requests, 'post', return_value=mock_resp) as mock_post:
+    with patch.object(unbinge.requests, 'post', return_value=mock_resp) as mock_post:
         resp = client.post('/api/test-tvdb', data={'tvdb_api_key': 'typed-not-saved', 'tvdb_pin': ''})
         assert resp.status_code == 200
         assert mock_post.call_args.kwargs['json']['apikey'] == 'typed-not-saved'
 
     # Testing must not have side effects on saved settings
-    assert driparr.get_setting('tvdb_api_key', '') == ''
-    assert driparr.get_setting('tvdb_token', '') == ''
+    assert unbinge.get_setting('tvdb_api_key', '') == ''
+    assert unbinge.get_setting('tvdb_token', '') == ''
 
 
 def test_tvdb_search_parses_mocked_results(harness, client):
-    driparr.set_setting('tvdb_api_key', 'fake-key')
+    unbinge.set_setting('tvdb_api_key', 'fake-key')
     mock_login = MagicMock()
     mock_login.raise_for_status = lambda: None
     mock_login.json = lambda: {'data': {'token': 'fake.token'}}
@@ -288,8 +288,8 @@ def test_tvdb_search_parses_mocked_results(harness, client):
     mock_search.json = lambda: {'data': [
         {'tvdb_id': '999', 'name': 'Mocked Show', 'year': '2021', 'image_url': 'http://example/x.jpg'},
     ]}
-    with patch.object(driparr.requests, 'post', return_value=mock_login), \
-         patch.object(driparr.requests, 'get', return_value=mock_search):
+    with patch.object(unbinge.requests, 'post', return_value=mock_login), \
+         patch.object(unbinge.requests, 'get', return_value=mock_search):
         resp = client.get('/api/tvdb-search?q=Mocked')
         data = resp.get_json()
         assert data['status'] == 'success'
@@ -299,7 +299,7 @@ def test_tvdb_search_parses_mocked_results(harness, client):
 
 def test_tvdb_link_stores_poster_and_id(harness, client):
     show_id = harness.add_show('Test Show')
-    driparr.set_setting('tvdb_api_key', 'fake-key')
+    unbinge.set_setting('tvdb_api_key', 'fake-key')
 
     mock_login = MagicMock()
     mock_login.raise_for_status = lambda: None
@@ -319,8 +319,8 @@ def test_tvdb_link_stores_poster_and_id(harness, client):
     mock_image.raise_for_status = lambda: None
     mock_image.iter_content = lambda chunk_size: [b'\xff\xd8\xff\xe0FAKE']
 
-    with patch.object(driparr.requests, 'post', return_value=mock_login), \
-         patch.object(driparr.requests, 'get', side_effect=[mock_series, mock_episodes, mock_image]):
+    with patch.object(unbinge.requests, 'post', return_value=mock_login), \
+         patch.object(unbinge.requests, 'get', side_effect=[mock_series, mock_episodes, mock_image]):
         resp = client.post(f'/api/tvdb-link/{show_id}', data={'tvdb_id': '555'})
         data = resp.get_json()
         assert data['status'] == 'success'
@@ -329,29 +329,29 @@ def test_tvdb_link_stores_poster_and_id(harness, client):
         assert data['poster_url'].startswith('/posters/')
         assert '0' not in data['season_episode_counts'], "specials must be excluded"
 
-    with closing(driparr.get_db()) as conn:
-        row = conn.execute(f"SELECT tvdb_id, poster_url FROM {driparr.TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
+    with closing(unbinge.get_db()) as conn:
+        row = conn.execute(f"SELECT tvdb_id, poster_url FROM {unbinge.TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
     assert row['tvdb_id'] == 555
     assert row['poster_url'].startswith('/posters/')
 
 
 def test_tvdb_unlink_clears_both_fields(harness, client):
     show_id = harness.add_show('Test Show')
-    with closing(driparr.get_db()) as conn:
-        conn.execute(f"UPDATE {driparr.TABLE_NAME} SET tvdb_id = 1, poster_url = 'x' WHERE id = ?", (show_id,))
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 1, poster_url = 'x' WHERE id = ?", (show_id,))
         conn.commit()
 
     client.post(f'/api/tvdb-unlink/{show_id}')
 
-    with closing(driparr.get_db()) as conn:
-        row = conn.execute(f"SELECT tvdb_id, poster_url FROM {driparr.TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
+    with closing(unbinge.get_db()) as conn:
+        row = conn.execute(f"SELECT tvdb_id, poster_url FROM {unbinge.TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
     assert row['tvdb_id'] is None and row['poster_url'] is None
 
 
 def test_dashboard_renders_linked_poster(harness, client):
     show_id = harness.add_show('Test Show')
-    with closing(driparr.get_db()) as conn:
-        conn.execute(f"UPDATE {driparr.TABLE_NAME} SET poster_url = ? WHERE id = ?",
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET poster_url = ? WHERE id = ?",
                      ('http://example/mypic.jpg', show_id))
         conn.commit()
 
@@ -372,7 +372,7 @@ def test_sonarr_not_configured_fails_cleanly(harness, client):
 def test_sonarr_test_connection_mocked_success(harness, client):
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
         resp = client.post('/api/test-sonarr', data={
             'sonarr_url': 'http://fake-sonarr:8989', 'sonarr_api_key': 'fake-key',
         })
@@ -380,8 +380,8 @@ def test_sonarr_test_connection_mocked_success(harness, client):
 
 
 def test_sonarr_get_series_excludes_specials(harness):
-    driparr.set_setting('sonarr_url', 'http://fake-sonarr:8989')
-    driparr.set_setting('sonarr_api_key', 'fake-key')
+    unbinge.set_setting('sonarr_url', 'http://fake-sonarr:8989')
+    unbinge.set_setting('sonarr_api_key', 'fake-key')
 
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
@@ -392,8 +392,8 @@ def test_sonarr_get_series_excludes_specials(harness):
             {'seasonNumber': 1, 'statistics': {'totalEpisodeCount': 10}},
         ],
     }]
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        details, err = driparr.sonarr_get_series(555)
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        details, err = unbinge.sonarr_get_series(555)
         assert err is None
         assert details['season_episode_counts'] == {1: 10}
 
@@ -409,19 +409,19 @@ def test_cache_poster_locally_downloads_and_saves(harness):
     mock_resp.raise_for_status = lambda: None
     mock_resp.iter_content = lambda chunk_size: [fake_bytes]
 
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        local_url = driparr.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        local_url = unbinge.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
 
     assert local_url.startswith('/posters/')
-    cached_path = os.path.join(driparr.POSTERS_DIR, os.path.basename(local_url))
+    cached_path = os.path.join(unbinge.POSTERS_DIR, os.path.basename(local_url))
     assert os.path.isfile(cached_path)
     assert open(cached_path, 'rb').read() == fake_bytes
 
 
 def test_cache_poster_locally_falls_back_on_failure(harness):
     show_id = harness.add_show('Test Show')
-    with patch.object(driparr.requests, 'get', side_effect=driparr.requests.RequestException("boom")):
-        result = driparr.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
+    with patch.object(unbinge.requests, 'get', side_effect=unbinge.requests.RequestException("boom")):
+        result = unbinge.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
     assert result == 'http://example.com/poster.jpg', \
         "a failed download should fall back to the original hotlink, not lose the poster entirely"
 
@@ -432,8 +432,8 @@ def test_cached_poster_is_served_by_its_route(harness, client):
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.iter_content = lambda chunk_size: [fake_bytes]
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        local_url = driparr.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        local_url = unbinge.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
 
     resp = client.get(local_url)
     assert resp.status_code == 200
@@ -445,19 +445,19 @@ def test_delete_cached_poster_removes_the_file(harness):
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.iter_content = lambda chunk_size: [b'x']
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        local_url = driparr.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
-    cached_path = os.path.join(driparr.POSTERS_DIR, os.path.basename(local_url))
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        local_url = unbinge.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
+    cached_path = os.path.join(unbinge.POSTERS_DIR, os.path.basename(local_url))
     assert os.path.isfile(cached_path)
 
-    driparr.delete_cached_poster(local_url)
+    unbinge.delete_cached_poster(local_url)
     assert not os.path.isfile(cached_path)
 
 
 def test_delete_cached_poster_ignores_hotlink_urls(harness):
     """A poster that failed to cache (still a raw hotlink) shouldn't cause
     delete_cached_poster to try deleting something that isn't a local file."""
-    driparr.delete_cached_poster('http://example.com/never-cached.jpg')  # must not raise
+    unbinge.delete_cached_poster('http://example.com/never-cached.jpg')  # must not raise
 
 
 def test_unlinking_a_show_removes_its_cached_poster_file(harness, client):
@@ -465,12 +465,12 @@ def test_unlinking_a_show_removes_its_cached_poster_file(harness, client):
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.iter_content = lambda chunk_size: [b'x']
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        local_url = driparr.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
-    with closing(driparr.get_db()) as conn:
-        conn.execute(f"UPDATE {driparr.TABLE_NAME} SET poster_url = ? WHERE id = ?", (local_url, show_id))
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        local_url = unbinge.cache_poster_locally(show_id, 'http://example.com/poster.jpg')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET poster_url = ? WHERE id = ?", (local_url, show_id))
         conn.commit()
-    cached_path = os.path.join(driparr.POSTERS_DIR, os.path.basename(local_url))
+    cached_path = os.path.join(unbinge.POSTERS_DIR, os.path.basename(local_url))
 
     client.post(f'/api/tvdb-unlink/{show_id}')
 
@@ -486,7 +486,7 @@ def test_inspect_warns_when_show_exceeds_free_space(harness, client):
     show.mkdir(parents=True)
     (show / 'BigShow - S01E01.mkv').write_bytes(b'x' * 5000)
 
-    with patch.object(driparr.shutil, 'disk_usage', return_value=type('D', (), {'free': 1000})()):
+    with patch.object(unbinge.shutil, 'disk_usage', return_value=type('D', (), {'free': 1000})()):
         resp = client.get('/api/inspect?show=BigShow')
         data = resp.get_json()
         assert data['space_warning'] is not None
@@ -498,7 +498,7 @@ def test_inspect_does_not_warn_when_space_is_sufficient(harness, client):
     show.mkdir(parents=True)
     (show / 'SmallShow - S01E01.mkv').write_bytes(b'x' * 100)
 
-    with patch.object(driparr.shutil, 'disk_usage', return_value=type('D', (), {'free': 999999999})()):
+    with patch.object(unbinge.shutil, 'disk_usage', return_value=type('D', (), {'free': 999999999})()):
         resp = client.get('/api/inspect?show=SmallShow')
         data = resp.get_json()
         assert data['space_warning'] is None
@@ -520,7 +520,7 @@ def test_backup_db_returns_a_valid_sqlite_file(harness, client):
         f.write(resp.data)
     import sqlite3
     check_conn = sqlite3.connect(tmp_path)
-    names = [r[0] for r in check_conn.execute(f"SELECT show_name FROM {driparr.TABLE_NAME}").fetchall()]
+    names = [r[0] for r in check_conn.execute(f"SELECT show_name FROM {unbinge.TABLE_NAME}").fetchall()]
     check_conn.close()
     assert 'Backup Test Show' in names
 
@@ -530,9 +530,9 @@ def test_backup_db_returns_a_valid_sqlite_file(harness, client):
 # ---------------------------------------------------------------------------
 
 def test_discord_notification_includes_poster_embed(harness):
-    driparr.set_setting('webhook_url', 'https://discord.com/api/webhooks/12345/abcdefTOKEN')
+    unbinge.set_setting('webhook_url', 'https://discord.com/api/webhooks/12345/abcdefTOKEN')
     mock_resp = MagicMock()
-    with patch.object(driparr.requests, 'post', return_value=mock_resp) as p:
+    with patch.object(unbinge.requests, 'post', return_value=mock_resp) as p:
         _REAL_SEND_NOTIFICATION('dripped', "test message", poster_url='http://example/poster.jpg')
         payload = p.call_args.kwargs['json']
     assert 'embeds' in payload
@@ -541,18 +541,18 @@ def test_discord_notification_includes_poster_embed(harness):
 
 
 def test_non_discord_webhook_gets_no_embed(harness):
-    driparr.set_setting('webhook_url', 'https://hooks.slack.com/services/FAKE')
+    unbinge.set_setting('webhook_url', 'https://hooks.slack.com/services/FAKE')
     mock_resp = MagicMock()
-    with patch.object(driparr.requests, 'post', return_value=mock_resp) as p:
+    with patch.object(unbinge.requests, 'post', return_value=mock_resp) as p:
         _REAL_SEND_NOTIFICATION('dripped', "test", poster_url='http://example/poster.jpg')
         payload = p.call_args.kwargs['json']
     assert 'embeds' not in payload
 
 
 def test_discord_webhook_without_poster_sends_plain_message(harness):
-    driparr.set_setting('webhook_url', 'https://discord.com/api/webhooks/12345/abcdefTOKEN')
+    unbinge.set_setting('webhook_url', 'https://discord.com/api/webhooks/12345/abcdefTOKEN')
     mock_resp = MagicMock()
-    with patch.object(driparr.requests, 'post', return_value=mock_resp) as p:
+    with patch.object(unbinge.requests, 'post', return_value=mock_resp) as p:
         _REAL_SEND_NOTIFICATION('dripped', "test", poster_url=None)
         payload = p.call_args.kwargs['json']
     assert 'embeds' not in payload
@@ -564,20 +564,20 @@ def test_dripped_notification_carries_the_shows_poster(harness, drip):
     show = harness.vault / 'Test Show'
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show')
-    with closing(driparr.get_db()) as conn:
-        conn.execute(f"UPDATE {driparr.TABLE_NAME} SET poster_url = ? WHERE id = ?",
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET poster_url = ? WHERE id = ?",
                      ('/posters/1.jpg', show_id))
         conn.commit()
 
     captured = {}
     def fake_notify(event, message, extra=None, poster_url=None):
         captured['poster_url'] = poster_url
-    original = driparr.send_notification
-    driparr.send_notification = fake_notify
+    original = unbinge.send_notification
+    unbinge.send_notification = fake_notify
     try:
         drip(show_id)
     finally:
-        driparr.send_notification = original
+        unbinge.send_notification = original
 
     assert captured.get('poster_url') == '/posters/1.jpg'
 
@@ -590,12 +590,12 @@ def test_project_schedule_carries_poster_url(harness):
     show = harness.vault / 'Test Show'
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
-    with closing(driparr.get_db()) as conn:
-        conn.execute(f"UPDATE {driparr.TABLE_NAME} SET poster_url = ? WHERE id = ?",
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET poster_url = ? WHERE id = ?",
                      ('/posters/99.jpg', show_id))
         conn.commit()
 
-    events = driparr.project_schedule(weeks_ahead=2)
+    events = unbinge.project_schedule(weeks_ahead=2)
     assert events, "expected at least one projected event"
     assert all(e.get('poster_url') == '/posters/99.jpg' for e in events if e['show_name'] == 'Test Show')
 
@@ -604,8 +604,8 @@ def test_schedule_page_renders_poster(harness, client):
     show = harness.vault / 'Test Show'
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     show_id = harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
-    with closing(driparr.get_db()) as conn:
-        conn.execute(f"UPDATE {driparr.TABLE_NAME} SET poster_url = ? WHERE id = ?",
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET poster_url = ? WHERE id = ?",
                      ('/posters/77.jpg', show_id))
         conn.commit()
 

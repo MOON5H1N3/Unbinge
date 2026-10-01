@@ -1,10 +1,10 @@
 """Tests for S2 (CSRF) and S3 (single shared password auth).
 
-Auth is opt-in via the DRIPARR_PASSWORD environment variable - the default
+Auth is opt-in via the UNBINGE_PASSWORD environment variable - the default
 (unset) must leave the app exactly as it always behaved, since making auth
 suddenly mandatory on upgrade would lock people out of their own install.
 
-These tests set/clear driparr.AUTH_PASSWORD directly rather than relying on
+These tests set/clear unbinge.AUTH_PASSWORD directly rather than relying on
 environment variables, since the module is already imported by the time any
 test runs - the harness fixture in conftest.py resets it to '' before each
 test so auth-off is the default test environment, matching the 170+ existing
@@ -14,7 +14,7 @@ tests that were written with no concept of auth at all.
 import re
 from contextlib import closing
 
-import app as driparr
+import app as unbinge
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +22,7 @@ import app as driparr
 # ---------------------------------------------------------------------------
 
 def test_auth_disabled_by_default(harness):
-    assert driparr.auth_enabled() is False
+    assert unbinge.auth_enabled() is False
 
 
 def test_all_pages_reachable_with_no_login_when_auth_disabled(harness, client):
@@ -47,11 +47,11 @@ def test_login_page_redirects_away_when_auth_not_configured(harness, client):
 # ---------------------------------------------------------------------------
 
 def _enable_auth(password='hunter2'):
-    driparr.AUTH_PASSWORD = password
+    unbinge.AUTH_PASSWORD = password
 
 
 def _disable_auth():
-    driparr.AUTH_PASSWORD = ''
+    unbinge.AUTH_PASSWORD = ''
 
 
 def test_protected_page_redirects_to_login_when_not_authenticated(harness, client):
@@ -155,7 +155,7 @@ def test_mutating_request_with_correct_csrf_header_succeeds(harness, client):
         client.post('/login', data={'password': 'hunter2', 'csrf_token': csrf})
 
         r2 = client.get('/')
-        new_csrf = re.search(r'DRIPARR_CSRF_TOKEN = "([^"]+)"', r2.data.decode()).group(1)
+        new_csrf = re.search(r'UNBINGE_CSRF_TOKEN = "([^"]+)"', r2.data.decode()).group(1)
 
         show_id = harness.add_show('Test Show')
         resp = client.post(f'/toggle-pause/{show_id}', headers={'X-CSRFToken': new_csrf})
@@ -196,7 +196,7 @@ def test_static_assets_exempt_from_auth(harness, client):
     _enable_auth()
     try:
         assert client.get('/static/style.css').status_code == 200
-        assert client.get('/static/driparr.js').status_code == 200
+        assert client.get('/static/unbinge.js').status_code == 200
     finally:
         _disable_auth()
 
@@ -219,5 +219,5 @@ def test_secret_key_bootstrap_does_not_touch_disk_under_testing(harness):
     before any test fixture could redirect DB_FILE - meaning importing
     app.py for test collection would write to whatever DB_PATH the real
     container was started with, before test isolation ever kicked in."""
-    key = driparr._get_or_create_secret_key()
+    key = unbinge._get_or_create_secret_key()
     assert key == 'test-secret-key-not-for-production'

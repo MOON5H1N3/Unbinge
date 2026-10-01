@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
-{% block title %}{{ show.show_name }} - Driparr{% endblock %}
+{% block title %}{{ show.show_name }} - Unbinge{% endblock %}
 
 {% block extra_head %}
 <style>
@@ -190,7 +190,7 @@ const SHOW_ID = {{ show.id }};
 async function toggleExclude(season, episode, currentStatus) {
     const action = currentStatus === 'excluded' ? 'unexclude' : 'exclude';
     if (currentStatus === 'dripped') {
-        driparrToast("already dripped - excluding it now won't undo that.", 'warning');
+        unbingeToast("already dripped - excluding it now won't undo that.", 'warning');
     }
     const body = new FormData();
     body.append('season', season);
@@ -199,10 +199,10 @@ async function toggleExclude(season, episode, currentStatus) {
     try {
         const res = await fetch(`/api/exclude-episode/${SHOW_ID}`, { method: 'POST', body });
         const data = await res.json();
-        driparrToast(data.message, res.ok ? 'success' : 'error');
+        unbingeToast(data.message, res.ok ? 'success' : 'error');
         if (res.ok) setTimeout(() => window.location.reload(), 500);
     } catch (err) {
-        driparrToast('network error.', 'error');
+        unbingeToast('network error.', 'error');
     }
 }
 
@@ -258,22 +258,22 @@ async function loadQueue() {
 }
 
 async function removeQueueEntry(entryId) {
-    const ok = await driparrConfirm({ title: 'remove from queue?', body: 'this show will no longer be queued to start automatically.', confirmLabel: 'remove', danger: true });
+    const ok = await unbingeConfirm({ title: 'remove from queue?', body: 'this show will no longer be queued to start automatically.', confirmLabel: 'remove', danger: true });
     if (!ok) return;
     const res = await fetch(`/api/queue/entry/${entryId}`, { method: 'DELETE' });
     const data = await res.json();
-    driparrToast(data.message, res.ok ? 'success' : 'error');
+    unbingeToast(data.message, res.ok ? 'success' : 'error');
     loadQueue();
 }
 
 async function addToQueue() {
     const showName = document.getElementById('queueShowName').value.trim();
-    if (!showName) { driparrToast('enter a show name.', 'error'); return; }
+    if (!showName) { unbingeToast('enter a show name.', 'error'); return; }
     const triggerType = document.querySelector('input[name="triggerType"]:checked').value;
     const triggerDate = document.getElementById('queueDate').value;
-    if (triggerType === 'date' && !triggerDate) { driparrToast('pick a start date.', 'error'); return; }
+    if (triggerType === 'date' && !triggerDate) { unbingeToast('pick a start date.', 'error'); return; }
     const days = Array.from(document.querySelectorAll('.queue-day-cb:checked')).map(cb => cb.value);
-    if (days.length === 0) { driparrToast('pick at least one release day.', 'error'); return; }
+    if (days.length === 0) { unbingeToast('pick at least one release day.', 'error'); return; }
 
     const body = new FormData();
     body.append('show_name', showName);
@@ -285,13 +285,13 @@ async function addToQueue() {
     try {
         const res = await fetch(`/api/queue/${SHOW_ID}`, { method: 'POST', body });
         const data = await res.json();
-        driparrToast(data.message, res.ok ? 'success' : 'error');
+        unbingeToast(data.message, res.ok ? 'success' : 'error');
         if (res.ok) {
             document.getElementById('queueShowName').value = '';
             loadQueue();
         }
     } catch (err) {
-        driparrToast('network error.', 'error');
+        unbingeToast('network error.', 'error');
     }
 }
 
@@ -336,7 +336,7 @@ async function loadUnmatchedFiles() {
 }
 
 async function matchFile(relPath, location, season, episode) {
-    if (season === '' || episode === '') { driparrToast('enter both a season and episode number.', 'error'); return; }
+    if (season === '' || episode === '') { unbingeToast('enter both a season and episode number.', 'error'); return; }
     const body = new FormData();
     body.append('rel_path', relPath);
     body.append('location', location);
@@ -345,10 +345,10 @@ async function matchFile(relPath, location, season, episode) {
     try {
         const res = await fetch(`/api/manual-match/${SHOW_ID}`, { method: 'POST', body });
         const data = await res.json();
-        driparrToast(data.message, res.ok ? 'success' : 'error');
+        unbingeToast(data.message, res.ok ? 'success' : 'error');
         if (res.ok) setTimeout(() => window.location.reload(), 600);
     } catch (err) {
-        driparrToast('network error.', 'error');
+        unbingeToast('network error.', 'error');
     }
 }
 

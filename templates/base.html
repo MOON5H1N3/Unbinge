@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Driparr{% endblock %}</title>
+    <title>{% block title %}Unbinge{% endblock %}</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%233AA6D6%22 stroke-width=%222%22><path d=%22M12 2.5C9 6.5 5.5 10.5 5.5 14.5a6.5 6.5 0 0 0 13 0C18.5 10.5 15 6.5 12 2.5z%22/></svg>">
     <meta name="theme-color" content="#14161C">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
@@ -19,7 +19,7 @@
     <nav class="sidebar">
         <div class="sidebar-header">
             {{ icon('droplet', 20) }}
-            <span class="wordmark">Driparr</span>
+            <span class="wordmark">Unbinge</span>
             <span class="version">v{{ app_version }}</span>
         </div>
         <div class="sidebar-nav">
@@ -52,8 +52,8 @@
     </main>
 </div>
 
-<script>window.DRIPARR_CSRF_TOKEN = "{{ csrf_token }}";</script>
-<script src="{{ url_for('static', filename='driparr.js') }}"></script>
+<script>window.UNBINGE_CSRF_TOKEN = "{{ csrf_token }}";</script>
+<script src="{{ url_for('static', filename='unbinge.js') }}"></script>
 <script>
 (function () {
     const dot = document.getElementById('sidebarHealthDot');

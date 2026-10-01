@@ -1,12 +1,12 @@
-# Driparr
+# Unbinge
 
-Driparr turns binge-watching back into appointment TV. Pick a show from your library, choose which days it "airs" and how many episodes drop each time, and Driparr releases it into a Plex library a few episodes at a time, like a weekly broadcast schedule.
+Unbinge turns binge-watching back into appointment TV. Pick a show from your library, choose which days it "airs" and how many episodes drop each time, and Unbinge releases it into a Plex library a few episodes at a time, like a weekly broadcast schedule.
 
 It's a small self-hosted Flask app that runs in Docker alongside the rest of your *arr stack.
 
 ## How it works
 
-Driparr moves show folders between three directories:
+Unbinge moves show folders between three directories:
 
 | Directory | What lives there |
 |---|---|
@@ -45,8 +45,8 @@ If episodes reappear in the vault during cooldown, the show resumes instead of g
 1. Clone the repo:
 
    ```bash
-   git clone https://github.com/MOON5H1N3/Driparr.git
-   cd Driparr
+   git clone https://github.com/MOON5H1N3/Unbinge.git
+   cd Unbinge
    ```
 
 2. Create a `.env` file next to `docker-compose.yaml`:
@@ -69,6 +69,24 @@ If episodes reappear in the vault during cooldown, the show resumes instead of g
 
 Point a Plex library at the same folder as `PLEX_BASE_DIR` so released episodes appear there.
 
+## Updating
+
+Once you've cloned the repo as above, pull in new releases with the bundled update script instead of doing it by hand:
+
+```bash
+./update.sh
+```
+
+It backs up the database, refuses to run if you've got uncommitted local edits, `git pull`s, rebuilds the image, restarts the container, and waits for `/health` to come back before declaring success. Run it from the same directory as `docker-compose.yaml`.
+
+If you'd rather update manually:
+
+```bash
+git pull
+docker compose build
+docker compose up -d
+```
+
 ## Configuration
 
 All configuration is through environment variables. Integration settings can also be changed later from the **Settings** page.
@@ -83,7 +101,7 @@ All configuration is through environment variables. Integration settings can als
 | `PLEX_BASE_DIR` | Yes | `/media/private_tv` | Folder the Plex library watches |
 | `DB_PATH` | No | `/config/drip_schedule.db` | SQLite database location (posters are stored beside it) |
 | `TZ` | No | UTC | Timezone the drip schedule runs in, e.g. `Europe/London` |
-| `DRIPARR_PASSWORD` | No | – | Set to enable the login page. Leave unset for no auth |
+| `UNBINGE_PASSWORD` | No | – | Set to enable the login page. Leave unset for no auth. (`DRIPARR_PASSWORD` still works as a fallback if you're upgrading from Driparr) |
 | `WEBHOOK_URL` | No | – | Webhook for drip / failure / missed-run notifications |
 | `DISCORD_SCHEDULE_WEBHOOK_URL` | No | – | Discord webhook for the live schedule message |
 | `TVDB_API_KEY` / `TVDB_PIN` | No | – | TVDB credentials for posters and metadata |
@@ -98,12 +116,12 @@ The daily drip time defaults to **03:00** and can be changed in Settings.
 The test suite runs inside the container:
 
 ```bash
-docker compose exec plex-drip pytest
+docker compose exec unbinge pytest
 ```
 
 ## Notes
 
-- Driparr runs as a **single process** on purpose. The scheduler starts with the app, so multiple workers would mean multiple drip jobs racing over the same files.
+- Unbinge runs as a **single process** on purpose. The scheduler starts with the app, so multiple workers would mean multiple drip jobs racing over the same files.
 - The container currently runs as root because the bind-mounted `/config` folder is owned by the host user.
 - Keep `.env` out of git and out of the image. Both `.gitignore` and `.dockerignore` already exclude it.
 

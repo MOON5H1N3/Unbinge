@@ -11,9 +11,9 @@ import os
 from contextlib import closing
 from unittest.mock import patch, MagicMock
 
-import app as driparr
+import app as unbinge
 
-_REAL_SEND_NOTIFICATION = driparr.send_notification  # see test_section5_features.py for why
+_REAL_SEND_NOTIFICATION = unbinge.send_notification  # see test_section5_features.py for why
 
 
 # ---------------------------------------------------------------------------
@@ -21,32 +21,32 @@ _REAL_SEND_NOTIFICATION = driparr.send_notification  # see test_section5_feature
 # ---------------------------------------------------------------------------
 
 def test_ics_escape_handles_all_special_characters():
-    assert driparr.ics_escape('a,b') == 'a\\,b'
-    assert driparr.ics_escape('a;b') == 'a\\;b'
-    assert driparr.ics_escape('a\\b') == 'a\\\\b'
-    assert driparr.ics_escape('a\nb') == 'a\\nb'
+    assert unbinge.ics_escape('a,b') == 'a\\,b'
+    assert unbinge.ics_escape('a;b') == 'a\\;b'
+    assert unbinge.ics_escape('a\\b') == 'a\\\\b'
+    assert unbinge.ics_escape('a\nb') == 'a\\nb'
 
 
 def test_ics_escape_backslash_is_escaped_before_other_characters():
     """Order matters: escaping ',' and ';' after '\\' would double-escape
     the backslashes those substitutions just introduced."""
-    assert driparr.ics_escape('a\\,b') == 'a\\\\\\,b'
+    assert unbinge.ics_escape('a\\,b') == 'a\\\\\\,b'
 
 
 def test_ics_escape_handles_none_and_empty():
-    assert driparr.ics_escape(None) == ''
-    assert driparr.ics_escape('') == ''
+    assert unbinge.ics_escape(None) == ''
+    assert unbinge.ics_escape('') == ''
 
 
 def test_ics_uid_slug_strips_unsafe_characters():
-    assert driparr.ics_uid_slug("Marvel's Daredevil") == 'marvel-s-daredevil'
-    assert driparr.ics_uid_slug('') == 'show'
-    assert driparr.ics_uid_slug(None) == 'show'
+    assert unbinge.ics_uid_slug("Marvel's Daredevil") == 'marvel-s-daredevil'
+    assert unbinge.ics_uid_slug('') == 'show'
+    assert unbinge.ics_uid_slug(None) == 'show'
 
 
 def test_ics_fold_line_wraps_long_lines():
     long_line = 'DESCRIPTION:' + ('x' * 100)
-    folded = driparr.ics_fold_line(long_line)
+    folded = unbinge.ics_fold_line(long_line)
     assert '\r\n ' in folded, "a folded continuation must start with a space"
     for segment in folded.split('\r\n'):
         assert len(segment.encode('utf-8')) <= 75
@@ -54,7 +54,7 @@ def test_ics_fold_line_wraps_long_lines():
 
 def test_ics_fold_line_leaves_short_lines_alone():
     short = 'SUMMARY:short'
-    assert driparr.ics_fold_line(short) == short
+    assert unbinge.ics_fold_line(short) == short
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ def test_ics_fold_line_leaves_short_lines_alone():
 # ---------------------------------------------------------------------------
 
 def test_feed_is_well_formed_with_no_shows(harness):
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     assert ics.startswith('BEGIN:VCALENDAR\r\n')
     assert ics.rstrip().endswith('END:VCALENDAR')
     assert ics.count('BEGIN:VEVENT') == ics.count('END:VEVENT') == 0
@@ -73,14 +73,14 @@ def test_feed_includes_drip_events_for_a_real_show(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     assert 'Test Show' in ics
     assert '📺' in ics
     assert ics.count('BEGIN:VEVENT') >= 1
 
 
 def test_feed_ends_with_crlf():
-    assert driparr.build_ical_feed().endswith('\r\n')
+    assert unbinge.build_ical_feed().endswith('\r\n')
 
 
 def test_feed_has_balanced_begin_end_pairs(harness):
@@ -88,7 +88,7 @@ def test_feed_has_balanced_begin_end_pairs(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     assert ics.count('BEGIN:VEVENT') == ics.count('END:VEVENT')
     assert ics.count('BEGIN:VCALENDAR') == ics.count('END:VCALENDAR') == 1
 
@@ -100,7 +100,7 @@ def test_feed_escapes_special_characters_in_show_names(harness):
     harness.make_episode(show, 'Weird; Show, Name', 1, 1, subdir='Season 01')
     harness.add_show('Weird; Show, Name', release_days='0,1,2,3,4,5,6')
 
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     summary_lines = [l for l in ics.split('\r\n') if l.startswith('SUMMARY:') and 'Weird' in l]
     assert summary_lines
     for line in summary_lines:
@@ -115,7 +115,7 @@ def test_feed_no_unfolded_line_exceeds_75_octets(harness):
     harness.make_episode(show, long_name, 1, 1, subdir='Season 01')
     harness.add_show(long_name, release_days='0,1,2,3,4,5,6')
 
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     for line in ics.split('\r\n'):
         if line == '' or line.startswith(' '):
             continue
@@ -127,10 +127,10 @@ def test_feed_uses_configured_timezone_for_drip_events(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     tzid_lines = [l for l in ics.split('\r\n') if l.startswith('DTSTART;TZID=')]
     assert tzid_lines
-    assert all(str(driparr.LOCAL_TZ) in l for l in tzid_lines)
+    assert all(str(unbinge.LOCAL_TZ) in l for l in tzid_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +138,8 @@ def test_feed_uses_configured_timezone_for_drip_events(harness):
 # ---------------------------------------------------------------------------
 
 def test_feed_includes_sonarr_events_when_configured(harness):
-    driparr.set_setting('sonarr_url', 'http://fake-sonarr:8989')
-    driparr.set_setting('sonarr_api_key', 'fake-key')
+    unbinge.set_setting('sonarr_url', 'http://fake-sonarr:8989')
+    unbinge.set_setting('sonarr_api_key', 'fake-key')
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.json = lambda: [{
@@ -147,8 +147,8 @@ def test_feed_includes_sonarr_events_when_configured(harness):
         'title': 'An Episode', 'airDateUtc': '2026-09-10T20:00:00Z',
         'hasFile': False, 'series': {'title': 'Sonarr Show'},
     }]
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        ics = driparr.build_ical_feed()
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        ics = unbinge.build_ical_feed()
 
     assert 'Sonarr Show' in ics
     assert '📡' in ics
@@ -159,8 +159,8 @@ def test_feed_escapes_sonarr_episode_titles(harness):
     """Regression guard: episode_title was originally excluded from
     escaping - only show_name was escaped - so a comma/semicolon in a
     Sonarr episode title would corrupt the SUMMARY line."""
-    driparr.set_setting('sonarr_url', 'http://fake-sonarr:8989')
-    driparr.set_setting('sonarr_api_key', 'fake-key')
+    unbinge.set_setting('sonarr_url', 'http://fake-sonarr:8989')
+    unbinge.set_setting('sonarr_api_key', 'fake-key')
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.json = lambda: [{
@@ -168,8 +168,8 @@ def test_feed_escapes_sonarr_episode_titles(harness):
         'title': 'The One, With; Punctuation\\Here', 'airDateUtc': '2026-09-10T20:00:00Z',
         'hasFile': False, 'series': {'title': 'Sonarr Show'},
     }]
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        ics = driparr.build_ical_feed()
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        ics = unbinge.build_ical_feed()
 
     sonarr_summary = [l for l in ics.split('\r\n') if l.startswith('SUMMARY:') and '📡' in l]
     assert sonarr_summary
@@ -186,15 +186,15 @@ def test_feed_omits_sonarr_section_when_not_configured(harness):
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
     harness.add_show('Test Show', release_days='0,1,2,3,4,5,6')
 
-    ics = driparr.build_ical_feed()
+    ics = unbinge.build_ical_feed()
     assert '📡' not in ics
 
 
 def test_feed_handles_sonarr_being_unreachable(harness):
-    driparr.set_setting('sonarr_url', 'http://fake-sonarr:8989')
-    driparr.set_setting('sonarr_api_key', 'fake-key')
-    with patch.object(driparr.requests, 'get', side_effect=driparr.requests.RequestException("down")):
-        ics = driparr.build_ical_feed()  # must not raise
+    unbinge.set_setting('sonarr_url', 'http://fake-sonarr:8989')
+    unbinge.set_setting('sonarr_api_key', 'fake-key')
+    with patch.object(unbinge.requests, 'get', side_effect=unbinge.requests.RequestException("down")):
+        ics = unbinge.build_ical_feed()  # must not raise
     assert ics.startswith('BEGIN:VCALENDAR')
 
 
@@ -224,8 +224,8 @@ def test_sonarr_calendar_route_empty_when_unconfigured(harness, client):
 
 
 def test_sonarr_calendar_route_returns_parsed_events(harness, client):
-    driparr.set_setting('sonarr_url', 'http://fake-sonarr:8989')
-    driparr.set_setting('sonarr_api_key', 'fake-key')
+    unbinge.set_setting('sonarr_url', 'http://fake-sonarr:8989')
+    unbinge.set_setting('sonarr_api_key', 'fake-key')
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.json = lambda: [{
@@ -233,7 +233,7 @@ def test_sonarr_calendar_route_returns_parsed_events(harness, client):
         'title': 'Ep Title', 'airDateUtc': '2026-09-12T18:00:00Z',
         'hasFile': True, 'series': {'title': 'Another Show'},
     }]
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
         resp = client.get('/api/sonarr/calendar?days=14')
         data = resp.get_json()
 
@@ -256,8 +256,8 @@ def test_schedule_page_includes_sonarr_panel_markup(harness, client):
 
 
 def test_sonarr_get_calendar_skips_events_with_no_air_date(harness):
-    driparr.set_setting('sonarr_url', 'http://fake-sonarr:8989')
-    driparr.set_setting('sonarr_api_key', 'fake-key')
+    unbinge.set_setting('sonarr_url', 'http://fake-sonarr:8989')
+    unbinge.set_setting('sonarr_api_key', 'fake-key')
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.json = lambda: [
@@ -265,8 +265,8 @@ def test_sonarr_get_calendar_skips_events_with_no_air_date(harness):
         {'seriesId': 2, 'seasonNumber': 1, 'episodeNumber': 1, 'airDateUtc': '2026-09-10T20:00:00Z',
          'series': {'title': 'Has Date Show'}, 'hasFile': False},
     ]
-    with patch.object(driparr.requests, 'get', return_value=mock_resp):
-        events, err = driparr.sonarr_get_calendar(days_ahead=14)
+    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+        events, err = unbinge.sonarr_get_calendar(days_ahead=14)
 
     assert err is None
     names = [e['show_name'] for e in events]

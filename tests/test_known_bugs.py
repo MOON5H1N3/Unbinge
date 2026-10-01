@@ -1,6 +1,6 @@
 """Known bugs, written as executable specifications.
 
-Each test here describes what Driparr *should* do. They are marked
+Each test here describes what Unbinge *should* do. They are marked
 `xfail(strict=True)`, which means:
 
 - **Today**, on unfixed code, they fail as expected and the suite stays green.
@@ -14,7 +14,7 @@ remove the markers, run again, everything green.
 
 import os
 
-import app as driparr
+import app as unbinge
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +80,11 @@ def test_a_backfilled_mid_season_gap_still_drips(harness, drip):
 def test_schedule_projection_includes_below_watermark_episodes(harness):
     show = harness.vault / 'Test Show'
     harness.make_episode(show, 'Test Show', 1, 1, subdir='Season 01')
-    today = driparr.now_local().weekday()
+    today = unbinge.now_local().weekday()
     harness.add_show('Test Show', release_days=str(today),
                      current_season=2, current_episode=4)
 
-    events = driparr.project_schedule(weeks_ahead=2)
+    events = unbinge.project_schedule(weeks_ahead=2)
 
     assert any(e['action'] == 'drip' for e in events), \
         "the schedule page should show these episodes as pending"
@@ -104,7 +104,7 @@ def test_colliding_files_are_not_silently_destroyed(harness):
     (src / 'notes.txt').write_text('THE ONLY COPY OF THIS CONTENT')
     (dest / 'notes.txt').write_text('different content')
 
-    driparr.merge_directory(str(src), str(dest))
+    unbinge.merge_directory(str(src), str(dest))
 
     surviving = list(harness.pool.rglob('*notes*'))
     contents = [p.read_text() for p in surviving if p.is_file()]
@@ -172,7 +172,7 @@ def test_drip_now_reports_failure_when_the_drip_fails(harness, client, monkeypat
 
     def boom(*a, **k):
         raise OSError("simulated failure")
-    monkeypatch.setattr(driparr, 'process_show_drip', boom)
+    monkeypatch.setattr(unbinge, 'process_show_drip', boom)
 
     resp = client.post(f'/api/drip-now/{show_id}')
 
@@ -208,7 +208,7 @@ def test_editing_a_show_cannot_create_a_duplicate_name(harness, client):
         'current_season': '1', 'current_episode': '0', 'episodes_per_drop': '1',
     })
 
-    names = [s['show_name'] for s in driparr.load_shows()]
+    names = [s['show_name'] for s in unbinge.load_shows()]
     assert len(names) == len(set(names)), "duplicate show names should be rejected"
 
 

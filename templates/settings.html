@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
-{% block title %}Settings - Driparr{% endblock %}
+{% block title %}Settings - Unbinge{% endblock %}
 
 {% block content %}
 <div class="page-header">
@@ -122,7 +122,7 @@
 
         <div style="margin-top:0.9rem; padding-top:0.9rem; border-top:1px solid var(--border);">
             <p class="hint" style="margin-top:0;">
-                if driparr isn't reachable from outside your network (e.g. a localhost or LAN-only address),
+                if unbinge isn't reachable from outside your network (e.g. a localhost or LAN-only address),
                 google can't fetch the url above at all - it'll silently never update. download a snapshot
                 instead and import it by hand: google calendar → settings → import &amp; export → import.
                 do this again whenever your schedule changes meaningfully (monthly is usually plenty).
@@ -176,7 +176,7 @@
 
 {% block extra_scripts %}
 <script>
-async function driparrRunAction(button, url, successMsg, body) {
+async function unbingeRunAction(button, url, successMsg, body) {
     const original = button.innerHTML;
     button.disabled = true;
     button.textContent = 'working…';
@@ -186,12 +186,12 @@ async function driparrRunAction(button, url, successMsg, body) {
         const res = await fetch(url, opts);
         const data = await res.json().catch(() => ({}));
         if (res.ok && data.status !== 'error') {
-            driparrToast(data.message || successMsg, 'success');
+            unbingeToast(data.message || successMsg, 'success');
         } else {
-            driparrToast(data.message || 'that failed - check the logs.', 'error');
+            unbingeToast(data.message || 'that failed - check the logs.', 'error');
         }
     } catch (err) {
-        driparrToast('request failed - is the container reachable?', 'error');
+        unbingeToast('request failed - is the container reachable?', 'error');
     } finally {
         button.disabled = false;
         button.innerHTML = original;
@@ -199,22 +199,22 @@ async function driparrRunAction(button, url, successMsg, body) {
 }
 
 document.getElementById('discord-sync-btn').addEventListener('click', (e) => {
-    driparrRunAction(e.target, '/api/sync-discord-schedule', 'discord schedule synced.');
+    unbingeRunAction(e.target, '/api/sync-discord-schedule', 'discord schedule synced.');
 });
 document.getElementById('test-tvdb-btn').addEventListener('click', (e) => {
     const body = new FormData();
     body.append('tvdb_api_key', document.getElementById('tvdb_api_key').value);
     body.append('tvdb_pin', document.getElementById('tvdb_pin').value);
-    driparrRunAction(e.target, '/api/test-tvdb', 'tvdb connection ok.', body);
+    unbingeRunAction(e.target, '/api/test-tvdb', 'tvdb connection ok.', body);
 });
 document.getElementById('test-sonarr-btn').addEventListener('click', (e) => {
     const body = new FormData();
     body.append('sonarr_url', document.getElementById('sonarr_url').value);
     body.append('sonarr_api_key', document.getElementById('sonarr_api_key').value);
-    driparrRunAction(e.target, '/api/test-sonarr', 'sonarr connection ok.', body);
+    unbingeRunAction(e.target, '/api/test-sonarr', 'sonarr connection ok.', body);
 });
 document.getElementById('run-backup-now-btn').addEventListener('click', async (e) => {
-    await driparrRunAction(e.target, '/api/run-backup-now', 'backup created.');
+    await unbingeRunAction(e.target, '/api/run-backup-now', 'backup created.');
     loadBackupsList();
 });
 
@@ -248,25 +248,25 @@ async function loadBackupsList() {
 loadBackupsList();
 
 document.getElementById('repair-paths-btn').addEventListener('click', (e) => {
-    driparrRunAction(e.target, '/api/repair-paths', 'paths checked.');
+    unbingeRunAction(e.target, '/api/repair-paths', 'paths checked.');
 });
 document.getElementById('run-drip-btn').addEventListener('click', async (e) => {
-    const ok = await driparrConfirm({
+    const ok = await unbingeConfirm({
         title: 'run drip check now?',
         body: 'this runs the same job as the nightly schedule, immediately, for every eligible show.',
         confirmLabel: 'run now',
     });
     if (!ok) return;
-    driparrRunAction(e.target, '/api/run-drip', 'drip check complete.');
+    unbingeRunAction(e.target, '/api/run-drip', 'drip check complete.');
 });
 document.getElementById('copy-ical-btn').addEventListener('click', async () => {
     const input = document.getElementById('ical_feed_url');
     input.select();
     try {
         await navigator.clipboard.writeText(input.value);
-        driparrToast('feed url copied.', 'success');
+        unbingeToast('feed url copied.', 'success');
     } catch (err) {
-        driparrToast('could not copy automatically - select and copy manually.', 'error');
+        unbingeToast('could not copy automatically - select and copy manually.', 'error');
     }
 });
 </script>

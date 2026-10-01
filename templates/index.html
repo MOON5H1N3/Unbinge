@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
-{% block title %}Driparr{% endblock %}
+{% block title %}Unbinge{% endblock %}
 
 {% block extra_head %}
 <style>
@@ -354,7 +354,7 @@ async function bulkAction(action) {
         delete: { title: `delete ${ids.length} show(s)?`, body: 'all their files will be returned to the pool. this cannot be undone from here.', danger: true, label: 'delete' },
     };
     const cfg = confirmMap[action];
-    const ok = await driparrConfirm({ title: cfg.title, body: cfg.body, confirmLabel: cfg.label, danger: cfg.danger });
+    const ok = await unbingeConfirm({ title: cfg.title, body: cfg.body, confirmLabel: cfg.label, danger: cfg.danger });
     if (!ok) return;
 
     let url, body;
@@ -372,10 +372,10 @@ async function bulkAction(action) {
     try {
         const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
         const data = await res.json();
-        driparrToast(data.message, res.ok && data.status !== 'error' ? 'success' : 'error');
+        unbingeToast(data.message, res.ok && data.status !== 'error' ? 'success' : 'error');
         setTimeout(() => window.location.reload(), 700);
     } catch (err) {
-        driparrToast('network error during bulk action.', 'error');
+        unbingeToast('network error during bulk action.', 'error');
     }
 }
 
@@ -438,11 +438,11 @@ function setDashboardView(view) {
         tableBtn.classList.add('active');
         gridBtn.classList.remove('active');
     }
-    try { localStorage.setItem('driparr_dashboard_view', view); } catch (e) {}
+    try { localStorage.setItem('unbinge_dashboard_view', view); } catch (e) {}
 }
 (function () {
     let saved = 'table';
-    try { saved = localStorage.getItem('driparr_dashboard_view') || 'table'; } catch (e) {}
+    try { saved = localStorage.getItem('unbinge_dashboard_view') || 'table'; } catch (e) {}
     setDashboardView(saved);
 })();
 
@@ -507,11 +507,11 @@ async function togglePause(button, showId) {
     try {
         const res = await fetchWithTimeout('/toggle-pause/' + showId, { method: 'POST', headers: { 'X-Requested-With': 'fetch' } });
         const data = await res.json();
-        if (!res.ok) { driparrToast(data.message || 'could not update.', 'error'); return; }
-        driparrToast(data.message, 'success');
+        if (!res.ok) { unbingeToast(data.message || 'could not update.', 'error'); return; }
+        unbingeToast(data.message, 'success');
         setTimeout(() => window.location.reload(), 500);
     } catch (err) {
-        driparrToast('network error - is the container reachable?', 'error');
+        unbingeToast('network error - is the container reachable?', 'error');
     }
 }
 
@@ -621,8 +621,8 @@ function submitPromotion(e) {
     const episodesPerDrop = document.getElementById('episodes_per_drop').value;
     const days = Array.from(document.querySelectorAll('.release-day-cb:checked')).map(cb => cb.value);
 
-    if (!showName) { driparrToast('please select a show first.', 'error'); return; }
-    if (days.length === 0) { driparrToast('pick at least one release day.', 'error'); return; }
+    if (!showName) { unbingeToast('please select a show first.', 'error'); return; }
+    if (days.length === 0) { unbingeToast('pick at least one release day.', 'error'); return; }
 
     document.getElementById('loadingTitle').innerText = `promoting "${showName}"...`;
     document.getElementById('modalStep1').style.display = 'none';
@@ -638,16 +638,16 @@ function submitPromotion(e) {
         .then(async response => {
             const data = await response.json().catch(() => ({}));
             if (response.ok) {
-                driparrToast(data.message || `'${showName}' promoted.`, 'success');
+                unbingeToast(data.message || `'${showName}' promoted.`, 'success');
                 setTimeout(() => window.location.reload(), 600);
             } else {
-                driparrToast(data.message || 'server error while promoting.', 'error');
+                unbingeToast(data.message || 'server error while promoting.', 'error');
                 backToStep1();
             }
         })
         .catch(err => {
             const msg = err.name === 'AbortError' ? 'timed out - try again.' : ('network error: ' + err);
-            driparrToast(msg, 'error');
+            unbingeToast(msg, 'error');
             backToStep1();
         });
 }
@@ -738,19 +738,19 @@ async function linkTvdbShow(tvdbId, tvdbName) {
         const res = await fetchWithTimeout('/api/tvdb-link/' + showId, { method: 'POST', body: formData });
         const data = await res.json();
         if (res.ok) {
-            driparrToast(data.message || `linked to ${tvdbName}.`, 'success');
+            unbingeToast(data.message || `linked to ${tvdbName}.`, 'success');
             closeTvdbModal();
             setTimeout(() => window.location.reload(), 500);
         } else {
-            driparrToast(data.message || 'could not link that show.', 'error');
+            unbingeToast(data.message || 'could not link that show.', 'error');
         }
     } catch (err) {
-        driparrToast('network error while linking.', 'error');
+        unbingeToast('network error while linking.', 'error');
     }
 }
 
 async function undoLastDrip(button) {
-    const ok = await driparrConfirm({
+    const ok = await unbingeConfirm({
         title: 'undo the last drip?',
         body: 'moves the file(s) back to the vault and un-marks the episode(s) as dripped, so the next run picks them up again.',
         confirmLabel: 'undo',
@@ -761,17 +761,17 @@ async function undoLastDrip(button) {
     try {
         const res = await fetchWithTimeout('/api/undo-last-drip', { method: 'POST' });
         const data = await res.json();
-        driparrToast(data.message, res.ok ? 'success' : 'error');
+        unbingeToast(data.message, res.ok ? 'success' : 'error');
         if (res.ok) setTimeout(() => window.location.reload(), 600);
     } catch (err) {
-        driparrToast('network error while undoing.', 'error');
+        unbingeToast('network error while undoing.', 'error');
     } finally {
         button.disabled = false;
     }
 }
 
 async function dripNow(button, showId, showName) {
-    const ok = await driparrConfirm({
+    const ok = await unbingeConfirm({
         title: `drip "${showName}" now?`,
         body: 'this ignores its scheduled release day and runs the next drip step immediately.',
         confirmLabel: 'drip now',
@@ -782,13 +782,13 @@ async function dripNow(button, showId, showName) {
         const res = await fetchWithTimeout('/api/drip-now/' + showId, { method: 'POST' });
         const data = await res.json();
         if (res.ok) {
-            driparrToast(data.message || 'done.', 'success');
+            unbingeToast(data.message || 'done.', 'success');
             setTimeout(() => window.location.reload(), 600);
         } else {
-            driparrToast(data.message || 'drip failed.', 'error');
+            unbingeToast(data.message || 'drip failed.', 'error');
         }
     } catch (err) {
-        driparrToast('network error while dripping.', 'error');
+        unbingeToast('network error while dripping.', 'error');
     } finally {
         button.disabled = false;
     }
@@ -796,7 +796,7 @@ async function dripNow(button, showId, showName) {
 
 async function deleteShow(button, showId, showName, episodeCount) {
     const episodeNote = episodeCount > 0 ? `${episodeCount} episode(s) will be returned to the pool.` : `no episodes have been recorded for it yet.`;
-    const ok = await driparrConfirm({
+    const ok = await unbingeConfirm({
         title: `remove "${showName}"?`,
         body: `this stops the drip and returns its files to the pool. ${episodeNote}`,
         confirmLabel: 'delete',
@@ -809,7 +809,7 @@ async function deleteShow(button, showId, showName, episodeCount) {
     const csrfInput = document.createElement('input');
     csrfInput.type = 'hidden';
     csrfInput.name = 'csrf_token';
-    csrfInput.value = window.DRIPARR_CSRF_TOKEN || '';
+    csrfInput.value = window.UNBINGE_CSRF_TOKEN || '';
     form.appendChild(csrfInput);
     document.body.appendChild(form);
     form.submit();

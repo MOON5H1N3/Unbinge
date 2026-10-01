@@ -42,7 +42,7 @@ def inject_shared_template_context():
 # ---------------------------------------------------------------------------
 # Auth (S3) and CSRF (S2)
 #
-# Single shared password, opt-in via the DRIPARR_PASSWORD environment
+# Single shared password, opt-in via the UNBINGE_PASSWORD environment
 # variable. If it's unset, auth is fully disabled and the app behaves
 # exactly as it always has - this is a deliberate default, not an
 # oversight: shipping auth as suddenly-mandatory on upgrade would lock
@@ -50,11 +50,14 @@ def inject_shared_template_context():
 # outcome than staying open until someone deliberately turns it on.
 #
 # CSRF protection only matters once there's a session cookie to steal, so
-# it's gated behind the same DRIPARR_PASSWORD check - an unauthenticated,
+# it's gated behind the same UNBINGE_PASSWORD check - an unauthenticated,
 # fully-open install has no session for a forged request to ride on.
 # ---------------------------------------------------------------------------
 
-AUTH_PASSWORD = os.environ.get('DRIPARR_PASSWORD', '')
+# Renamed from DRIPARR_PASSWORD when the app was rebranded to Unbinge - the
+# old name is still read as a fallback so an existing deployment's
+# compose file/.env keeps working unchanged until it's convenient to update.
+AUTH_PASSWORD = os.environ.get('UNBINGE_PASSWORD', '') or os.environ.get('DRIPARR_PASSWORD', '')
 
 AUTH_EXEMPT_PATHS = ('/login', '/logout', '/calendar.ics', '/health', '/static/', '/posters/')
 
@@ -128,7 +131,7 @@ def logout():
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("driparr")
+log = logging.getLogger("unbinge")
 
 # ---------------------------------------------------------------------------
 # Config (all container-side paths; comes from docker-compose environment)
@@ -145,7 +148,7 @@ def _get_or_create_secret_key():
     before the rest of the app has finished initializing) the same way
     other durable app state lives there.
 
-    Returns a fixed dummy key under DRIPARR_TESTING rather than touching
+    Returns a fixed dummy key under UNBINGE_TESTING rather than touching
     disk at all - this runs at import time, before any test fixture has a
     chance to redirect DB_FILE to an isolated temp path, so without this
     guard every pytest collection would write a secret_key row into the
@@ -153,7 +156,7 @@ def _get_or_create_secret_key():
     with. The same class of mistake _should_start_background_work() already
     exists to prevent, just at import time instead of at the bottom of the
     module."""
-    if os.environ.get('DRIPARR_TESTING') == '1':
+    if os.environ.get('UNBINGE_TESTING') == '1':
         return 'test-secret-key-not-for-production'
 
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
@@ -211,7 +214,7 @@ APP_VERSION = '0.2.0'
 
 
 def _resolve_timezone():
-    """Resolves the timezone Driparr schedules against.
+    """Resolves the timezone Unbinge schedules against.
 
     Previously everything used naive local time, which inside a container is
     UTC unless TZ is set - so a drip configured for 03:00 actually fired at
@@ -323,7 +326,7 @@ def get_db():
     except sqlite3.OperationalError as e:
         conn.close()
         raise RuntimeError(
-            f"Cannot write to the Driparr database at {DB_FILE} ({e}). "
+            f"Cannot write to the Unbinge database at {DB_FILE} ({e}). "
             f"This is almost always a permissions problem on the mounted config "
             f"directory rather than a database fault - check that the user the "
             f"container runs as can write to {os.path.dirname(DB_FILE)}."
@@ -1021,9 +1024,9 @@ def get_recommendations_for_show(show_id):
 
 def sonarr_get_calendar(days_ahead=14):
     """Fetches upcoming episode air dates across the user's WHOLE Sonarr
-    library (every monitored show, not just ones synced into Driparr).
+    library (every monitored show, not just ones synced into Unbinge).
 
-    This is a genuinely different thing from Driparr's own schedule: Driparr
+    This is a genuinely different thing from Unbinge's own schedule: Unbinge
     projects when files ALREADY ON DISK will drip into Plex on a schedule
     you set; this reports when episodes are actually airing/being released
     according to Sonarr, which may not be downloaded yet at all.
@@ -1186,7 +1189,7 @@ def build_schedule_embed():
 
     return {
         "embeds": [{
-            "title": "📅 Driparr Schedule",
+            "title": "📅 Unbinge Schedule",
             "description": description[:4096],
             "color": 0x5865F2,
             "timestamp": datetime.now(dt_timezone.utc).isoformat(),
@@ -2105,7 +2108,7 @@ def compute_next_batch(vault_path, dripped, episodes_per_drop, excluded=frozense
     return sorted(committed_tags), batch
 
 
-CONFLICTS_DIRNAME = '_driparr_conflicts'
+CONFLICTS_DIRNAME = '_unbinge_conflicts'
 
 
 def files_look_identical(path_a, path_b):
@@ -2114,7 +2117,7 @@ def files_look_identical(path_a, path_b):
     Deliberately not a hash - these are multi-gigabyte video files on a
     network-backed mount, and hashing them would take minutes per graduation.
     Size plus mtime is what every sync tool uses for the same reason, and the
-    consequence of a false negative here is a file parked in _driparr_conflicts
+    consequence of a false negative here is a file parked in _unbinge_conflicts
     rather than anything being lost."""
     try:
         sa, sb = os.stat(path_a), os.stat(path_b)
@@ -2139,7 +2142,7 @@ def merge_directory(src_dir, dest_dir):
     was written for (copied, not moved, so genuinely duplicated) but it also
     silently destroyed any genuinely different file with a matching name. Now
     identical files are dropped as before, and differing ones are parked in a
-    _driparr_conflicts folder with a loud warning.
+    _unbinge_conflicts folder with a loud warning.
 
     C4 - every file operation is wrapped. On a Windows/NTFS bind mount Plex
     takes mandatory locks while scanning or streaming, so a move can fail in
@@ -2286,7 +2289,7 @@ def ics_fold_line(line):
 
 
 def build_ical_feed():
-    """Builds the combined .ics calendar: Driparr's own projected
+    """Builds the combined .ics calendar: Unbinge's own projected
     drip/cooldown/graduate schedule, plus - if Sonarr is configured - real
     upcoming air dates across the whole Sonarr library. Two clearly
     different event types in one feed, since Google Calendar subscribes to
@@ -2300,10 +2303,10 @@ def build_ical_feed():
     lines = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
-        'PRODID:-//Driparr//Schedule//EN',
+        'PRODID:-//Unbinge//Schedule//EN',
         'CALSCALE:GREGORIAN',
         'METHOD:PUBLISH',
-        'X-WR-CALNAME:Driparr Schedule',
+        'X-WR-CALNAME:Unbinge Schedule',
         'REFRESH-INTERVAL;VALUE=DURATION:PT12H',
     ]
 
@@ -2320,7 +2323,7 @@ def build_ical_feed():
 
         lines += [
             'BEGIN:VEVENT',
-            f'UID:driparr-{i}-{ev["date"].isoformat()}-{ics_uid_slug(ev["show_name"])}@driparr',
+            f'UID:unbinge-{i}-{ev["date"].isoformat()}-{ics_uid_slug(ev["show_name"])}@unbinge',
             f'DTSTAMP:{now_stamp}',
             f'DTSTART;TZID={LOCAL_TZ}:{start_dt.strftime("%Y%m%dT%H%M%S")}',
             f'DTEND;TZID={LOCAL_TZ}:{end_dt.strftime("%Y%m%dT%H%M%S")}',
@@ -2338,7 +2341,7 @@ def build_ical_feed():
             status = 'already downloaded' if ev['has_file'] else 'not yet downloaded'
             lines += [
                 'BEGIN:VEVENT',
-                f'UID:driparr-sonarr-{i}-{ev["air_date"].isoformat()}-{ics_uid_slug(ev["show_name"])}@driparr',
+                f'UID:unbinge-sonarr-{i}-{ev["air_date"].isoformat()}-{ics_uid_slug(ev["show_name"])}@unbinge',
                 f'DTSTAMP:{now_stamp}',
                 f'DTSTART;VALUE=DATE:{ev["air_date"].strftime("%Y%m%d")}',
                 f'SUMMARY:📡 {ics_escape(ev["show_name"])} {ep_label} airs',
@@ -2822,7 +2825,7 @@ def run_drip_job(force_show_id=None):
     today_str = today_local().isoformat()
 
     # Missed-run notification - previously detect_missed_run() only drove a
-    # dashboard banner, which you'd only see by opening Driparr. Firing it
+    # dashboard banner, which you'd only see by opening Unbinge. Firing it
     # here too means the scheduled job itself can tell you it noticed a gap,
     # without needing to check the dashboard proactively.
     if force_show_id is None:
@@ -3001,11 +3004,11 @@ def _should_start_background_work():
     child's. Reading the environment directly is the check that actually
     distinguishes the two.
 
-    DRIPARR_TESTING short-circuits the whole block. Importing this module runs
+    UNBINGE_TESTING short-circuits the whole block. Importing this module runs
     it, so without that escape hatch merely collecting the test suite would
     start a real scheduler, reconcile real paths, and post to the real Discord
     webhook. Tests call init_db() themselves against a temporary database."""
-    if os.environ.get('DRIPARR_TESTING') == '1':
+    if os.environ.get('UNBINGE_TESTING') == '1':
         return False
 
     debug_mode = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
@@ -3083,7 +3086,7 @@ def serve_calendar_ics():
     over the public internet - a localhost or LAN-only address works fine
     when you open it yourself, but Google's fetcher has no way to reach
     it, which silently looks identical to "hasn't refreshed yet." If
-    Driparr isn't reachable from outside your network, use
+    Unbinge isn't reachable from outside your network, use
     /calendar-download instead for a one-off file you import by hand."""
     try:
         ics_text = build_ical_feed()
@@ -3093,7 +3096,7 @@ def serve_calendar_ics():
 
     return ics_text, 200, {
         'Content-Type': 'text/calendar; charset=utf-8',
-        'Content-Disposition': 'inline; filename="driparr-schedule.ics"',
+        'Content-Disposition': 'inline; filename="unbinge-schedule.ics"',
     }
 
 
@@ -3101,7 +3104,7 @@ def serve_calendar_ics():
 def download_calendar_ics():
     """A one-off downloadable .ics file, for importing by hand into Google
     Calendar (Settings -> Import & export -> Import) rather than
-    subscribing to a live URL. This is the answer for anyone whose Driparr
+    subscribing to a live URL. This is the answer for anyone whose Unbinge
     isn't reachable from the public internet, since Google's import feature
     accepts an uploaded file directly and never needs to fetch anything
     itself.
@@ -3123,7 +3126,7 @@ def download_calendar_ics():
         log.error("Calendar file generation failed: %s", e)
         return "Calendar generation failed - check the container logs.", 500
 
-    filename = f"driparr-schedule-{today_local().isoformat()}.ics"
+    filename = f"unbinge-schedule-{today_local().isoformat()}.ics"
     return ics_text, 200, {
         'Content-Type': 'text/calendar; charset=utf-8',
         'Content-Disposition': f'attachment; filename="{filename}"',
@@ -3140,7 +3143,7 @@ def serve_poster(filename):
 
 def gather_system_checks():
     """Consolidates every health-relevant signal that already exists
-    somewhere in Driparr - database, scheduler, disk space, TVDB, Sonarr,
+    somewhere in Unbinge - database, scheduler, disk space, TVDB, Sonarr,
     path drift - into one list, instead of them being scattered across
     separate banners and endpoints with no single place to look. Each item
     is {'label', 'status': 'ok'|'warn'|'error', 'detail'}."""
@@ -3947,11 +3950,11 @@ def create_db_backup(destination_dir=None):
     destination_dir = destination_dir or BACKUPS_DIR
     os.makedirs(destination_dir, exist_ok=True)
     timestamp = now_local().strftime('%Y%m%d-%H%M%S-%f')
-    filename = f'driparr-backup-{timestamp}.db'
+    filename = f'unbinge-backup-{timestamp}.db'
     path = os.path.join(destination_dir, filename)
     suffix = 1
     while os.path.exists(path):
-        path = os.path.join(destination_dir, f'driparr-backup-{timestamp}-{suffix}.db')
+        path = os.path.join(destination_dir, f'unbinge-backup-{timestamp}-{suffix}.db')
         suffix += 1
 
     src = sqlite3.connect(DB_FILE)
@@ -3963,6 +3966,16 @@ def create_db_backup(destination_dir=None):
     return path
 
 
+# Old backups created before the Driparr->Unbinge rename are still named
+# "driparr-backup-*.db" on disk - they're recognized here too so pruning
+# and the Settings backup list don't silently orphan pre-rename backups.
+BACKUP_FILENAME_PREFIXES = ('unbinge-backup-', 'driparr-backup-')
+
+
+def _is_backup_filename(filename):
+    return filename.endswith('.db') and filename.startswith(BACKUP_FILENAME_PREFIXES)
+
+
 def prune_old_backups(keep=7):
     """Deletes all but the most recent `keep` backups in BACKUPS_DIR. Called
     after every scheduled backup so the directory doesn't grow forever -
@@ -3972,7 +3985,7 @@ def prune_old_backups(keep=7):
     if not os.path.isdir(BACKUPS_DIR):
         return
     backups = sorted(
-        (f for f in os.listdir(BACKUPS_DIR) if f.startswith('driparr-backup-') and f.endswith('.db')),
+        (f for f in os.listdir(BACKUPS_DIR) if _is_backup_filename(f)),
         reverse=True
     )
     for old in backups[keep:]:
@@ -4032,7 +4045,7 @@ def api_list_backups():
     if not os.path.isdir(BACKUPS_DIR):
         return jsonify({"status": "success", "backups": []})
     files = sorted(
-        (f for f in os.listdir(BACKUPS_DIR) if f.startswith('driparr-backup-') and f.endswith('.db')),
+        (f for f in os.listdir(BACKUPS_DIR) if _is_backup_filename(f)),
         reverse=True
     )
     backups = []

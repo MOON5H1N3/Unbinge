@@ -1,4 +1,4 @@
-/* Driparr shared JS - toasts, flash banners, and a reusable confirm modal.
+/* Unbinge shared JS - toasts, flash banners, and a reusable confirm modal.
  *
  * U8: replaces alert()/confirm() throughout the app with in-app UI.
  * U10: gives every action (save, pause, delete) visible feedback instead of
@@ -18,18 +18,18 @@
     window.fetch = function (input, init) {
         init = init || {};
         const method = (init.method || 'GET').toUpperCase();
-        if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method) && window.DRIPARR_CSRF_TOKEN) {
+        if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method) && window.UNBINGE_CSRF_TOKEN) {
             if (init.headers instanceof Headers) {
-                if (!init.headers.has('X-CSRFToken')) init.headers.set('X-CSRFToken', window.DRIPARR_CSRF_TOKEN);
+                if (!init.headers.has('X-CSRFToken')) init.headers.set('X-CSRFToken', window.UNBINGE_CSRF_TOKEN);
             } else {
-                init.headers = { 'X-CSRFToken': window.DRIPARR_CSRF_TOKEN, ...(init.headers || {}) };
+                init.headers = { 'X-CSRFToken': window.UNBINGE_CSRF_TOKEN, ...(init.headers || {}) };
             }
         }
         return originalFetch(input, init);
     };
 })();
 
-function driparrToast(message, kind = 'info') {
+function unbingeToast(message, kind = 'info') {
     let stack = document.getElementById('toast-stack');
     if (!stack) {
         stack = document.createElement('div');
@@ -53,32 +53,32 @@ function driparrToast(message, kind = 'info') {
  * it as a toast, then strips it from the address bar so a refresh doesn't
  * repeat it. This is what makes edit/pause/delete give feedback after a
  * full-page redirect, without needing a session-based flash store. */
-function driparrShowFlashFromQuery() {
+function unbingeShowFlashFromQuery() {
     const params = new URLSearchParams(window.location.search);
     const msg = params.get('flash');
     if (!msg) return;
     const kind = params.get('flash_kind') || 'info';
-    driparrToast(decodeURIComponent(msg), kind);
+    unbingeToast(decodeURIComponent(msg), kind);
     params.delete('flash');
     params.delete('flash_kind');
     const clean = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
     window.history.replaceState({}, '', clean);
 }
-document.addEventListener('DOMContentLoaded', driparrShowFlashFromQuery);
+document.addEventListener('DOMContentLoaded', unbingeShowFlashFromQuery);
 
 /* Confirm modal - returns a Promise<boolean>. Usage:
- *   const ok = await driparrConfirm({title, body, confirmLabel, danger});
+ *   const ok = await unbingeConfirm({title, body, confirmLabel, danger});
  *   if (!ok) return;
  * Escape and backdrop-click both resolve false (U15's fix applied here too,
  * since this modal replaces the ones that lacked it). */
-function driparrConfirm({ title = 'Are you sure?', body = '', confirmLabel = 'Confirm', danger = false } = {}) {
+function unbingeConfirm({ title = 'Are you sure?', body = '', confirmLabel = 'Confirm', danger = false } = {}) {
     return new Promise((resolve) => {
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay open';
         overlay.innerHTML = `
-            <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="driparr-confirm-title">
+            <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="unbinge-confirm-title">
                 <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                    <h3 id="driparr-confirm-title">${title}</h3>
+                    <h3 id="unbinge-confirm-title">${title}</h3>
                     <button type="button" class="modal-close-btn" aria-label="Close">&times;</button>
                 </div>
                 <p>${body}</p>

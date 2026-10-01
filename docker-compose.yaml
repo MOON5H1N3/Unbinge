@@ -1,7 +1,7 @@
 services:
-  plex-drip:
+  unbinge:
     build: .
-    container_name: plex-drip
+    container_name: unbinge
     ports:
       - "5000:5000"
     environment:
@@ -16,9 +16,21 @@ services:
       # NOTE: these must be container-side paths (they live under the /media/A
       # mount below), not the host's Windows path - the container never sees
       # your "A:" drive letter directly.
+      #
+      # Left pointing at the old "driparr" folder names deliberately - these
+      # are real paths on your actual A: drive. Renaming them here without
+      # first renaming the matching folders on disk would make the app look
+      # for a vault/plex folder that doesn't exist and most likely fail to
+      # start. If you want these renamed too, rename the folders on the A:
+      # drive yourself first, then update both lines below to match.
       - VAULT_DIR=/media/A/driparr/media/vault
       - PLEX_BASE_DIR=/media/A/driparr/media/Plex Path
       - DB_PATH=/config/drip_schedule.db
+      # Optional: a shared password to gate the whole app (unset = no auth,
+      # the default). Was DRIPARR_PASSWORD before this rename - that name
+      # still works too if you already have it set, so there's no rush to
+      # change it.
+      # - UNBINGE_PASSWORD=
     volumes:
       - ./config:/config
       # Maps your Windows A: drive root into the container as /media/A.
