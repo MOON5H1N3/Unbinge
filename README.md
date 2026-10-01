@@ -73,11 +73,13 @@ Point a Plex library at the same folder as `PLEX_BASE_DIR` so released episodes 
 
 Once you've cloned the repo as above, pull in new releases with the bundled update script instead of doing it by hand:
 
-```bash
-./update.sh
-```
+- **Windows:** double-click `update.bat` in your Unbinge folder (or run it from a terminal).
+- **macOS/Linux:**
+  ```bash
+  ./update.sh
+  ```
 
-It backs up the database, refuses to run if you've got uncommitted local edits, `git pull`s, rebuilds the image, restarts the container, and waits for `/health` to come back before declaring success. Run it from the same directory as `docker-compose.yaml`.
+Either one backs up the database, refuses to run if you've got uncommitted local edits, `git pull`s, rebuilds the image, restarts the container, and waits for `/health` to come back before declaring success. Run it from the same directory as `docker-compose.yaml` (this is already true if you double-click it from Explorer).
 
 If you'd rather update manually:
 
