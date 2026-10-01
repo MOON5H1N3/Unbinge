@@ -1,6 +1,7 @@
 """Tests for S2 (CSRF) and S3 (single shared password auth).
 
-Auth is opt-in via the DRIPARR_PASSWORD environment variable - the default
+Auth is opt-in via the UNBINGE_PASSWORD environment variable (or the older
+DRIPARR_PASSWORD) - the default
 (unset) must leave the app exactly as it always behaved, since making auth
 suddenly mandatory on upgrade would lock people out of their own install.
 
@@ -221,3 +222,30 @@ def test_secret_key_bootstrap_does_not_touch_disk_under_testing(harness):
     container was started with, before test isolation ever kicked in."""
     key = driparr._get_or_create_secret_key()
     assert key == 'test-secret-key-not-for-production'
+
+
+# ---------------------------------------------------------------------------
+# Password variable: UNBINGE_PASSWORD, with DRIPARR_PASSWORD kept working
+# for installs from before the rename.
+# ---------------------------------------------------------------------------
+
+def _auth_password_with_env(tmp_path, **env_vars):
+    import os, subprocess, sys
+    env = {k: v for k, v in os.environ.items() if k not in ('UNBINGE_PASSWORD', 'DRIPARR_PASSWORD')}
+    env.update(DRIPARR_TESTING='1', DB_PATH=str(tmp_path / 'env_test.db'), **env_vars)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run([sys.executable, '-c', 'import app; print(repr(app.AUTH_PASSWORD))'],
+                         cwd=root, env=env, capture_output=True, text=True, check=True)
+    return out.stdout.strip().splitlines()[-1]
+
+
+def test_unbinge_password_variable_enables_auth(tmp_path):
+    assert _auth_password_with_env(tmp_path, UNBINGE_PASSWORD='new') == "'new'"
+
+
+def test_old_driparr_password_variable_still_works(tmp_path):
+    assert _auth_password_with_env(tmp_path, DRIPARR_PASSWORD='old') == "'old'"
+
+
+def test_unbinge_password_wins_when_both_are_set(tmp_path):
+    assert _auth_password_with_env(tmp_path, UNBINGE_PASSWORD='new', DRIPARR_PASSWORD='old') == "'new'"

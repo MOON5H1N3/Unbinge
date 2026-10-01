@@ -7,7 +7,7 @@ monkeypatched to point at them.
 
 Run inside the container:
 
-    docker compose exec plex-drip python -m pytest tests/ -v
+    docker compose exec unbinge python -m pytest tests/ -v
 """
 
 import os

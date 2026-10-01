@@ -1,7 +1,7 @@
 services:
-  plex-drip:
+  unbinge:
     build: .
-    container_name: plex-drip
+    container_name: unbinge
     ports:
       - "5000:5000"
     environment:

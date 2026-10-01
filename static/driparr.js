@@ -1,4 +1,4 @@
-/* Driparr shared JS - toasts, flash banners, and a reusable confirm modal.
+/* Unbinge shared JS - toasts, flash banners, and a reusable confirm modal.
  *
  * U8: replaces alert()/confirm() throughout the app with in-app UI.
  * U10: gives every action (save, pause, delete) visible feedback instead of

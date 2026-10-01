@@ -42,7 +42,7 @@ def inject_shared_template_context():
 # ---------------------------------------------------------------------------
 # Auth (S3) and CSRF (S2)
 #
-# Single shared password, opt-in via the DRIPARR_PASSWORD environment
+# Single shared password, opt-in via the UNBINGE_PASSWORD environment
 # variable. If it's unset, auth is fully disabled and the app behaves
 # exactly as it always has - this is a deliberate default, not an
 # oversight: shipping auth as suddenly-mandatory on upgrade would lock
@@ -50,11 +50,13 @@ def inject_shared_template_context():
 # outcome than staying open until someone deliberately turns it on.
 #
 # CSRF protection only matters once there's a session cookie to steal, so
-# it's gated behind the same DRIPARR_PASSWORD check - an unauthenticated,
+# it's gated behind the same UNBINGE_PASSWORD check - an unauthenticated,
 # fully-open install has no session for a forged request to ride on.
 # ---------------------------------------------------------------------------
 
-AUTH_PASSWORD = os.environ.get('DRIPARR_PASSWORD', '')
+# UNBINGE_PASSWORD is the current name; DRIPARR_PASSWORD still works for
+# installs set up before the rename.
+AUTH_PASSWORD = os.environ.get('UNBINGE_PASSWORD') or os.environ.get('DRIPARR_PASSWORD', '')
 
 AUTH_EXEMPT_PATHS = ('/login', '/logout', '/calendar.ics', '/health', '/static/', '/posters/')
 
@@ -128,7 +130,7 @@ def logout():
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("driparr")
+log = logging.getLogger("unbinge")
 
 # ---------------------------------------------------------------------------
 # Config (all container-side paths; comes from docker-compose environment)
@@ -211,7 +213,7 @@ APP_VERSION = '0.2.0'
 
 
 def _resolve_timezone():
-    """Resolves the timezone Driparr schedules against.
+    """Resolves the timezone Unbinge schedules against.
 
     Previously everything used naive local time, which inside a container is
     UTC unless TZ is set - so a drip configured for 03:00 actually fired at
@@ -323,7 +325,7 @@ def get_db():
     except sqlite3.OperationalError as e:
         conn.close()
         raise RuntimeError(
-            f"Cannot write to the Driparr database at {DB_FILE} ({e}). "
+            f"Cannot write to the Unbinge database at {DB_FILE} ({e}). "
             f"This is almost always a permissions problem on the mounted config "
             f"directory rather than a database fault - check that the user the "
             f"container runs as can write to {os.path.dirname(DB_FILE)}."
@@ -1021,9 +1023,9 @@ def get_recommendations_for_show(show_id):
 
 def sonarr_get_calendar(days_ahead=14):
     """Fetches upcoming episode air dates across the user's WHOLE Sonarr
-    library (every monitored show, not just ones synced into Driparr).
+    library (every monitored show, not just ones synced into Unbinge).
 
-    This is a genuinely different thing from Driparr's own schedule: Driparr
+    This is a genuinely different thing from Unbinge's own schedule: Unbinge
     projects when files ALREADY ON DISK will drip into Plex on a schedule
     you set; this reports when episodes are actually airing/being released
     according to Sonarr, which may not be downloaded yet at all.
@@ -1186,7 +1188,7 @@ def build_schedule_embed():
 
     return {
         "embeds": [{
-            "title": "📅 Driparr Schedule",
+            "title": "📅 Unbinge Schedule",
             "description": description[:4096],
             "color": 0x5865F2,
             "timestamp": datetime.now(dt_timezone.utc).isoformat(),
@@ -2286,7 +2288,7 @@ def ics_fold_line(line):
 
 
 def build_ical_feed():
-    """Builds the combined .ics calendar: Driparr's own projected
+    """Builds the combined .ics calendar: Unbinge's own projected
     drip/cooldown/graduate schedule, plus - if Sonarr is configured - real
     upcoming air dates across the whole Sonarr library. Two clearly
     different event types in one feed, since Google Calendar subscribes to
@@ -2300,10 +2302,10 @@ def build_ical_feed():
     lines = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
-        'PRODID:-//Driparr//Schedule//EN',
+        'PRODID:-//Unbinge//Schedule//EN',
         'CALSCALE:GREGORIAN',
         'METHOD:PUBLISH',
-        'X-WR-CALNAME:Driparr Schedule',
+        'X-WR-CALNAME:Unbinge Schedule',
         'REFRESH-INTERVAL;VALUE=DURATION:PT12H',
     ]
 
@@ -2822,7 +2824,7 @@ def run_drip_job(force_show_id=None):
     today_str = today_local().isoformat()
 
     # Missed-run notification - previously detect_missed_run() only drove a
-    # dashboard banner, which you'd only see by opening Driparr. Firing it
+    # dashboard banner, which you'd only see by opening Unbinge. Firing it
     # here too means the scheduled job itself can tell you it noticed a gap,
     # without needing to check the dashboard proactively.
     if force_show_id is None:
@@ -3083,7 +3085,7 @@ def serve_calendar_ics():
     over the public internet - a localhost or LAN-only address works fine
     when you open it yourself, but Google's fetcher has no way to reach
     it, which silently looks identical to "hasn't refreshed yet." If
-    Driparr isn't reachable from outside your network, use
+    Unbinge isn't reachable from outside your network, use
     /calendar-download instead for a one-off file you import by hand."""
     try:
         ics_text = build_ical_feed()
@@ -3093,7 +3095,7 @@ def serve_calendar_ics():
 
     return ics_text, 200, {
         'Content-Type': 'text/calendar; charset=utf-8',
-        'Content-Disposition': 'inline; filename="driparr-schedule.ics"',
+        'Content-Disposition': 'inline; filename="unbinge-schedule.ics"',
     }
 
 
@@ -3101,7 +3103,7 @@ def serve_calendar_ics():
 def download_calendar_ics():
     """A one-off downloadable .ics file, for importing by hand into Google
     Calendar (Settings -> Import & export -> Import) rather than
-    subscribing to a live URL. This is the answer for anyone whose Driparr
+    subscribing to a live URL. This is the answer for anyone whose Unbinge
     isn't reachable from the public internet, since Google's import feature
     accepts an uploaded file directly and never needs to fetch anything
     itself.
@@ -3123,7 +3125,7 @@ def download_calendar_ics():
         log.error("Calendar file generation failed: %s", e)
         return "Calendar generation failed - check the container logs.", 500
 
-    filename = f"driparr-schedule-{today_local().isoformat()}.ics"
+    filename = f"unbinge-schedule-{today_local().isoformat()}.ics"
     return ics_text, 200, {
         'Content-Type': 'text/calendar; charset=utf-8',
         'Content-Disposition': f'attachment; filename="{filename}"',
@@ -3140,7 +3142,7 @@ def serve_poster(filename):
 
 def gather_system_checks():
     """Consolidates every health-relevant signal that already exists
-    somewhere in Driparr - database, scheduler, disk space, TVDB, Sonarr,
+    somewhere in Unbinge - database, scheduler, disk space, TVDB, Sonarr,
     path drift - into one list, instead of them being scattered across
     separate banners and endpoints with no single place to look. Each item
     is {'label', 'status': 'ok'|'warn'|'error', 'detail'}."""
