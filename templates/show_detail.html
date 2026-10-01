@@ -6,14 +6,14 @@
 <style>
     .ep-chip {
         display: inline-flex; align-items: center; justify-content: center;
-        min-width: 30px; height: 24px; padding: 0 5px; border-radius: 3px;
+        min-width: 30px; height: 24px; padding: 0 5px; border-radius: var(--radius);
         font-size: 10.5px; font-weight: 600; cursor: pointer; border: none;
         font-family: inherit;
     }
-    .ep-dripped { background: var(--pill-complete); color: var(--pill-complete-text); }
-    .ep-waiting { background: var(--pill-partial); color: var(--pill-partial-text); }
-    .ep-missing { background: var(--pill-idle); color: var(--pill-idle-text); opacity: 0.6; }
-    .ep-excluded { background: var(--pill-missing); color: var(--pill-missing-text); text-decoration: line-through; opacity: 0.7; }
+    .ep-dripped { background: var(--pill-complete-bg); color: var(--pill-complete-text); }
+    .ep-waiting { background: var(--pill-partial-bg); color: var(--pill-partial-text); }
+    .ep-missing { background: var(--pill-idle-bg); color: var(--pill-idle-text); opacity: 0.6; }
+    .ep-excluded { background: var(--pill-missing-bg); color: var(--pill-missing-text); text-decoration: line-through; opacity: 0.7; }
     .ep-grid { display: flex; flex-wrap: wrap; gap: 5px; }
     .season-block { margin-bottom: 1.1rem; }
     .season-title { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
@@ -102,10 +102,10 @@
 <div class="panel">
     <h2>episodes <span class="cell-faint" style="font-weight:400;">({{ dripped_count }} / {{ total_eps }} dripped)</span></h2>
     <div class="legend">
-        <span><i class="dot-sample" style="background:var(--pill-complete);"></i>dripped</span>
-        <span><i class="dot-sample" style="background:var(--pill-partial);"></i>waiting in vault</span>
-        <span><i class="dot-sample" style="background:var(--pill-idle); opacity:0.6;"></i>missing</span>
-        <span><i class="dot-sample" style="background:var(--pill-missing);"></i>excluded</span>
+        <span><i class="dot-sample" style="background:var(--pill-complete-bg);"></i>dripped</span>
+        <span><i class="dot-sample" style="background:var(--pill-partial-bg);"></i>waiting in vault</span>
+        <span><i class="dot-sample" style="background:var(--pill-idle-bg); opacity:0.6;"></i>missing</span>
+        <span><i class="dot-sample" style="background:var(--pill-missing-bg);"></i>excluded</span>
     </div>
 
     {% for season in seasons_sorted %}

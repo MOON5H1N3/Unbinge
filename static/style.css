@@ -315,7 +315,7 @@ table.data-table a:hover { text-decoration: underline; }
    ------------------------------------------------------------------- */
 .pill {
     display: inline-block; font-size: 11px; font-weight: 600;
-    text-align: center; border-radius: 3px; padding: 3px 10px;
+    text-align: center; border-radius: 20px; padding: 3px 11px;
     min-width: 46px;
 }
 .pill-complete { background: var(--pill-complete-bg); color: var(--pill-complete-text); }
@@ -562,7 +562,7 @@ table.data-table a:hover { text-decoration: underline; }
 }
 .poster-card {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column;
+    border-radius: var(--radius-lg); overflow: hidden; display: flex; flex-direction: column;
 }
 .poster-card-image {
     aspect-ratio: 2 / 3; width: 100%; background: var(--surface-raised);
@@ -571,7 +571,7 @@ table.data-table a:hover { text-decoration: underline; }
 }
 .poster-card-image img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .poster-card-pill { position: absolute; top: 6px; right: 6px; }
-.poster-card-body { padding: 8px 9px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
+.poster-card-body { padding: 12px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
 .poster-card-title {
     font-size: 12px; font-weight: 500; line-height: 1.3;
     overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
@@ -583,6 +583,53 @@ table.data-table a:hover { text-decoration: underline; }
     margin-top: auto; padding-top: 6px; border-top: 1px solid var(--border);
 }
 .poster-card-actions .icon-row .btn-icon { width: 24px; height: 24px; }
+
+/* ---------------------------------------------------------------------
+   Dashboard poster cards ("series" grid view) - the full mockup
+   treatment: rounded panel, placeholder-initial header, tick-mark
+   progress meter in place of a numeric pill for active/dripping shows.
+   ------------------------------------------------------------------- */
+#posterGridView {
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 18px;
+}
+.show-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 18px; display: flex; flex-direction: column;
+    gap: 12px; position: relative;
+}
+.show-card-select {
+    position: absolute; top: 14px; left: 14px; z-index: 2;
+}
+.show-card-header { display: flex; align-items: center; gap: 11px; }
+.show-card-poster {
+    width: 42px; height: 60px; object-fit: cover; border-radius: var(--radius);
+    flex-shrink: 0; background: var(--surface-raised);
+}
+.show-card-avatar {
+    width: 42px; height: 60px; border-radius: var(--radius); flex-shrink: 0;
+    background: var(--accent-bg); color: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mast); font-style: italic; font-weight: 600; font-size: 22px;
+}
+.show-card-titles { min-width: 0; flex: 1; }
+.show-card-title {
+    font-size: 15px; font-weight: 700; line-height: 1.3;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.show-card-title a { color: var(--text); text-decoration: none; }
+.show-card-meta { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+
+.tick-meter { display: flex; gap: 3px; }
+.tick-meter .tick { flex: 1; height: 6px; border-radius: 3px; background: var(--border); }
+.tick-meter .tick.filled { background: var(--accent); }
+
+.show-card-actions {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--border);
+}
+.show-card-actions .btn-icon { color: var(--text-muted); }
+.show-card-actions .btn-icon:hover { color: var(--accent); background: var(--accent-bg); }
 
 /* ---------------------------------------------------------------------
    Calendar / schedule page
@@ -622,7 +669,7 @@ table.data-table a:hover { text-decoration: underline; }
 /* ---------------------------------------------------------------------
    History page
    ------------------------------------------------------------------- */
-.action-tag { padding: 2px 8px; border-radius: 3px; font-size: 10.5px; font-weight: 600; display: inline-block; }
+.action-tag { padding: 2px 9px; border-radius: 20px; font-size: 10.5px; font-weight: 600; display: inline-block; }
 .action-dripped { background: var(--pill-complete-bg); color: var(--pill-complete-text); }
 .action-cooldown { background: var(--pill-partial-bg); color: var(--pill-partial-text); }
 .action-graduated { background: var(--pill-complete-strong-bg); color: var(--pill-complete-strong-text); }

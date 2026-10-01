@@ -180,47 +180,63 @@
 
 <div class="poster-grid" id="posterGridView" style="display:none;">
     {% for show in shows %}
-    <div class="poster-card" data-show-name="{{ show.show_name|lower }}"
-         data-status="{{ 'paused' if show.paused else ('cooldown' if show.completed_at else 'active') }}"
+    {% set status = 'paused' if show.paused else ('cooldown' if show.completed_at else 'active') %}
+    {% set nu = next_up_map.get(show.show_name) %}
+    <div class="show-card" data-show-name="{{ show.show_name|lower }}"
+         data-status="{{ status }}"
          data-tags="{{ show.tags|join(',')|lower }}"
          data-show-id="{{ show.id }}">
-        <div class="poster-card-image">
-            <input type="checkbox" class="row-select-cb" value="{{ show.id }}" onchange="updateBulkBar()" style="position:absolute; top:6px; left:6px; z-index:2;">
+        <input type="checkbox" class="row-select-cb show-card-select" value="{{ show.id }}" onchange="updateBulkBar()">
+        <div class="show-card-header">
             {% if show.poster_url %}
-            <img src="{{ show.poster_url }}" alt="" loading="lazy">
+            <img src="{{ show.poster_url }}" alt="" class="show-card-poster" loading="lazy">
             {% else %}
-            {{ icon('image', 26) }}
+            <span class="show-card-avatar">{{ show.show_name[0]|upper }}</span>
             {% endif %}
-            {% if show.episodes_total == 0 %}
-                <span class="pill pill-idle poster-card-pill">not started</span>
-            {% else %}
-                {% set ratio = show.episodes_dripped / show.episodes_total %}
-                <span class="pill {{ 'pill-complete' if ratio >= 0.9 else ('pill-partial' if ratio >= 0.5 else 'pill-missing') }} poster-card-pill">
-                    {{ show.episodes_dripped }}/{{ show.episodes_total }}
-                </span>
-            {% endif %}
-        </div>
-        <div class="poster-card-body">
-            <div class="poster-card-title"><a href="/show/{{ show.id }}" style="color:var(--text); text-decoration:none;">{{ show.show_name }}</a></div>
-            <div class="poster-card-meta">
-                {% if show.paused %}paused
-                {% elif show.completed_at %}cooldown
-                {% else %}{{ show.release_days_display }}
-                {% endif %}
-            </div>
-            <div class="poster-card-actions" data-show-name="{{ show.show_name }}">
-                <div class="icon-row">
-                    <a href="/show/{{ show.id }}" class="btn-icon" title="edit" aria-label="edit">{{ icon('edit', 13) }}</a>
-                    <button type="button" class="btn-icon" title="drip now" aria-label="drip now" onclick="dripNow(this, {{ show.id }}, this.closest('[data-show-name]').dataset.showName)">{{ icon('droplet', 13) }}</button>
+            <div class="show-card-titles">
+                <div class="show-card-title"><a href="/show/{{ show.id }}">{{ show.show_name }}</a></div>
+                <div class="show-card-meta">
+                    {% if show.paused %}
+                        paused
+                    {% elif status == 'active' and show.episodes_total > 0 %}
+                        ep {{ show.episodes_dripped }} of {{ show.episodes_total }}{% if nu and nu.date %} · drops {{ nu.date.strftime('%a') }}{% endif %}
+                    {% elif status == 'cooldown' %}
+                        cooldown{% if nu and nu.action == 'graduate' %} · back {{ nu.date.strftime('%a %b %d') }}{% endif %}
+                    {% else %}
+                        {{ show.release_days_display }}
+                    {% endif %}
                 </div>
-                <div class="menu-wrap">
-                    <button type="button" class="btn-icon" title="more" aria-label="more actions" aria-haspopup="true" onclick="toggleActionMenu(event, this)">{{ icon('dots-vertical', 13) }}</button>
-                    <div class="menu">
-                        <button type="button" onclick="previewShow({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('search', 14) }}preview</button>
-                        <button type="button" onclick="openTvdbModal({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('link', 14) }}link poster</button>
-                        <button type="button" onclick="togglePause(this, {{ show.id }}); closeAllActionMenus();">{{ icon('pause', 14) }}{{ 'resume' if show.paused else 'pause' }}</button>
-                        <button type="button" class="danger" onclick="deleteShow(this, {{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName, {{ (show.episodes_remaining + show.episodes_dripped) }}); closeAllActionMenus();">{{ icon('trash', 14) }}delete</button>
-                    </div>
+            </div>
+        </div>
+
+        {% if status == 'active' and show.episodes_total > 0 %}
+            {% set ratio = show.episodes_dripped / show.episodes_total %}
+            {% set filled_ticks = (ratio * 8)|round(0, 'floor')|int %}
+            <div class="tick-meter" title="{{ show.episodes_dripped }} / {{ show.episodes_total }} episodes dripped">
+                {% for i in range(8) %}
+                <span class="tick {{ 'filled' if i < filled_ticks else '' }}"></span>
+                {% endfor %}
+            </div>
+        {% elif show.paused %}
+            <span class="pill pill-idle">paused</span>
+        {% elif status == 'cooldown' %}
+            <span class="pill pill-partial">cooldown</span>
+        {% else %}
+            <span class="pill pill-idle">not started</span>
+        {% endif %}
+
+        <div class="show-card-actions" data-show-name="{{ show.show_name }}">
+            <div class="icon-row">
+                <a href="/show/{{ show.id }}" class="btn-icon" title="edit" aria-label="edit">{{ icon('edit', 15) }}</a>
+                <button type="button" class="btn-icon" title="drip now" aria-label="drip now" onclick="dripNow(this, {{ show.id }}, this.closest('[data-show-name]').dataset.showName)">{{ icon('droplet', 15) }}</button>
+            </div>
+            <div class="menu-wrap">
+                <button type="button" class="btn-icon" title="more" aria-label="more actions" aria-haspopup="true" onclick="toggleActionMenu(event, this)">{{ icon('dots-vertical', 15) }}</button>
+                <div class="menu">
+                    <button type="button" onclick="previewShow({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('search', 14) }}preview</button>
+                    <button type="button" onclick="openTvdbModal({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('link', 14) }}link poster</button>
+                    <button type="button" onclick="togglePause(this, {{ show.id }}); closeAllActionMenus();">{{ icon('pause', 14) }}{{ 'resume' if show.paused else 'pause' }}</button>
+                    <button type="button" class="danger" onclick="deleteShow(this, {{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName, {{ (show.episodes_remaining + show.episodes_dripped) }}); closeAllActionMenus();">{{ icon('trash', 14) }}delete</button>
                 </div>
             </div>
         </div>
@@ -403,7 +419,7 @@ function applyTableFilters() {
     const noResultsRow = document.getElementById('noResultsRow');
     if (noResultsRow) noResultsRow.style.display = (visibleInTable === 0 && tableRows.length > 0) ? '' : 'none';
 
-    const gridCards = document.querySelectorAll('#posterGridView .poster-card');
+    const gridCards = document.querySelectorAll('#posterGridView .show-card');
     let visibleInGrid = 0;
     gridCards.forEach(card => {
         const show = card.dataset.showName.includes(q) &&
@@ -441,8 +457,8 @@ function setDashboardView(view) {
     try { localStorage.setItem('unbinge_dashboard_view', view); } catch (e) {}
 }
 (function () {
-    let saved = 'table';
-    try { saved = localStorage.getItem('unbinge_dashboard_view') || 'table'; } catch (e) {}
+    let saved = 'grid';
+    try { saved = localStorage.getItem('unbinge_dashboard_view') || 'grid'; } catch (e) {}
     setDashboardView(saved);
 })();
 
