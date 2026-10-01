@@ -10,10 +10,10 @@
         font-size: 10.5px; font-weight: 600; cursor: pointer; border: none;
         font-family: inherit;
     }
-    .ep-dripped { background: var(--pill-complete-bg); color: var(--pill-complete-text); }
-    .ep-waiting { background: var(--pill-partial-bg); color: var(--pill-partial-text); }
-    .ep-missing { background: var(--pill-idle-bg); color: var(--pill-idle-text); opacity: 0.6; }
-    .ep-excluded { background: var(--pill-missing-bg); color: var(--pill-missing-text); text-decoration: line-through; opacity: 0.7; }
+    .ep-chip.ep-dripped { background: var(--pill-complete-bg); color: var(--pill-complete-text); }
+    .ep-chip.ep-waiting { background: var(--pill-partial-bg); color: var(--pill-partial-text); }
+    .ep-chip.ep-missing { background: var(--pill-idle-bg); color: var(--pill-idle-text); opacity: 0.6; }
+    .ep-chip.ep-excluded { background: var(--pill-missing-bg); color: var(--pill-missing-text); text-decoration: line-through; opacity: 0.7; }
     .ep-grid { display: flex; flex-wrap: wrap; gap: 5px; }
     .season-block { margin-bottom: 1.1rem; }
     .season-title { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
@@ -31,12 +31,30 @@
 {% endblock %}
 
 {% block content %}
-<div class="page-header">
-    <h1 class="mast">
-        {% if show.poster_url %}<img src="{{ show.poster_url }}" alt="" style="width:24px; height:34px; object-fit:cover; border-radius:2px; vertical-align:middle; margin-right:8px;">{% endif %}
-        {{ show.show_name }}
-    </h1>
+{% set status = 'paused' if show.paused else ('cooldown' if show.completed_at else 'active') %}
+<a href="/" class="cell-faint" style="display:inline-flex; align-items:center; gap:5px; font-size:12.5px; margin-bottom:1rem;">&larr; back to dashboard</a>
+
+<div class="show-hero">
+    <div class="show-hero-avatar">
+        {% if show.poster_url %}<img src="{{ show.poster_url }}" alt="">{% else %}{{ show.show_name[:2]|upper }}{% endif %}
+    </div>
+    <div class="show-hero-info">
+        <h1 class="mast">{{ show.show_name }}</h1>
+        <div class="show-hero-meta">
+            {% if status == 'paused' %}<span class="pill pill-idle">paused</span>
+            {% elif status == 'cooldown' %}<span class="pill pill-partial">cooldown</span>
+            {% else %}<span class="pill pill-complete">dripping</span>{% endif %}
+            <span>episode {{ show.current_episode }} of {{ total_eps }} &middot; {{ dripped_count }} dripped{% if show.release_days_display %} &middot; drops {{ show.release_days_display }}{% endif %}</span>
+        </div>
+    </div>
+    <div class="show-hero-actions">
+        <button type="button" class="btn" id="heroDripBtn">{{ icon('droplet', 14) }}drip now</button>
+        <button type="button" class="btn" id="heroPauseBtn">{{ icon('pause', 14) }}{{ 'resume' if show.paused else 'pause' }}</button>
+    </div>
 </div>
+
+<div class="show-detail-layout">
+<div>
 
 <div class="panel" id="settingsPanel">
     <h2>{{ icon('edit', 14) }}show settings</h2>
@@ -111,13 +129,20 @@
     {% for season in seasons_sorted %}
     <div class="season-block">
         <div class="season-title">{% if season == specials_season %}specials{% else %}season {{ season }}{% endif %}</div>
-        <div class="ep-grid">
+        <div class="ep-list">
             {% for ep in grid[season] %}
             <button type="button"
-                    class="ep-chip ep-{{ ep.status }}"
-                    title="S{{ '%02d'|format(season) }}E{{ '%02d'|format(ep.episode) }} - {{ ep.status }} (click to {{ 'un-exclude' if ep.status == 'excluded' else 'exclude' }})"
+                    class="ep-list-row ep-{{ ep.status }}"
+                    title="click to {{ 'un-exclude' if ep.status == 'excluded' else 'exclude' }}"
                     onclick="toggleExclude({{ season }}, {{ ep.episode }}, '{{ ep.status }}')">
-                {{ '%02d'|format(ep.episode) }}
+                <span class="ep-list-num">{{ ep.episode }}</span>
+                <span class="ep-list-title">S{{ '%02d'|format(season) }}E{{ '%02d'|format(ep.episode) }}</span>
+                <span class="ep-list-status">
+                    {% if ep.status == 'dripped' %}released
+                    {% elif ep.status == 'waiting' %}in vault
+                    {% elif ep.status == 'excluded' %}excluded
+                    {% else %}missing{% endif %}
+                </span>
             </button>
             {% endfor %}
         </div>
@@ -132,6 +157,19 @@
     <h2>{{ icon('alert-triangle', 14) }}unmatched files</h2>
     <p class="panel-hint">these video files don't match a recognizable SxxExx pattern, so they're invisible to the drip pipeline entirely - not counted, not shown, not moved. assign a season and episode to fix that.</p>
     <div id="unmatchedList"></div>
+</div>
+
+</div>
+<div>
+
+<div class="panel">
+    <h2>{{ icon('calendar', 14) }}release schedule</h2>
+    <div class="day-pill-row">
+        {% for day_num, day_letter in [(0,'m'),(1,'t'),(2,'w'),(3,'t'),(4,'f'),(5,'s'),(6,'s')] %}
+        <div class="day-pill {{ 'active' if day_num in show.release_days_set }}">{{ day_letter }}</div>
+        {% endfor %}
+    </div>
+    <p class="hint" style="margin:10px 0 0;">{{ show.episodes_per_drop }} episode{{ 's' if show.episodes_per_drop != 1 }} per drop &middot; {{ 'daily mode on' if show.release_days_set|length == 7 else 'daily mode off' }}</p>
 </div>
 
 <div class="panel">
@@ -180,6 +218,9 @@
         </div>
         <button type="button" class="btn btn-primary btn-sm" onclick="addToQueue()">{{ icon('plus', 13) }}add to queue</button>
     </form>
+</div>
+
+</div>
 </div>
 {% endblock %}
 
@@ -434,5 +475,37 @@ async function loadRecommendations() {
 loadUnmatchedFiles();
 loadQueue();
 loadRecommendations();
+
+document.getElementById('heroDripBtn').addEventListener('click', async (e) => {
+    const button = e.currentTarget;
+    const original = button.innerHTML;
+    button.disabled = true;
+    try {
+        const res = await fetch(`/api/drip-now/${SHOW_ID}`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        unbingeToast(data.message || (res.ok ? 'drip started.' : 'that failed.'), res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => window.location.reload(), 700);
+    } catch (err) {
+        unbingeToast('network error.', 'error');
+    } finally {
+        button.disabled = false;
+        button.innerHTML = original;
+    }
+});
+
+document.getElementById('heroPauseBtn').addEventListener('click', async (e) => {
+    const button = e.currentTarget;
+    button.disabled = true;
+    try {
+        const res = await fetch(`/toggle-pause/${SHOW_ID}`, { method: 'POST', headers: { 'X-Requested-With': 'fetch' } });
+        const data = await res.json().catch(() => ({}));
+        unbingeToast(data.message || (res.ok ? 'updated.' : 'that failed.'), res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+        unbingeToast('network error.', 'error');
+    } finally {
+        button.disabled = false;
+    }
+});
 </script>
 {% endblock %}

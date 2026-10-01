@@ -4186,6 +4186,9 @@ def show_detail(show_id):
     # toggle) can be pre-checked identically on both pages.
     release_days_raw = show.get('release_days') or str(show.get('release_day', '0'))
     show['release_days_set'] = set(parse_release_days(release_days_raw))
+    # Same display string the dashboard uses ("mon, wed, fri"), for the
+    # hero header's meta line.
+    show['release_days_display'] = format_release_days(release_days_raw)
 
     grid = build_episode_grid(show_id, show)
     seasons_sorted = sorted(grid.keys())
