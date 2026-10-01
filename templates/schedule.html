@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Calendar - Driparr{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>calendar</h1>
+</div>
+
+<p class="cell-faint" style="margin: -0.4rem 0 1rem; line-height:1.6;">
+    projected drips based on remaining vault episodes and each show's release day(s).
+    this is a projection, not a guarantee.
+    <a href="/settings" style="color: var(--accent);">subscribe to this schedule →</a>
+</p>
+
+<div class="panel" id="sonarrUpcomingCard" style="display:none;">
+    <h2>{{ icon('flask', 14) }}upcoming on sonarr</h2>
+    <div id="sonarrUpcomingList"></div>
+</div>
+
+<div class="weeks-seg" style="margin-bottom: 1.1rem;">
+    <a href="/schedule?weeks=2"  class="{{ 'active' if weeks_ahead == 2  else '' }}">2 weeks</a>
+    <a href="/schedule?weeks=6"  class="{{ 'active' if weeks_ahead == 6  else '' }}">6 weeks</a>
+    <a href="/schedule?weeks=12" class="{{ 'active' if weeks_ahead == 12 else '' }}">12 weeks</a>
+</div>
+
+{% if ordered_dates %}
+    {% for d in ordered_dates %}
+    <div class="day-group">
+        <div class="day-heading{% if d == today_str %} today{% endif %}">
+            {{ day_labels[d] }}{% if d == today_str %} · today{% elif d == tomorrow_str %} · tomorrow{% endif %}
+        </div>
+        {% for ev in grouped[d] %}
+        <div class="event-row">
+            {% if ev.poster_url %}
+            <img src="{{ ev.poster_url }}" alt="" class="event-poster" loading="lazy">
+            {% else %}
+            <div class="event-icon">
+                {% if ev.action == 'drip' %}{{ icon('droplet', 15) }}
+                {% elif ev.action == 'cooldown' %}{{ icon('clock', 15) }}
+                {% elif ev.action == 'graduate' %}{{ icon('check', 15) }}
+                {% else %}•{% endif %}
+            </div>
+            {% endif %}
+            <div>
+                <div class="event-show">{{ ev.show_name }}</div>
+                <div class="event-detail">{{ ev.detail }}</div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+{% else %}
+    <p class="empty-note">
+        nothing projected in this window - add a show, or
+        <a href="/schedule?weeks=12" style="color: var(--accent);">try 12 weeks</a>.
+    </p>
+{% endif %}
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+fetch('/api/sonarr/calendar?days=14')
+    .then(res => res.json())
+    .then(data => {
+        if (!data.events || data.events.length === 0) return;
+        const card = document.getElementById('sonarrUpcomingCard');
+        const list = document.getElementById('sonarrUpcomingList');
+        card.style.display = 'block';
+
+        data.events.forEach(ev => {
+            const row = document.createElement('div');
+            row.className = 'sonarr-row';
+            const d = new Date(ev.air_date + 'T00:00:00');
+            const dateStr = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+            const epLabel = `s${String(ev.season).padStart(2,'0')}e${String(ev.episode).padStart(2,'0')}`;
+
+            const left = document.createElement('div');
+            const dateSpan = document.createElement('span');
+            dateSpan.className = 'sr-date';
+            dateSpan.textContent = dateStr;
+            const nameSpan = document.createElement('strong');
+            nameSpan.style.fontWeight = '500';
+            nameSpan.textContent = ' ' + ev.show_name + ' ';
+            const epSpan = document.createElement('span');
+            epSpan.className = 'sr-ep';
+            epSpan.textContent = epLabel + (ev.episode_title ? ' - ' + ev.episode_title : '');
+            left.appendChild(dateSpan);
+            left.appendChild(nameSpan);
+            left.appendChild(epSpan);
+
+            const status = document.createElement('span');
+            status.className = 'pill ' + (ev.has_file ? 'pill-complete' : 'pill-missing');
+            status.textContent = ev.has_file ? 'have' : 'missing';
+
+            row.appendChild(left);
+            row.appendChild(status);
+            list.appendChild(row);
+        });
+    })
+    .catch(() => {});
+</script>
+{% endblock %}

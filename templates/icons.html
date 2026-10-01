@@ -1,0 +1,36 @@
+{# Inline SVG icons. No external font/CDN - a self-hosted app running on a
+   homelab shouldn't have its icons break because the internet is down.
+   Usage: {% from "icons.html" import icon %}{{ icon('droplet', 16) }} #}
+
+{% macro icon(name, size=16, extra_class='') %}
+{%- set d = {
+  'droplet': 'M12 2.5C9 6.5 5.5 10.5 5.5 14.5a6.5 6.5 0 0 0 13 0C18.5 10.5 15 6.5 12 2.5z',
+  'grid': 'M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm10 0h6v6h-6v-6z',
+  'calendar': 'M7 2v3M17 2v3M3.5 8.5h17M4 5.5h16A1.5 1.5 0 0 1 21.5 7v13A1.5 1.5 0 0 1 20 21.5H4A1.5 1.5 0 0 1 2.5 20V7A1.5 1.5 0 0 1 4 5.5z',
+  'history': 'M3.5 12a8.5 8.5 0 1 0 2.6-6.1M3.5 4v4.5H8M12 7.5V12l3 2',
+  'settings': 'M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM19.4 12a7.4 7.4 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-2-1.2L14.5 3h-4l-.4 2.6a7.6 7.6 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6a7.4 7.4 0 0 0 0 2.4l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 0 0 2 1.2l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6a7.4 7.4 0 0 0 .1-1.2z',
+  'refresh': 'M4 4v5h5M20 20v-5h-5M4.6 15a8 8 0 0 0 14.2 2.4M19.4 9A8 8 0 0 0 5.2 6.6',
+  'wrench': 'M20 6.5a4.5 4.5 0 0 1-5.9 4.3L7.5 17.4a1.8 1.8 0 0 1-2.6 0l-.3-.3a1.8 1.8 0 0 1 0-2.6l6.6-6.6A4.5 4.5 0 0 1 17.5 2l-3 3 1 1.5 1.5 1 3-3c.3.6.5 1.3.5 2z',
+  'trash': 'M4 7h16M9 7V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V7m2 0v12.5A1.5 1.5 0 0 1 15.5 21h-7A1.5 1.5 0 0 1 7 19.5V7h10zM10.5 11v6M13.5 11v6',
+  'x': 'M5 5l14 14M19 5L5 19',
+  'chevron-down': 'M5 8l7 7 7-7',
+  'dots-vertical': 'M12 6.2v.1M12 12v.1M12 17.8v.1',
+  'check': 'M4.5 12.5l5 5 10-10',
+  'alert-triangle': 'M12 3.5L2.5 20h19L12 3.5zM12 10v4.5M12 17.5v.1',
+  'play': 'M6 4.5v15l13-7.5-13-7.5z',
+  'pause': 'M6.5 4.5h4v15h-4v-15zM13.5 4.5h4v15h-4v-15z',
+  'search': 'M11 4.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM20.5 20.5l-4.8-4.8',
+  'plus': 'M12 4.5v15M4.5 12h15',
+  'external-link': 'M9 5.5H5.5A1.5 1.5 0 0 0 4 7v11.5A1.5 1.5 0 0 0 5.5 20H17a1.5 1.5 0 0 0 1.5-1.5V15M14 4.5h5.5V10M19.5 4.5L11 13',
+  'download': 'M12 3.5v11.5M7 10.5l5 5 5-5M4.5 19.5h15',
+  'undo': 'M8 8.5H4.5V5M4.7 15a8 8 0 1 0 1.6-8.9l-1.8 1.9',
+  'copy': 'M8 8V5.5A1.5 1.5 0 0 1 9.5 4h9A1.5 1.5 0 0 1 20 5.5v9a1.5 1.5 0 0 1-1.5 1.5H16m-8-8h9A1.5 1.5 0 0 1 18.5 9.5v9A1.5 1.5 0 0 1 17 20H8.5A1.5 1.5 0 0 1 7 18.5v-9A1.5 1.5 0 0 1 8.5 8z',
+  'edit': 'M14.5 5.5l4 4L8 20H4v-4L14.5 5.5zM13 7l4 4',
+  'link': 'M9.5 14.5l5-5M8.5 8.5l-1 1a3.5 3.5 0 0 0 5 5l1-1M15.5 15.5l1-1a3.5 3.5 0 0 0-5-5l-1 1',
+  'image': 'M4 5.5h16A1.5 1.5 0 0 1 21.5 7v10A1.5 1.5 0 0 1 20 18.5H4A1.5 1.5 0 0 1 2.5 17V7A1.5 1.5 0 0 1 4 5.5zM7.5 9.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM3 16l5-5 3.5 3.5L16 9l5 6',
+  'clock': 'M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.5V12l3 2',
+  'server': 'M4 5.5h16A1 1 0 0 1 21 6.5v3A1 1 0 0 1 20 10.5H4A1 1 0 0 1 3 9.5v-3A1 1 0 0 1 4 5.5zM4 13.5h16a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1zM7 8h.01M7 16h.01',
+  'flask': 'M9 3h6M10 3v6l-5.5 9.5A1.5 1.5 0 0 0 5.8 21h12.4a1.5 1.5 0 0 0 1.3-2.5L14 9V3M8 15h8',
+  'menu': 'M4 6.5h16M4 12h16M4 17.5h16',
+  'list': 'M4 6.5h2M4 12h2M4 17.5h2M9 6.5h11M9 12h11M9 17.5h11',
+}[name] %}<svg xmlns="http://www.w3.org/2000/svg" width="{{ size }}" height="{{ size }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="icon {{ extra_class }}" aria-hidden="true"><path d="{{ d }}"/></svg>{% endmacro %}

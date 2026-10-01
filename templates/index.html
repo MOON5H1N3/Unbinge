@@ -1,0 +1,818 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Driparr{% endblock %}
+
+{% block extra_head %}
+<style>
+    .status-line { display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text-muted); margin-top:8px; }
+    .status-line .icon { color: var(--text-faint); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>series</h1>
+    <button type="button" class="btn btn-primary" onclick="openPoolModal()">{{ icon('plus', 14) }}add series</button>
+</div>
+
+{% if missed_run_notice %}
+<div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>{{ missed_run_notice }}</span></div>
+{% endif %}
+
+{% if undoable %}
+<div class="banner banner-info">
+    {{ icon('undo', 15) }}
+    <span>last drip: {{ undoable.show_name }} - {{ undoable.detail }}</span>
+    <button type="button" class="banner-action" onclick="undoLastDrip(this)">undo</button>
+</div>
+{% endif %}
+
+{% if last_run %}
+<div class="banner {{ 'banner-error' if last_run.error_count > 0 else 'banner-info' }}">
+    <span class="dot {{ 'dot-off' if last_run.error_count > 0 else 'dot-ok' }}"></span>
+    <span>last run {{ last_run.started_at.replace('T', ' ')[:16] }}{% if last_run.forced_show_id %} (manual){% endif %}: {{ last_run.detail }}</span>
+    {% if last_run.error_count > 0 %}<a href="/history" class="banner-action">view details →</a>{% endif %}
+</div>
+{% endif %}
+
+{% if next_run_iso %}
+<div class="status-line" id="nextRunNote" data-next-run="{{ next_run_iso }}">
+    {{ icon('clock', 14) }}<span>next drip check in <span id="nextRunCountdown">calculating…</span></span>
+</div>
+{% endif %}
+
+{% if shows %}
+<div class="banner banner-info" id="bulkActionBar" style="display:none;">
+    <span id="bulkCount">0 selected</span>
+    <button type="button" class="banner-action" onclick="bulkAction('pause')">pause</button>
+    <button type="button" class="banner-action" onclick="bulkAction('resume')">resume</button>
+    <button type="button" class="banner-action" onclick="bulkAction('drip')">drip now</button>
+    <button type="button" class="banner-action" style="color:var(--danger);" onclick="bulkAction('delete')">delete</button>
+    <button type="button" class="banner-action" onclick="clearSelection()">clear</button>
+</div>
+<div class="toolbar" style="margin-top:1.25rem;">
+    <div class="count-chips" id="countChips">
+        <button type="button" class="count-chip" data-filter="all"><strong>{{ shows|length }}</strong> total</button>
+        <button type="button" class="count-chip" data-filter="active"><strong>{{ counts.active }}</strong> active</button>
+        <button type="button" class="count-chip" data-filter="cooldown"><strong>{{ counts.cooldown }}</strong> cooldown</button>
+        <button type="button" class="count-chip" data-filter="paused"><strong>{{ counts.paused }}</strong> paused</button>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <input type="text" id="showFilterInput" onkeyup="filterShowsTable()" placeholder="filter by name...">
+        {% if all_tags %}
+        <select id="tagFilterSelect" onchange="filterShowsTable()">
+            <option value="">all tags</option>
+            {% for tag in all_tags %}
+            <option value="{{ tag|lower }}">{{ tag }}</option>
+            {% endfor %}
+        </select>
+        {% endif %}
+        <div class="sort-links">
+            <span class="cell-faint" style="font-size:11.5px;">sort:</span>
+            <a href="/?sort=day" class="sort-link{% if current_sort == 'day' %} active{% endif %}">day</a>
+            <a href="/?sort=name" class="sort-link{% if current_sort == 'name' %} active{% endif %}">name</a>
+            <a href="/?sort=status" class="sort-link{% if current_sort == 'status' %} active{% endif %}">status</a>
+        </div>
+        <div class="view-toggle">
+            <button type="button" id="viewToggleTable" onclick="setDashboardView('table')" title="table view" aria-label="table view">{{ icon('list', 15) }}</button>
+            <button type="button" id="viewToggleGrid" onclick="setDashboardView('grid')" title="grid view" aria-label="grid view">{{ icon('grid', 15) }}</button>
+        </div>
+    </div>
+</div>
+
+<table class="data-table responsive-table">
+    <thead>
+        <tr>
+            <th><input type="checkbox" id="selectAllCb" onchange="toggleSelectAll(this)" style="margin-right:4px; vertical-align:middle;">series</th>
+            <th>release day(s)</th>
+            <th>next up</th>
+            <th>episodes</th>
+            <th>status</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody id="showsTableBody">
+        {% for show in shows %}
+        <tr data-show-name="{{ show.show_name|lower }}"
+            data-status="{{ 'paused' if show.paused else ('cooldown' if show.completed_at else 'active') }}"
+            data-tags="{{ show.tags|join(',')|lower }}">
+            <td data-label="Series">
+                <div class="show-cell">
+                    <input type="checkbox" class="row-select-cb" value="{{ show.id }}" onchange="updateBulkBar()" style="margin-right:4px;">
+                    {% if show.poster_url %}
+                    <img src="{{ show.poster_url }}" alt="" class="show-poster" loading="lazy">
+                    {% else %}
+                    <span class="show-poster-placeholder">{{ icon('image', 13) }}</span>
+                    {% endif %}
+                    <div>
+                        <a href="/show/{{ show.id }}" style="color:var(--text); text-decoration:none;">{{ show.show_name }}</a>
+                        {% if show.tags %}
+                        <div style="display:flex; gap:4px; margin-top:3px; flex-wrap:wrap;">
+                            {% for tag in show.tags %}
+                            <span class="pill pill-idle" style="font-size:9.5px; padding:1px 6px;">{{ tag }}</span>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </td>
+            <td data-label="Release Day(s)" class="cell-muted">{{ show.release_days_display }}</td>
+            <td data-label="Next Up">
+                {% if show.paused %}
+                    <span class="cell-faint">paused</span>
+                {% else %}
+                    {% set nu = next_up_map.get(show.show_name) %}
+                    {% if nu %}
+                        <div style="display:flex; align-items:center; gap:6px;">
+                            {% if nu.action == 'drip' %}{{ icon('droplet', 13) }}
+                            {% elif nu.action == 'cooldown' %}{{ icon('clock', 13) }}
+                            {% elif nu.action == 'graduate' %}{{ icon('check', 13) }}
+                            {% endif %}
+                            <span>{{ nu.detail }}</span>
+                        </div>
+                        <div class="cell-faint">{{ nu.date.strftime('%a %b %d') }}</div>
+                    {% else %}
+                        <span class="cell-faint">—</span>
+                    {% endif %}
+                {% endif %}
+            </td>
+            <td data-label="Episodes">
+                {% if show.episodes_total == 0 %}
+                    <span class="pill pill-idle">not started</span>
+                {% else %}
+                    {% set ratio = show.episodes_dripped / show.episodes_total %}
+                    <span class="pill {{ 'pill-complete' if ratio >= 0.9 else ('pill-partial' if ratio >= 0.5 else 'pill-missing') }}">
+                        {{ show.episodes_dripped }} / {{ show.episodes_total }}
+                    </span>
+                    {% if show.episodes_remaining > 0 %}<div class="cell-faint" style="margin-top:4px;">{{ show.episodes_remaining }} left</div>{% endif %}
+                {% endif %}
+            </td>
+            <td data-label="Status">
+                {% if show.paused %}
+                    <span class="status-word status-paused">paused</span>
+                {% elif show.completed_at %}
+                    {% set nu = next_up_map.get(show.show_name) %}
+                    <span class="status-word status-cooldown">cooldown{% if nu and nu.action == 'graduate' %} · back {{ nu.date.strftime('%a %b %d') }}{% endif %}</span>
+                {% else %}
+                    <span class="status-word status-active">active</span>
+                {% endif %}
+            </td>
+            <td data-label="Actions" class="actions-cell" data-show-id="{{ show.id }}" data-show-name="{{ show.show_name }}">
+                <div class="icon-row">
+                    <a href="/show/{{ show.id }}" class="btn-icon" title="edit" aria-label="edit">{{ icon('edit', 15) }}</a>
+                    <button type="button" class="btn-icon" title="drip now" aria-label="drip now" onclick="dripNow(this, {{ show.id }}, this.closest('[data-show-name]').dataset.showName)">{{ icon('droplet', 15) }}</button>
+                    <div class="menu-wrap">
+                        <button type="button" class="btn-icon" title="more" aria-label="more actions" aria-haspopup="true" onclick="toggleActionMenu(event, this)">{{ icon('dots-vertical', 15) }}</button>
+                        <div class="menu">
+                            <button type="button" onclick="previewShow({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('search', 14) }}preview</button>
+                            <button type="button" onclick="openTvdbModal({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('link', 14) }}link poster</button>
+                            <button type="button" onclick="togglePause(this, {{ show.id }}); closeAllActionMenus();">{{ icon('pause', 14) }}{{ 'resume' if show.paused else 'pause' }}</button>
+                            <button type="button" class="danger" onclick="deleteShow(this, {{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName, {{ (show.episodes_remaining + show.episodes_dripped) }}); closeAllActionMenus();">{{ icon('trash', 14) }}delete</button>
+                        </div>
+                    </div>
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+        <tr id="noResultsRow" style="display:none;"><td colspan="6" class="empty-note">no shows match your filter.</td></tr>
+    </tbody>
+</table>
+
+<div class="poster-grid" id="posterGridView" style="display:none;">
+    {% for show in shows %}
+    <div class="poster-card" data-show-name="{{ show.show_name|lower }}"
+         data-status="{{ 'paused' if show.paused else ('cooldown' if show.completed_at else 'active') }}"
+         data-tags="{{ show.tags|join(',')|lower }}"
+         data-show-id="{{ show.id }}">
+        <div class="poster-card-image">
+            <input type="checkbox" class="row-select-cb" value="{{ show.id }}" onchange="updateBulkBar()" style="position:absolute; top:6px; left:6px; z-index:2;">
+            {% if show.poster_url %}
+            <img src="{{ show.poster_url }}" alt="" loading="lazy">
+            {% else %}
+            {{ icon('image', 26) }}
+            {% endif %}
+            {% if show.episodes_total == 0 %}
+                <span class="pill pill-idle poster-card-pill">not started</span>
+            {% else %}
+                {% set ratio = show.episodes_dripped / show.episodes_total %}
+                <span class="pill {{ 'pill-complete' if ratio >= 0.9 else ('pill-partial' if ratio >= 0.5 else 'pill-missing') }} poster-card-pill">
+                    {{ show.episodes_dripped }}/{{ show.episodes_total }}
+                </span>
+            {% endif %}
+        </div>
+        <div class="poster-card-body">
+            <div class="poster-card-title"><a href="/show/{{ show.id }}" style="color:var(--text); text-decoration:none;">{{ show.show_name }}</a></div>
+            <div class="poster-card-meta">
+                {% if show.paused %}paused
+                {% elif show.completed_at %}cooldown
+                {% else %}{{ show.release_days_display }}
+                {% endif %}
+            </div>
+            <div class="poster-card-actions" data-show-name="{{ show.show_name }}">
+                <div class="icon-row">
+                    <a href="/show/{{ show.id }}" class="btn-icon" title="edit" aria-label="edit">{{ icon('edit', 13) }}</a>
+                    <button type="button" class="btn-icon" title="drip now" aria-label="drip now" onclick="dripNow(this, {{ show.id }}, this.closest('[data-show-name]').dataset.showName)">{{ icon('droplet', 13) }}</button>
+                </div>
+                <div class="menu-wrap">
+                    <button type="button" class="btn-icon" title="more" aria-label="more actions" aria-haspopup="true" onclick="toggleActionMenu(event, this)">{{ icon('dots-vertical', 13) }}</button>
+                    <div class="menu">
+                        <button type="button" onclick="previewShow({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('search', 14) }}preview</button>
+                        <button type="button" onclick="openTvdbModal({{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName); closeAllActionMenus();">{{ icon('link', 14) }}link poster</button>
+                        <button type="button" onclick="togglePause(this, {{ show.id }}); closeAllActionMenus();">{{ icon('pause', 14) }}{{ 'resume' if show.paused else 'pause' }}</button>
+                        <button type="button" class="danger" onclick="deleteShow(this, {{ show.id }}, this.closest('.menu-wrap').closest('[data-show-name]').dataset.showName, {{ (show.episodes_remaining + show.episodes_dripped) }}); closeAllActionMenus();">{{ icon('trash', 14) }}delete</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+    <p id="noResultsGrid" class="empty-note" style="display:none; grid-column:1/-1;">no shows match your filter.</p>
+</div>
+{% else %}
+<p class="empty-note" style="margin-top:2rem;">no shows currently being dripped. click "add series" to promote one from your pool.</p>
+{% endif %}
+
+<!-- POOL MODAL -->
+<div id="poolModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content">
+        <div id="modalStep1">
+            <div class="modal-header">
+                <h3>select a show to drip</h3>
+                <button type="button" onclick="closePoolModal()" class="modal-close-btn" aria-label="close">{{ icon('x', 18) }}</button>
+            </div>
+            <input type="text" id="poolSearchInput" class="search-input" placeholder="type to search..." autofocus>
+            <div id="poolContainer" class="result-grid"></div>
+        </div>
+
+        <div id="modalStep2" style="display:none;">
+            <div class="modal-header">
+                <h3 id="selectedShowTitle">configure show</h3>
+                <button type="button" onclick="closePoolModal()" class="modal-close-btn" aria-label="close">{{ icon('x', 18) }}</button>
+            </div>
+            <input type="hidden" id="selectedShowInput" value="">
+            <div id="inspectBox" class="inspect-box" style="display:none;">
+                <div>
+                    <div id="inspectSummary"></div>
+                    <div id="inspectWarning" class="warn" style="display:none;"></div>
+                </div>
+            </div>
+            <div class="field">
+                <label>weekly release day(s)</label>
+                <label class="daily-toggle"><input type="checkbox" id="promoteDailyCb" onchange="toggleDailyDrip(this, '.release-day-cb')"> drip daily (every day of the week)</label>
+                <div class="day-checks">
+                    <label><input type="checkbox" class="release-day-cb" value="0"> mon</label>
+                    <label><input type="checkbox" class="release-day-cb" value="1"> tue</label>
+                    <label><input type="checkbox" class="release-day-cb" value="2"> wed</label>
+                    <label><input type="checkbox" class="release-day-cb" value="3" checked> thu</label>
+                    <label><input type="checkbox" class="release-day-cb" value="4"> fri</label>
+                    <label><input type="checkbox" class="release-day-cb" value="5"> sat</label>
+                    <label><input type="checkbox" class="release-day-cb" value="6"> sun</label>
+                </div>
+            </div>
+            <div class="field">
+                <label for="episodes_per_drop">episodes per drop</label>
+                <input type="number" id="episodes_per_drop" value="1" min="1">
+            </div>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:1.2rem;">
+                <button type="button" class="btn" onclick="backToStep1()">back</button>
+                <button type="button" class="btn btn-primary" id="confirmPromoteBtn" onclick="submitPromotion(event)">confirm & start drip</button>
+            </div>
+        </div>
+
+        <div id="modalLoading" class="loading-overlay">
+            <div class="spinner"></div>
+            <div id="loadingTitle" class="loading-text">moving show to vault...</div>
+            <div class="loading-subtext">please wait while files are being transferred into position.</div>
+        </div>
+    </div>
+</div>
+
+<!-- TVDB LINK MODAL -->
+<div id="tvdbModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width: 480px;">
+        <div class="modal-header">
+            <h3>link poster (tvdb)</h3>
+            <button type="button" onclick="closeTvdbModal()" class="modal-close-btn" aria-label="close">{{ icon('x', 18) }}</button>
+        </div>
+        <input type="hidden" id="tvdbShowId" value="">
+        <input type="text" id="tvdbSearchInput" class="search-input" placeholder="search tvdb by show name...">
+        <div id="tvdbResults" style="max-height:50vh; overflow-y:auto; display:flex; flex-direction:column; gap:6px;"></div>
+    </div>
+</div>
+
+<!-- PREVIEW MODAL -->
+<div id="previewModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width: 440px;">
+        <div class="modal-header">
+            <h3 id="previewTitle">preview</h3>
+            <button type="button" onclick="closePreviewModal()" class="modal-close-btn" aria-label="close">{{ icon('x', 18) }}</button>
+        </div>
+        <div id="previewResult" style="font-size:12.5px;">loading…</div>
+        <div style="display:flex; justify-content:flex-end; margin-top:1.1rem;">
+            <button type="button" class="btn" onclick="closePreviewModal()">close</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function getSelectedIds() {
+    return Array.from(document.querySelectorAll('.row-select-cb:checked'))
+        .map(cb => parseInt(cb.value, 10));
+}
+
+function updateBulkBar() {
+    const ids = getSelectedIds();
+    const bar = document.getElementById('bulkActionBar');
+    document.getElementById('bulkCount').textContent = `${ids.length} selected`;
+    bar.style.display = ids.length > 0 ? 'flex' : 'none';
+}
+
+function clearSelection() {
+    document.querySelectorAll('.row-select-cb').forEach(cb => { cb.checked = false; });
+    const selectAll = document.getElementById('selectAllCb');
+    if (selectAll) selectAll.checked = false;
+    updateBulkBar();
+}
+
+function toggleSelectAll(checkbox) {
+    document.querySelectorAll('#showsTableBody .row-select-cb').forEach(cb => {
+        if (cb.closest('tr').style.display !== 'none') cb.checked = checkbox.checked;
+    });
+    updateBulkBar();
+}
+
+async function bulkAction(action) {
+    const ids = getSelectedIds();
+    if (ids.length === 0) return;
+
+    const confirmMap = {
+        pause: { title: `pause ${ids.length} show(s)?`, body: 'they will be skipped by the scheduler until resumed.', danger: false, label: 'pause' },
+        resume: { title: `resume ${ids.length} show(s)?`, body: 'they will become eligible for the schedule again.', danger: false, label: 'resume' },
+        drip: { title: `drip ${ids.length} show(s) now?`, body: 'runs the next drip step immediately for each, ignoring release day.', danger: false, label: 'drip now' },
+        delete: { title: `delete ${ids.length} show(s)?`, body: 'all their files will be returned to the pool. this cannot be undone from here.', danger: true, label: 'delete' },
+    };
+    const cfg = confirmMap[action];
+    const ok = await driparrConfirm({ title: cfg.title, body: cfg.body, confirmLabel: cfg.label, danger: cfg.danger });
+    if (!ok) return;
+
+    let url, body;
+    if (action === 'pause' || action === 'resume') {
+        url = '/api/bulk/pause';
+        body = JSON.stringify({ show_ids: ids, paused: action === 'pause' });
+    } else if (action === 'drip') {
+        url = '/api/bulk/drip-now';
+        body = JSON.stringify({ show_ids: ids });
+    } else {
+        url = '/api/bulk/delete';
+        body = JSON.stringify({ show_ids: ids });
+    }
+
+    try {
+        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        const data = await res.json();
+        driparrToast(data.message, res.ok && data.status !== 'error' ? 'success' : 'error');
+        setTimeout(() => window.location.reload(), 700);
+    } catch (err) {
+        driparrToast('network error during bulk action.', 'error');
+    }
+}
+
+let activeStatusFilter = 'all';
+
+function applyTableFilters() {
+    const q = document.getElementById('showFilterInput').value.trim().toLowerCase();
+    const tagSelect = document.getElementById('tagFilterSelect');
+    const tagFilter = tagSelect ? tagSelect.value : '';
+
+    function matchesTag(dataTags) {
+        if (!tagFilter) return true;
+        return (dataTags || '').split(',').includes(tagFilter);
+    }
+
+    const tableRows = document.querySelectorAll('#showsTableBody tr[data-show-name]');
+    let visibleInTable = 0;
+    tableRows.forEach(row => {
+        const show = row.dataset.showName.includes(q) &&
+            (activeStatusFilter === 'all' || row.dataset.status === activeStatusFilter) &&
+            matchesTag(row.dataset.tags);
+        row.style.display = show ? '' : 'none';
+        if (show) visibleInTable++;
+    });
+    const noResultsRow = document.getElementById('noResultsRow');
+    if (noResultsRow) noResultsRow.style.display = (visibleInTable === 0 && tableRows.length > 0) ? '' : 'none';
+
+    const gridCards = document.querySelectorAll('#posterGridView .poster-card');
+    let visibleInGrid = 0;
+    gridCards.forEach(card => {
+        const show = card.dataset.showName.includes(q) &&
+            (activeStatusFilter === 'all' || card.dataset.status === activeStatusFilter) &&
+            matchesTag(card.dataset.tags);
+        card.style.display = show ? '' : 'none';
+        if (show) visibleInGrid++;
+    });
+    const noResultsGrid = document.getElementById('noResultsGrid');
+    if (noResultsGrid) noResultsGrid.style.display = (visibleInGrid === 0 && gridCards.length > 0) ? '' : 'none';
+}
+function filterShowsTable() { applyTableFilters(); }
+
+// U-view: table/grid toggle, remembered across visits. Sonarr itself offers
+// both a table and a poster-grid view - this mirrors that rather than
+// picking one and forcing it.
+function setDashboardView(view) {
+    const table = document.querySelector('table.data-table');
+    const grid = document.getElementById('posterGridView');
+    const tableBtn = document.getElementById('viewToggleTable');
+    const gridBtn = document.getElementById('viewToggleGrid');
+    if (!table || !grid) return;
+
+    if (view === 'grid') {
+        table.style.display = 'none';
+        grid.style.display = 'grid';
+        gridBtn.classList.add('active');
+        tableBtn.classList.remove('active');
+    } else {
+        table.style.display = '';
+        grid.style.display = 'none';
+        tableBtn.classList.add('active');
+        gridBtn.classList.remove('active');
+    }
+    try { localStorage.setItem('driparr_dashboard_view', view); } catch (e) {}
+}
+(function () {
+    let saved = 'table';
+    try { saved = localStorage.getItem('driparr_dashboard_view') || 'table'; } catch (e) {}
+    setDashboardView(saved);
+})();
+
+document.querySelectorAll('#countChips .count-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+        activeStatusFilter = chip.dataset.filter;
+        document.querySelectorAll('#countChips .count-chip').forEach(c => c.classList.toggle('active', c === chip));
+        applyTableFilters();
+    });
+});
+document.querySelector('#countChips .count-chip[data-filter="all"]')?.classList.add('active');
+
+(function () {
+    const params = new URLSearchParams(window.location.search);
+    const savedFilter = params.get('filter');
+    if (savedFilter) {
+        const input = document.getElementById('showFilterInput');
+        if (input) { input.value = savedFilter; applyTableFilters(); }
+    }
+    document.querySelectorAll('.sort-link').forEach(link => {
+        link.addEventListener('click', (e) => {
+            const q = document.getElementById('showFilterInput')?.value.trim();
+            if (!q) return;
+            e.preventDefault();
+            const url = new URL(link.href, window.location.origin);
+            url.searchParams.set('filter', q);
+            window.location.href = url.toString();
+        });
+    });
+})();
+
+(function () {
+    const note = document.getElementById('nextRunNote');
+    if (!note) return;
+    const target = new Date(note.dataset.nextRun);
+    const el = document.getElementById('nextRunCountdown');
+    function tick() {
+        const diffMs = target - new Date();
+        if (diffMs <= 0) { el.textContent = 'due now'; return; }
+        const h = Math.floor(diffMs / 3600000);
+        const m = Math.floor((diffMs % 3600000) / 60000);
+        el.textContent = h > 0 ? `${h}h ${m}m` : `${m}m`;
+    }
+    tick();
+    setInterval(tick, 30000);
+})();
+
+function closeAllActionMenus() {
+    document.querySelectorAll('.menu.open').forEach(m => m.classList.remove('open'));
+}
+function toggleActionMenu(e, button) {
+    e.stopPropagation();
+    const menu = button.nextElementSibling;
+    const wasOpen = menu.classList.contains('open');
+    closeAllActionMenus();
+    if (!wasOpen) menu.classList.add('open');
+}
+document.addEventListener('click', closeAllActionMenus);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllActionMenus(); });
+
+async function togglePause(button, showId) {
+    try {
+        const res = await fetchWithTimeout('/toggle-pause/' + showId, { method: 'POST', headers: { 'X-Requested-With': 'fetch' } });
+        const data = await res.json();
+        if (!res.ok) { driparrToast(data.message || 'could not update.', 'error'); return; }
+        driparrToast(data.message, 'success');
+        setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+        driparrToast('network error - is the container reachable?', 'error');
+    }
+}
+
+let poolSearchDebounce = null;
+let poolFetchToken = 0;
+
+function openPoolModal() {
+    const overlay = document.getElementById('poolModal');
+    overlay.style.display = 'flex';
+    const input = document.getElementById('poolSearchInput');
+    input.value = '';
+    backToStep1();
+    const dailyCb = document.getElementById('promoteDailyCb');
+    if (dailyCb.checked) { dailyCb.checked = false; toggleDailyDrip(dailyCb, '.release-day-cb'); }
+    fetchPoolShows('');
+    setTimeout(() => input.focus(), 0);
+}
+function closePoolModal() { document.getElementById('poolModal').style.display = 'none'; }
+
+document.getElementById('poolSearchInput').addEventListener('keyup', () => {
+    clearTimeout(poolSearchDebounce);
+    poolSearchDebounce = setTimeout(() => { fetchPoolShows(document.getElementById('poolSearchInput').value); }, 250);
+});
+
+function fetchPoolShows(query) {
+    const token = ++poolFetchToken;
+    const container = document.getElementById('poolContainer');
+    container.innerHTML = '<div class="result-loading">searching…</div>';
+
+    fetch('/api/pool?q=' + encodeURIComponent(query))
+        .then(res => res.json())
+        .then(data => {
+            if (token !== poolFetchToken) return;
+            container.innerHTML = '';
+            if (!data.shows || data.shows.length === 0) {
+                container.innerHTML = '<p class="result-loading">no matching shows found.</p>';
+                return;
+            }
+            data.shows.forEach(show => {
+                const card = document.createElement('div');
+                card.className = 'result-card';
+                card.onclick = () => selectShow(show);
+                const h4 = document.createElement('h4');
+                h4.textContent = show;
+                card.appendChild(h4);
+                container.appendChild(card);
+            });
+        })
+        .catch(() => {
+            if (token !== poolFetchToken) return;
+            container.innerHTML = '<p class="result-loading">could not reach the server.</p>';
+        });
+}
+
+function selectShow(showName) {
+    document.getElementById('selectedShowTitle').innerText = showName;
+    document.getElementById('selectedShowInput').value = showName;
+    document.getElementById('modalStep1').style.display = 'none';
+    document.getElementById('modalStep2').style.display = 'block';
+    document.getElementById('modalLoading').style.display = 'none';
+
+    const box = document.getElementById('inspectBox');
+    const summary = document.getElementById('inspectSummary');
+    const warning = document.getElementById('inspectWarning');
+    box.style.display = 'flex';
+    summary.innerText = 'checking episode files…';
+    warning.style.display = 'none';
+
+    fetch('/api/inspect?show=' + encodeURIComponent(showName))
+        .then(res => res.json())
+        .then(data => {
+            if (data.status !== 'success') { summary.innerText = data.message || 'could not inspect this folder.'; return; }
+            const seasonsText = data.seasons && data.seasons.length ? `across ${data.seasons.length} season(s)` : '';
+            const sizeText = data.total_bytes ? ' · ' + formatBytes(data.total_bytes) : '';
+            summary.innerText = `${data.episode_count} episode(s) detected ${seasonsText}${sizeText}`;
+            const warnings = [];
+            if (data.warning) warnings.push(data.warning);
+            if (data.space_warning) warnings.push(data.space_warning);
+            if (warnings.length) { warning.innerText = warnings.join(' '); warning.style.display = 'block'; }
+        })
+        .catch(() => { summary.innerText = 'could not inspect this folder.'; });
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let val = bytes, i = -1;
+    do { val /= 1024; i++; } while (val >= 1024 && i < units.length - 1);
+    return val.toFixed(val < 10 ? 1 : 0) + ' ' + units[i];
+}
+
+function backToStep1() {
+    document.getElementById('modalStep1').style.display = 'block';
+    document.getElementById('modalStep2').style.display = 'none';
+    document.getElementById('modalLoading').style.display = 'none';
+}
+
+function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(id));
+}
+
+function submitPromotion(e) {
+    if (e) e.preventDefault();
+    const showName = document.getElementById('selectedShowInput').value;
+    const episodesPerDrop = document.getElementById('episodes_per_drop').value;
+    const days = Array.from(document.querySelectorAll('.release-day-cb:checked')).map(cb => cb.value);
+
+    if (!showName) { driparrToast('please select a show first.', 'error'); return; }
+    if (days.length === 0) { driparrToast('pick at least one release day.', 'error'); return; }
+
+    document.getElementById('loadingTitle').innerText = `promoting "${showName}"...`;
+    document.getElementById('modalStep1').style.display = 'none';
+    document.getElementById('modalStep2').style.display = 'none';
+    document.getElementById('modalLoading').style.display = 'flex';
+
+    const formData = new FormData();
+    formData.append('show_name', showName);
+    days.forEach(d => formData.append('release_days', d));
+    formData.append('episodes_per_drop', episodesPerDrop);
+
+    fetchWithTimeout('/promote', { method: 'POST', body: formData })
+        .then(async response => {
+            const data = await response.json().catch(() => ({}));
+            if (response.ok) {
+                driparrToast(data.message || `'${showName}' promoted.`, 'success');
+                setTimeout(() => window.location.reload(), 600);
+            } else {
+                driparrToast(data.message || 'server error while promoting.', 'error');
+                backToStep1();
+            }
+        })
+        .catch(err => {
+            const msg = err.name === 'AbortError' ? 'timed out - try again.' : ('network error: ' + err);
+            driparrToast(msg, 'error');
+            backToStep1();
+        });
+}
+
+function previewShow(showId, showName) {
+    document.getElementById('previewTitle').innerText = 'preview: ' + showName;
+    document.getElementById('previewResult').innerText = 'loading…';
+    document.getElementById('previewModal').style.display = 'flex';
+
+    fetchWithTimeout('/api/preview/' + showId)
+        .then(res => res.json())
+        .then(data => {
+            const box = document.getElementById('previewResult');
+            if (data.status !== 'success') { box.textContent = data.message || 'could not preview.'; return; }
+            box.innerHTML = '';
+            const summary = document.createElement('div');
+            summary.textContent = 'next scheduled action: ' + data.detail;
+            box.appendChild(summary);
+            if (data.files && data.files.length) {
+                const list = document.createElement('ul');
+                list.style.cssText = 'margin:0.75rem 0 0; padding-left:1.1rem; color:var(--text-faint); font-size:12px;';
+                data.files.forEach(f => { const li = document.createElement('li'); li.textContent = f; list.appendChild(li); });
+                box.appendChild(list);
+            }
+        })
+        .catch(() => { document.getElementById('previewResult').textContent = 'network error while previewing.'; });
+}
+function closePreviewModal() { document.getElementById('previewModal').style.display = 'none'; }
+
+let tvdbSearchDebounce = null;
+let tvdbFetchToken = 0;
+
+function openTvdbModal(showId, showName) {
+    document.getElementById('tvdbShowId').value = showId;
+    document.getElementById('tvdbModal').style.display = 'flex';
+    const input = document.getElementById('tvdbSearchInput');
+    input.value = showName;
+    setTimeout(() => input.focus(), 0);
+    runTvdbSearch(showName);
+}
+function closeTvdbModal() { document.getElementById('tvdbModal').style.display = 'none'; }
+
+document.getElementById('tvdbSearchInput').addEventListener('keyup', () => {
+    clearTimeout(tvdbSearchDebounce);
+    const q = document.getElementById('tvdbSearchInput').value;
+    tvdbSearchDebounce = setTimeout(() => runTvdbSearch(q), 350);
+});
+
+function runTvdbSearch(query) {
+    const token = ++tvdbFetchToken;
+    const box = document.getElementById('tvdbResults');
+    if (!query.trim()) { box.innerHTML = ''; return; }
+    box.innerHTML = '<p class="result-loading">searching tvdb…</p>';
+
+    fetchWithTimeout('/api/tvdb-search?q=' + encodeURIComponent(query))
+        .then(res => res.json())
+        .then(data => {
+            if (token !== tvdbFetchToken) return;
+            box.innerHTML = '';
+            if (data.status !== 'success') { box.innerHTML = `<p class="result-loading">${data.message || 'search failed.'}</p>`; return; }
+            if (!data.results.length) { box.innerHTML = '<p class="result-loading">no matches found.</p>'; return; }
+            data.results.forEach(r => {
+                const row = document.createElement('div');
+                row.className = 'result-card';
+                row.style.cursor = 'pointer';
+                const img = document.createElement('img');
+                img.src = r.image_url || '';
+                img.onerror = () => { img.style.display = 'none'; };
+                const info = document.createElement('div');
+                info.style.flex = '1';
+                const title = document.createElement('h4');
+                title.textContent = r.name + (r.year ? ` (${r.year})` : '');
+                info.appendChild(title);
+                row.appendChild(img);
+                row.appendChild(info);
+                row.onclick = () => linkTvdbShow(r.tvdb_id, r.name);
+                box.appendChild(row);
+            });
+        })
+        .catch(() => { if (token !== tvdbFetchToken) return; box.innerHTML = '<p class="result-loading">network error while searching.</p>'; });
+}
+
+async function linkTvdbShow(tvdbId, tvdbName) {
+    const showId = document.getElementById('tvdbShowId').value;
+    const formData = new FormData();
+    formData.append('tvdb_id', tvdbId);
+    try {
+        const res = await fetchWithTimeout('/api/tvdb-link/' + showId, { method: 'POST', body: formData });
+        const data = await res.json();
+        if (res.ok) {
+            driparrToast(data.message || `linked to ${tvdbName}.`, 'success');
+            closeTvdbModal();
+            setTimeout(() => window.location.reload(), 500);
+        } else {
+            driparrToast(data.message || 'could not link that show.', 'error');
+        }
+    } catch (err) {
+        driparrToast('network error while linking.', 'error');
+    }
+}
+
+async function undoLastDrip(button) {
+    const ok = await driparrConfirm({
+        title: 'undo the last drip?',
+        body: 'moves the file(s) back to the vault and un-marks the episode(s) as dripped, so the next run picks them up again.',
+        confirmLabel: 'undo',
+        danger: true,
+    });
+    if (!ok) return;
+    button.disabled = true;
+    try {
+        const res = await fetchWithTimeout('/api/undo-last-drip', { method: 'POST' });
+        const data = await res.json();
+        driparrToast(data.message, res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => window.location.reload(), 600);
+    } catch (err) {
+        driparrToast('network error while undoing.', 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function dripNow(button, showId, showName) {
+    const ok = await driparrConfirm({
+        title: `drip "${showName}" now?`,
+        body: 'this ignores its scheduled release day and runs the next drip step immediately.',
+        confirmLabel: 'drip now',
+    });
+    if (!ok) return;
+    button.disabled = true;
+    try {
+        const res = await fetchWithTimeout('/api/drip-now/' + showId, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+            driparrToast(data.message || 'done.', 'success');
+            setTimeout(() => window.location.reload(), 600);
+        } else {
+            driparrToast(data.message || 'drip failed.', 'error');
+        }
+    } catch (err) {
+        driparrToast('network error while dripping.', 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function deleteShow(button, showId, showName, episodeCount) {
+    const episodeNote = episodeCount > 0 ? `${episodeCount} episode(s) will be returned to the pool.` : `no episodes have been recorded for it yet.`;
+    const ok = await driparrConfirm({
+        title: `remove "${showName}"?`,
+        body: `this stops the drip and returns its files to the pool. ${episodeNote}`,
+        confirmLabel: 'delete',
+        danger: true,
+    });
+    if (!ok) return;
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/delete/' + showId;
+    const csrfInput = document.createElement('input');
+    csrfInput.type = 'hidden';
+    csrfInput.name = 'csrf_token';
+    csrfInput.value = window.DRIPARR_CSRF_TOKEN || '';
+    form.appendChild(csrfInput);
+    document.body.appendChild(form);
+    form.submit();
+}
+</script>
+{% endblock %}

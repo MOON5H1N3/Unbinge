@@ -1,0 +1,273 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Settings - Driparr{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>settings</h1>
+</div>
+
+<div class="panel">
+    <h2>{{ icon('server', 14) }}scheduler status</h2>
+    <div style="display:flex; flex-direction:column; gap:0;">
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); font-size:12.5px;">
+            <span class="cell-faint">last run</span>
+            <span>{{ settings.last_job_run.replace('T', ' ')[:19] if settings.last_job_run else 'never yet' }}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); font-size:12.5px;">
+            <span class="cell-faint">next scheduled run</span>
+            <span>{{ next_run or 'unknown' }}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; padding:6px 0; font-size:12.5px;">
+            <span class="cell-faint">plex connection</span>
+            <span><span class="dot {{ 'dot-ok' if plex_configured else 'dot-off' }}"></span>{{ 'connected' if plex_configured else 'not set (PLEX_URL / PLEX_TOKEN)' }}</span>
+        </div>
+    </div>
+</div>
+
+<form method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="panel">
+        <h2>{{ icon('clock', 14) }}drip schedule</h2>
+        <div class="field-row">
+            <div class="field">
+                <label for="drip_hour">hour (0-23)</label>
+                <input type="number" id="drip_hour" name="drip_hour" min="0" max="23" value="{{ settings.drip_hour }}" required>
+            </div>
+            <div class="field">
+                <label for="drip_minute">minute</label>
+                <input type="number" id="drip_minute" name="drip_minute" min="0" max="59" value="{{ settings.drip_minute }}" required>
+            </div>
+        </div>
+        <p class="field hint" style="margin-top:-0.5rem;">times are in the container's timezone ({{ container_tz }}), set via TZ in docker-compose.</p>
+
+        <div class="checkbox-row" style="margin-top:0.9rem; padding-top:0.9rem; border-top:1px solid var(--border);">
+            <input type="checkbox" id="dry_run" name="dry_run" {% if settings.dry_run %}checked{% endif %}>
+            <label for="dry_run" style="font-size:12.5px; color:var(--text); cursor:pointer;">dry-run mode</label>
+        </div>
+        <p class="hint" style="margin:4px 0 0 24px;">when on, every drip is logged as a preview only - no files move.</p>
+    </div>
+
+    <div class="panel">
+        <h2>notifications</h2>
+        <div class="field">
+            <label for="webhook_url">webhook url</label>
+            <input type="text" id="webhook_url" name="webhook_url" value="{{ settings.webhook_url }}" placeholder="https://discord.com/api/webhooks/... or any endpoint">
+            <span class="hint">works with discord, slack, ntfy, or a custom listener.</span>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:8px; margin:0.8rem 0 0;">
+            <label class="checkbox-row"><input type="checkbox" name="notify_on_drip" {% if settings.notify_on_drip %}checked{% endif %}> <span style="font-size:12.5px;">notify on drip, cooldown, and graduation</span></label>
+            <label class="checkbox-row"><input type="checkbox" name="notify_on_failure" {% if settings.notify_on_failure %}checked{% endif %}> <span style="font-size:12.5px;">notify on a failed drip</span></label>
+            <label class="checkbox-row"><input type="checkbox" name="notify_on_missed_run" {% if settings.notify_on_missed_run %}checked{% endif %}> <span style="font-size:12.5px;">notify if a scheduled run appears to have been missed</span></label>
+        </div>
+
+        <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.7rem;">
+                <span style="font-size:12.5px; font-weight:500;">discord schedule message</span>
+                <span style="font-size:11.5px;"><span class="dot {{ 'dot-ok' if discord_configured else 'dot-off' }}"></span>{% if discord_message_live %}live{% elif discord_configured %}configured{% else %}not configured{% endif %}</span>
+            </div>
+            <div class="field">
+                <label for="discord_webhook_url">discord webhook url</label>
+                <input type="text" id="discord_webhook_url" name="discord_webhook_url" value="{{ settings.discord_webhook_url }}" placeholder="https://discord.com/api/webhooks/1234.../abcd...">
+                <span class="hint">a single message edited in place every time the schedule changes, instead of a new post each time.</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>{{ icon('image', 14) }}show artwork (tvdb)</h2>
+        <p class="panel-hint">used to fetch posters and season/episode counts when linking a show. get a key at
+            <a href="https://thetvdb.com/dashboard/account/apikeys" target="_blank" style="color:var(--accent);">thetvdb.com/dashboard/account/apikeys</a>
+            (choose "end-user subscriptions" for a personal key).</p>
+        <div class="field">
+            <label for="tvdb_api_key">tvdb api key</label>
+            <input type="text" id="tvdb_api_key" name="tvdb_api_key" value="{{ settings.tvdb_api_key }}" placeholder="your tvdb v4 project api key">
+        </div>
+        <div class="field">
+            <label for="tvdb_pin">subscriber pin <span class="hint" style="display:inline;">(only if end-user subscriptions)</span></label>
+            <input type="text" id="tvdb_pin" name="tvdb_pin" value="{{ settings.tvdb_pin }}" placeholder="optional">
+        </div>
+        <button type="button" class="btn btn-sm" id="test-tvdb-btn">test connection</button>
+    </div>
+
+    <div class="panel">
+        <h2>{{ icon('server', 14) }}sonarr <span class="cell-faint" style="font-weight:400;">(optional)</span></h2>
+        <p class="panel-hint">cross-checks season/episode counts against your sonarr library, and powers the calendar's upcoming-episodes panel.</p>
+        <div class="field-row">
+            <div class="field">
+                <label for="sonarr_url">sonarr url</label>
+                <input type="text" id="sonarr_url" name="sonarr_url" value="{{ settings.sonarr_url }}" placeholder="http://192.168.1.x:8989">
+            </div>
+            <div class="field">
+                <label for="sonarr_api_key">sonarr api key</label>
+                <input type="text" id="sonarr_api_key" name="sonarr_api_key" value="{{ settings.sonarr_api_key }}" placeholder="settings -> general in sonarr">
+            </div>
+        </div>
+        <button type="button" class="btn btn-sm" id="test-sonarr-btn">test connection</button>
+    </div>
+
+    <div class="panel">
+        <h2>{{ icon('calendar', 14) }}calendar feed</h2>
+        <p class="panel-hint">subscribe in google/apple/outlook calendar to see your drip schedule (and sonarr's upcoming air dates, if configured) update automatically.</p>
+        <div class="field">
+            <label for="ical_feed_url">feed url</label>
+            <div style="display:flex; gap:8px;">
+                <input type="text" id="ical_feed_url" value="{{ ical_feed_url }}" readonly style="flex:1;" onclick="this.select();">
+                <button type="button" class="btn btn-sm" id="copy-ical-btn">copy</button>
+            </div>
+        </div>
+        <p class="hint">google calendar: settings → add calendar → from url. refreshes every 12-24 hours, not instantly.</p>
+        <p class="hint" style="color: var(--warning);">this url has no password - anyone with it can see your schedule.</p>
+
+        <div style="margin-top:0.9rem; padding-top:0.9rem; border-top:1px solid var(--border);">
+            <p class="hint" style="margin-top:0;">
+                if driparr isn't reachable from outside your network (e.g. a localhost or LAN-only address),
+                google can't fetch the url above at all - it'll silently never update. download a snapshot
+                instead and import it by hand: google calendar → settings → import &amp; export → import.
+                do this again whenever your schedule changes meaningfully (monthly is usually plenty).
+            </p>
+            <a href="/calendar-download" class="btn btn-sm">{{ icon('download', 13) }}download calendar file (.ics)</a>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>{{ icon('server', 14) }}database backup</h2>
+        <p class="panel-hint">dripped_episodes, drip_moves (for undo), job history, and every show's configuration all live in one file - cheap insurance, especially right before a schema migration on upgrade.</p>
+
+        <div class="checkbox-row">
+            <input type="checkbox" id="auto_backup_enabled" name="auto_backup_enabled" {% if settings.auto_backup_enabled %}checked{% endif %}>
+            <label for="auto_backup_enabled" style="font-size:12.5px; cursor:pointer;">back up automatically once a day</label>
+        </div>
+        <div class="field" style="margin-top:0.7rem;">
+            <label for="backup_retention_count">keep the last</label>
+            <input type="number" id="backup_retention_count" name="backup_retention_count" value="{{ settings.backup_retention_count }}" min="1" max="90" style="max-width:100px;">
+            <span class="hint">older automatic backups beyond this count are deleted.</span>
+        </div>
+        {% if settings.last_auto_backup %}
+        <p class="hint">last automatic backup: {{ settings.last_auto_backup.replace('T', ' ')[:19] }}</p>
+        {% endif %}
+
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:0.7rem;">
+            <button type="button" class="btn btn-sm" id="run-backup-now-btn">{{ icon('server', 13) }}back up now</button>
+            <a href="/api/backup-db" class="btn btn-sm">{{ icon('download', 13) }}download a one-off copy</a>
+        </div>
+
+        <div id="backupsList" style="margin-top:1rem; padding-top:0.8rem; border-top:1px solid var(--border);">
+            <p class="cell-faint" style="font-size:12px;">loading backups…</p>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>maintenance</h2>
+        <p class="panel-hint">path drift caused the one real incident this app has had. these run immediately, outside the nightly schedule.</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button type="button" class="btn btn-sm" id="repair-paths-btn">{{ icon('wrench', 13) }}repair paths</button>
+            <button type="button" class="btn btn-sm" id="run-drip-btn">{{ icon('refresh', 13) }}run drip check now</button>
+        </div>
+    </div>
+
+    <div style="display:flex; gap:8px; align-items:center;">
+        <button type="submit" class="btn btn-primary">save settings</button>
+        <button type="button" class="btn" id="discord-sync-btn">sync discord now</button>
+    </div>
+</form>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+async function driparrRunAction(button, url, successMsg, body) {
+    const original = button.innerHTML;
+    button.disabled = true;
+    button.textContent = 'working…';
+    try {
+        const opts = { method: 'POST' };
+        if (body) opts.body = body;
+        const res = await fetch(url, opts);
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.status !== 'error') {
+            driparrToast(data.message || successMsg, 'success');
+        } else {
+            driparrToast(data.message || 'that failed - check the logs.', 'error');
+        }
+    } catch (err) {
+        driparrToast('request failed - is the container reachable?', 'error');
+    } finally {
+        button.disabled = false;
+        button.innerHTML = original;
+    }
+}
+
+document.getElementById('discord-sync-btn').addEventListener('click', (e) => {
+    driparrRunAction(e.target, '/api/sync-discord-schedule', 'discord schedule synced.');
+});
+document.getElementById('test-tvdb-btn').addEventListener('click', (e) => {
+    const body = new FormData();
+    body.append('tvdb_api_key', document.getElementById('tvdb_api_key').value);
+    body.append('tvdb_pin', document.getElementById('tvdb_pin').value);
+    driparrRunAction(e.target, '/api/test-tvdb', 'tvdb connection ok.', body);
+});
+document.getElementById('test-sonarr-btn').addEventListener('click', (e) => {
+    const body = new FormData();
+    body.append('sonarr_url', document.getElementById('sonarr_url').value);
+    body.append('sonarr_api_key', document.getElementById('sonarr_api_key').value);
+    driparrRunAction(e.target, '/api/test-sonarr', 'sonarr connection ok.', body);
+});
+document.getElementById('run-backup-now-btn').addEventListener('click', async (e) => {
+    await driparrRunAction(e.target, '/api/run-backup-now', 'backup created.');
+    loadBackupsList();
+});
+
+async function loadBackupsList() {
+    const container = document.getElementById('backupsList');
+    try {
+        const res = await fetch('/api/backups');
+        const data = await res.json();
+        if (!data.backups || data.backups.length === 0) {
+            container.innerHTML = '<p class="cell-faint" style="font-size:12px;">no backups yet.</p>';
+            return;
+        }
+        container.innerHTML = '<p class="cell-faint" style="font-size:11px; text-transform:uppercase; margin-bottom:6px;">existing backups (' + data.backups.length + ')</p>';
+        data.backups.forEach(b => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex; justify-content:space-between; padding:4px 0; font-size:12px; color:var(--text-muted);';
+            row.innerHTML = '';
+            const name = document.createElement('span');
+            name.textContent = b.filename;
+            const size = document.createElement('span');
+            size.className = 'cell-faint';
+            size.textContent = b.size_human;
+            row.appendChild(name);
+            row.appendChild(size);
+            container.appendChild(row);
+        });
+    } catch (err) {
+        container.innerHTML = '<p class="cell-faint" style="font-size:12px;">could not load backups.</p>';
+    }
+}
+loadBackupsList();
+
+document.getElementById('repair-paths-btn').addEventListener('click', (e) => {
+    driparrRunAction(e.target, '/api/repair-paths', 'paths checked.');
+});
+document.getElementById('run-drip-btn').addEventListener('click', async (e) => {
+    const ok = await driparrConfirm({
+        title: 'run drip check now?',
+        body: 'this runs the same job as the nightly schedule, immediately, for every eligible show.',
+        confirmLabel: 'run now',
+    });
+    if (!ok) return;
+    driparrRunAction(e.target, '/api/run-drip', 'drip check complete.');
+});
+document.getElementById('copy-ical-btn').addEventListener('click', async () => {
+    const input = document.getElementById('ical_feed_url');
+    input.select();
+    try {
+        await navigator.clipboard.writeText(input.value);
+        driparrToast('feed url copied.', 'success');
+    } catch (err) {
+        driparrToast('could not copy automatically - select and copy manually.', 'error');
+    }
+});
+</script>
+{% endblock %}

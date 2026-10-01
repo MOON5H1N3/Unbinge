@@ -1,0 +1,29 @@
+# Secrets - MUST stay here. The Dockerfile does `COPY . .`, so anything not
+# ignored is baked into the image layers.
+.env
+.env.*
+
+# Local database & configs
+*.db
+*.db-wal
+*.db-shm
+config/
+
+# Media directories if they live inside this folder
+vault/
+tv/
+private_tv/
+media/
+
+# Python cache & environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# VCS and tooling
+.git/
+.gitignore
+.pytest_cache/
+# NOTE: tests/ is deliberately NOT ignored - the suite runs inside the
+# container via `docker compose exec`, so it has to be in the image.

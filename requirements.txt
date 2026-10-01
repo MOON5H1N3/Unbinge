@@ -1,0 +1,10 @@
+Flask==3.0.3
+Werkzeug==3.0.3
+waitress==3.0.0
+plexapi==4.15.11
+APScheduler==3.10.4
+requests==2.32.3
+tzdata==2024.1
+
+# Test suite runs inside the container (docker compose exec ... pytest).
+pytest==8.2.2

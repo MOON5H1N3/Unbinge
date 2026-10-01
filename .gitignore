@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+
+# Local database & configs
+*.db
+*.db-wal
+*.db-shm
+config/
+
+# Media directories if they live inside this folder
+vault/
+tv/
+private_tv/
+media/
+
+# Python cache & environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

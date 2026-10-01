@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Edit {{ show.show_name }} - Driparr{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>edit series</h1>
+</div>
+
+<div class="panel" style="max-width: 560px;">
+    {% if error == 'duplicate_name' %}
+    <div class="banner banner-error">{{ icon('alert-triangle', 15) }}<span>that name is already used by another show. choose a different one.</span></div>
+    {% elif error == 'invalid_name' %}
+    <div class="banner banner-error">{{ icon('alert-triangle', 15) }}<span>that name isn't valid - it can't contain path separators like "/" or "..".</span></div>
+    {% endif %}
+
+    <form action="/edit/{{ show.id }}" method="POST" onsubmit="document.querySelectorAll('.edit-day-cb').forEach(cb => cb.disabled = false);">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="field">
+            <label for="show_name">show name</label>
+            <input type="text" id="show_name" name="show_name" value="{{ show.show_name }}" required>
+        </div>
+        <div class="field">
+            <label for="vault_path">vault path</label>
+            <input type="text" id="vault_path" name="vault_path" value="{{ show.vault_path }}" required>
+        </div>
+        <div class="field">
+            <label for="plex_path">plex path</label>
+            <input type="text" id="plex_path" name="plex_path" value="{{ show.plex_path }}" required>
+        </div>
+        <div class="field">
+            <label>weekly release day(s)</label>
+            <label class="daily-toggle"><input type="checkbox" id="editDailyCb" {% if show.release_days_set|length == 7 %}checked{% endif %} onchange="toggleDailyDrip(this, '.edit-day-cb')"> drip daily (every day of the week)</label>
+            <div class="day-checks">
+                {% for day_num, day_name in [(0,'mon'),(1,'tue'),(2,'wed'),(3,'thu'),(4,'fri'),(5,'sat'),(6,'sun')] %}
+                <label><input type="checkbox" class="edit-day-cb" name="release_days" value="{{ day_num }}" {% if day_num in show.release_days_set %}checked{% endif %} {% if show.release_days_set|length == 7 %}disabled{% endif %}> {{ day_name }}</label>
+                {% endfor %}
+            </div>
+        </div>
+        <div class="field-row">
+            <div class="field">
+                <label for="current_season">season</label>
+                <input type="number" id="current_season" name="current_season" value="{{ show.current_season }}" min="1" required>
+            </div>
+            <div class="field">
+                <label for="current_episode">last episode released</label>
+                <input type="number" id="current_episode" name="current_episode" value="{{ show.current_episode }}" min="0" required>
+            </div>
+        </div>
+        <div class="field">
+            <label for="episodes_per_drop">episodes per drop</label>
+            <input type="number" id="episodes_per_drop" name="episodes_per_drop" value="{{ show.episodes_per_drop }}" min="1" required>
+        </div>
+        <div class="field">
+            <label for="tags">tags</label>
+            <input type="text" id="tags" name="tags" value="{{ show.tags }}" placeholder="anime, kids, drama...">
+            <span class="hint">comma-separated. used for filtering the dashboard.</span>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:1.2rem;">
+            <a href="/" class="btn">cancel</a>
+            <button type="submit" class="btn btn-primary">save changes</button>
+        </div>
+    </form>
+</div>
+{% endblock %}

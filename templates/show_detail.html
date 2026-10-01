@@ -1,0 +1,438 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}{{ show.show_name }} - Driparr{% endblock %}
+
+{% block extra_head %}
+<style>
+    .ep-chip {
+        display: inline-flex; align-items: center; justify-content: center;
+        min-width: 30px; height: 24px; padding: 0 5px; border-radius: 3px;
+        font-size: 10.5px; font-weight: 600; cursor: pointer; border: none;
+        font-family: inherit;
+    }
+    .ep-dripped { background: var(--pill-complete); color: var(--pill-complete-text); }
+    .ep-waiting { background: var(--pill-partial); color: var(--pill-partial-text); }
+    .ep-missing { background: var(--pill-idle); color: var(--pill-idle-text); opacity: 0.6; }
+    .ep-excluded { background: var(--pill-missing); color: var(--pill-missing-text); text-decoration: line-through; opacity: 0.7; }
+    .ep-grid { display: flex; flex-wrap: wrap; gap: 5px; }
+    .season-block { margin-bottom: 1.1rem; }
+    .season-title { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
+    .legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-faint); margin-bottom: 1rem; flex-wrap: wrap; }
+    .legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .legend .dot-sample { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    .queue-entry {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 8px 4px; border-bottom: 1px solid var(--border); font-size: 12.5px;
+    }
+    .queue-entry:last-child { border-bottom: none; }
+    .trigger-fields { display: none; }
+    .trigger-fields.active { display: block; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>
+        {% if show.poster_url %}<img src="{{ show.poster_url }}" alt="" style="width:24px; height:34px; object-fit:cover; border-radius:2px; vertical-align:middle; margin-right:8px;">{% endif %}
+        {{ show.show_name }}
+    </h1>
+</div>
+
+<div class="panel" id="settingsPanel">
+    <h2>{{ icon('edit', 14) }}show settings</h2>
+    {% if error == 'duplicate_name' %}
+    <div class="banner banner-error">{{ icon('alert-triangle', 15) }}<span>that name is already used by another show. choose a different one.</span></div>
+    {% elif error == 'invalid_name' %}
+    <div class="banner banner-error">{{ icon('alert-triangle', 15) }}<span>that name isn't valid - it can't contain path separators like "/" or "..".</span></div>
+    {% endif %}
+    <!-- Same fields, same field-for-field layout as /edit/{{ show.id }} - the
+         two used to drift out of sync (this page had no name/path/season
+         settings at all), so this panel and the standalone edit page now
+         both post to the same /edit route and stay identical by construction
+         rather than by remembering to update both by hand. -->
+    <form action="/edit/{{ show.id }}" method="POST" style="max-width:560px;" onsubmit="document.querySelectorAll('.settings-day-cb').forEach(cb => cb.disabled = false);">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="return_to" value="show_detail">
+        <div class="field">
+            <label for="settingsShowName">show name</label>
+            <input type="text" id="settingsShowName" name="show_name" value="{{ show.show_name }}" required>
+        </div>
+        <div class="field">
+            <label for="settingsVaultPath">vault path</label>
+            <input type="text" id="settingsVaultPath" name="vault_path" value="{{ show.vault_path }}" required>
+        </div>
+        <div class="field">
+            <label for="settingsPlexPath">plex path</label>
+            <input type="text" id="settingsPlexPath" name="plex_path" value="{{ show.plex_path }}" required>
+        </div>
+        <div class="field">
+            <label>weekly release day(s)</label>
+            <label class="daily-toggle"><input type="checkbox" id="settingsDailyCb" {% if show.release_days_set|length == 7 %}checked{% endif %} onchange="toggleDailyDrip(this, '.settings-day-cb')"> drip daily (every day of the week)</label>
+            <div class="day-checks">
+                {% for day_num, day_name in [(0,'mon'),(1,'tue'),(2,'wed'),(3,'thu'),(4,'fri'),(5,'sat'),(6,'sun')] %}
+                <label><input type="checkbox" class="settings-day-cb" name="release_days" value="{{ day_num }}" {% if day_num in show.release_days_set %}checked{% endif %} {% if show.release_days_set|length == 7 %}disabled{% endif %}> {{ day_name }}</label>
+                {% endfor %}
+            </div>
+        </div>
+        <div class="field-row">
+            <div class="field">
+                <label for="settingsCurrentSeason">season</label>
+                <input type="number" id="settingsCurrentSeason" name="current_season" value="{{ show.current_season }}" min="1" required>
+            </div>
+            <div class="field">
+                <label for="settingsCurrentEpisode">last episode released</label>
+                <input type="number" id="settingsCurrentEpisode" name="current_episode" value="{{ show.current_episode }}" min="0" required>
+            </div>
+        </div>
+        <div class="field">
+            <label for="settingsEpisodesPerDrop">episodes per drop</label>
+            <input type="number" id="settingsEpisodesPerDrop" name="episodes_per_drop" value="{{ show.episodes_per_drop }}" min="1" required>
+        </div>
+        <div class="field">
+            <label for="settingsTags">tags</label>
+            <input type="text" id="settingsTags" name="tags" value="{{ show.tags }}" placeholder="anime, kids, drama...">
+            <span class="hint">comma-separated. used for filtering the dashboard.</span>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:1.2rem;">
+            <button type="submit" class="btn btn-primary">save changes</button>
+        </div>
+    </form>
+</div>
+
+<div class="panel">
+    <h2>episodes <span class="cell-faint" style="font-weight:400;">({{ dripped_count }} / {{ total_eps }} dripped)</span></h2>
+    <div class="legend">
+        <span><i class="dot-sample" style="background:var(--pill-complete);"></i>dripped</span>
+        <span><i class="dot-sample" style="background:var(--pill-partial);"></i>waiting in vault</span>
+        <span><i class="dot-sample" style="background:var(--pill-idle); opacity:0.6;"></i>missing</span>
+        <span><i class="dot-sample" style="background:var(--pill-missing);"></i>excluded</span>
+    </div>
+
+    {% for season in seasons_sorted %}
+    <div class="season-block">
+        <div class="season-title">{% if season == specials_season %}specials{% else %}season {{ season }}{% endif %}</div>
+        <div class="ep-grid">
+            {% for ep in grid[season] %}
+            <button type="button"
+                    class="ep-chip ep-{{ ep.status }}"
+                    title="S{{ '%02d'|format(season) }}E{{ '%02d'|format(ep.episode) }} - {{ ep.status }} (click to {{ 'un-exclude' if ep.status == 'excluded' else 'exclude' }})"
+                    onclick="toggleExclude({{ season }}, {{ ep.episode }}, '{{ ep.status }}')">
+                {{ '%02d'|format(ep.episode) }}
+            </button>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+    {% if not seasons_sorted %}
+    <p class="empty-note">no episode files found in the vault or plex yet.</p>
+    {% endif %}
+</div>
+
+<div class="panel" id="unmatchedCard" style="display:none;">
+    <h2>{{ icon('alert-triangle', 14) }}unmatched files</h2>
+    <p class="panel-hint">these video files don't match a recognizable SxxExx pattern, so they're invisible to the drip pipeline entirely - not counted, not shown, not moved. assign a season and episode to fix that.</p>
+    <div id="unmatchedList"></div>
+</div>
+
+<div class="panel">
+    <h2>{{ icon('history', 14) }}up next <span class="cell-faint" style="font-weight:400;">(what replaces this show)</span></h2>
+    <p class="panel-hint">queue a show from your pool to automatically start when this one finishes, or on a specific date.</p>
+
+    <div id="queueList"></div>
+
+    <div id="recommendationsBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border); display:none;">
+        <div class="season-title">recommended based on this show</div>
+        <div id="recommendationsList" class="poster-grid"></div>
+    </div>
+    <p id="recommendationsHint" class="panel-hint" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border); display:none;"></p>
+
+    <form id="addQueueForm" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
+        <div class="field">
+            <label for="queueShowName">show name (from pool)</label>
+            <input type="text" id="queueShowName" list="poolDatalist" placeholder="start typing..." required>
+            <datalist id="poolDatalist"></datalist>
+        </div>
+        <div class="field">
+            <label>starts</label>
+            <div style="display:flex; gap:14px; font-size:12.5px;">
+                <label style="display:flex; align-items:center; gap:6px;"><input type="radio" name="triggerType" value="after_show" checked onchange="updateTriggerFields()"> when this show finishes</label>
+                <label style="display:flex; align-items:center; gap:6px;"><input type="radio" name="triggerType" value="date" onchange="updateTriggerFields()"> on a specific date</label>
+            </div>
+        </div>
+        <div class="field trigger-fields" id="dateField">
+            <label for="queueDate">start date</label>
+            <input type="date" id="queueDate">
+        </div>
+        <div class="field-row">
+            <div class="field">
+                <label for="queueReleaseDays">release day(s)</label>
+                <label class="daily-toggle"><input type="checkbox" id="queueDailyCb" onchange="toggleDailyDrip(this, '.queue-day-cb')"> drip daily</label>
+                <div class="day-checks" id="queueDayChecks">
+                    {% for day_num, day_name in [(0,'mon'),(1,'tue'),(2,'wed'),(3,'thu'),(4,'fri'),(5,'sat'),(6,'sun')] %}
+                    <label><input type="checkbox" class="queue-day-cb" value="{{ day_num }}" {% if day_num in show.release_days_set %}checked{% endif %}> {{ day_name }}</label>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="field">
+                <label for="queueEpisodesPerDrop">episodes per drop</label>
+                <input type="number" id="queueEpisodesPerDrop" value="{{ show.episodes_per_drop }}" min="1">
+            </div>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" onclick="addToQueue()">{{ icon('plus', 13) }}add to queue</button>
+    </form>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const SHOW_ID = {{ show.id }};
+
+async function toggleExclude(season, episode, currentStatus) {
+    const action = currentStatus === 'excluded' ? 'unexclude' : 'exclude';
+    if (currentStatus === 'dripped') {
+        driparrToast("already dripped - excluding it now won't undo that.", 'warning');
+    }
+    const body = new FormData();
+    body.append('season', season);
+    body.append('episode', episode);
+    body.append('action', action);
+    try {
+        const res = await fetch(`/api/exclude-episode/${SHOW_ID}`, { method: 'POST', body });
+        const data = await res.json();
+        driparrToast(data.message, res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+        driparrToast('network error.', 'error');
+    }
+}
+
+function updateTriggerFields() {
+    const isDate = document.querySelector('input[name="triggerType"]:checked').value === 'date';
+    document.getElementById('dateField').classList.toggle('active', isDate);
+}
+
+let poolDebounce = null;
+document.getElementById('queueShowName').addEventListener('input', (e) => {
+    clearTimeout(poolDebounce);
+    poolDebounce = setTimeout(() => {
+        fetch('/api/pool?q=' + encodeURIComponent(e.target.value))
+            .then(res => res.json())
+            .then(data => {
+                const list = document.getElementById('poolDatalist');
+                list.innerHTML = '';
+                (data.shows || []).forEach(name => {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    list.appendChild(opt);
+                });
+            })
+            .catch(() => {});
+    }, 250);
+});
+
+async function loadQueue() {
+    const res = await fetch(`/api/queue/${SHOW_ID}`);
+    const data = await res.json();
+    const container = document.getElementById('queueList');
+    container.innerHTML = '';
+    if (!data.entries || data.entries.length === 0) {
+        container.innerHTML = '<p class="cell-faint" style="font-size:12.5px;">nothing queued yet.</p>';
+        return;
+    }
+    data.entries.forEach(entry => {
+        const row = document.createElement('div');
+        row.className = 'queue-entry';
+        const label = document.createElement('span');
+        const when = entry.trigger_type === 'date' ? `starts ${entry.trigger_date}` : 'starts when this show finishes';
+        label.textContent = `${entry.show_name} - ${when}`;
+        const btn = document.createElement('button');
+        btn.className = 'btn-icon';
+        btn.title = 'remove from queue';
+        btn.textContent = '\u00d7';
+        btn.style.fontSize = '16px';
+        btn.onclick = () => removeQueueEntry(entry.id);
+        row.appendChild(label);
+        row.appendChild(btn);
+        container.appendChild(row);
+    });
+}
+
+async function removeQueueEntry(entryId) {
+    const ok = await driparrConfirm({ title: 'remove from queue?', body: 'this show will no longer be queued to start automatically.', confirmLabel: 'remove', danger: true });
+    if (!ok) return;
+    const res = await fetch(`/api/queue/entry/${entryId}`, { method: 'DELETE' });
+    const data = await res.json();
+    driparrToast(data.message, res.ok ? 'success' : 'error');
+    loadQueue();
+}
+
+async function addToQueue() {
+    const showName = document.getElementById('queueShowName').value.trim();
+    if (!showName) { driparrToast('enter a show name.', 'error'); return; }
+    const triggerType = document.querySelector('input[name="triggerType"]:checked').value;
+    const triggerDate = document.getElementById('queueDate').value;
+    if (triggerType === 'date' && !triggerDate) { driparrToast('pick a start date.', 'error'); return; }
+    const days = Array.from(document.querySelectorAll('.queue-day-cb:checked')).map(cb => cb.value);
+    if (days.length === 0) { driparrToast('pick at least one release day.', 'error'); return; }
+
+    const body = new FormData();
+    body.append('show_name', showName);
+    body.append('trigger_type', triggerType);
+    if (triggerType === 'date') body.append('trigger_date', triggerDate);
+    body.append('release_days', days.join(','));
+    body.append('episodes_per_drop', document.getElementById('queueEpisodesPerDrop').value);
+
+    try {
+        const res = await fetch(`/api/queue/${SHOW_ID}`, { method: 'POST', body });
+        const data = await res.json();
+        driparrToast(data.message, res.ok ? 'success' : 'error');
+        if (res.ok) {
+            document.getElementById('queueShowName').value = '';
+            loadQueue();
+        }
+    } catch (err) {
+        driparrToast('network error.', 'error');
+    }
+}
+
+async function loadUnmatchedFiles() {
+    const res = await fetch(`/api/unmatched-files/${SHOW_ID}`);
+    const data = await res.json();
+    const card = document.getElementById('unmatchedCard');
+    const list = document.getElementById('unmatchedList');
+    if (!data.files || data.files.length === 0) {
+        card.style.display = 'none';
+        return;
+    }
+    card.style.display = 'block';
+    list.innerHTML = '';
+    data.files.forEach(f => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid var(--border); font-size:12px; flex-wrap:wrap;';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.style.cssText = 'flex:1; min-width:180px; color:var(--text-muted);';
+        nameSpan.textContent = `${f.location}/${f.rel_path}`;
+
+        const seasonInput = document.createElement('input');
+        seasonInput.type = 'number'; seasonInput.min = '0'; seasonInput.placeholder = 'season';
+        seasonInput.style.cssText = 'width:70px; background:var(--bg); border:1px solid var(--border-strong); color:var(--text); padding:5px 7px; border-radius:3px; font-size:12px;';
+
+        const episodeInput = document.createElement('input');
+        episodeInput.type = 'number'; episodeInput.min = '0'; episodeInput.placeholder = 'episode';
+        episodeInput.style.cssText = seasonInput.style.cssText;
+
+        const matchBtn = document.createElement('button');
+        matchBtn.className = 'btn btn-sm';
+        matchBtn.textContent = 'match';
+        matchBtn.onclick = () => matchFile(f.rel_path, f.location, seasonInput.value, episodeInput.value);
+
+        row.appendChild(nameSpan);
+        row.appendChild(seasonInput);
+        row.appendChild(episodeInput);
+        row.appendChild(matchBtn);
+        list.appendChild(row);
+    });
+}
+
+async function matchFile(relPath, location, season, episode) {
+    if (season === '' || episode === '') { driparrToast('enter both a season and episode number.', 'error'); return; }
+    const body = new FormData();
+    body.append('rel_path', relPath);
+    body.append('location', location);
+    body.append('season', season);
+    body.append('episode', episode);
+    try {
+        const res = await fetch(`/api/manual-match/${SHOW_ID}`, { method: 'POST', body });
+        const data = await res.json();
+        driparrToast(data.message, res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => window.location.reload(), 600);
+    } catch (err) {
+        driparrToast('network error.', 'error');
+    }
+}
+
+async function loadRecommendations() {
+    const box = document.getElementById('recommendationsBox');
+    const hint = document.getElementById('recommendationsHint');
+    box.style.display = 'none';
+    hint.style.display = 'none';
+
+    try {
+        const res = await fetch(`/api/recommendations/${SHOW_ID}`);
+        const data = await res.json();
+
+        if (data.status !== 'ok') {
+            // no_tvdb_link / no_genres / not_found - all just explain why
+            // there's nothing to show, rather than showing an error.
+            hint.textContent = data.message || 'no recommendations available yet.';
+            hint.style.display = 'block';
+            return;
+        }
+        if (!data.recommendations || data.recommendations.length === 0) {
+            hint.textContent = "nothing in your pool shares a genre with this show yet.";
+            hint.style.display = 'block';
+            return;
+        }
+
+        const list = document.getElementById('recommendationsList');
+        list.innerHTML = '';
+        data.recommendations.forEach(rec => {
+            const card = document.createElement('div');
+            card.className = 'poster-card';
+
+            const imageBox = document.createElement('div');
+            imageBox.className = 'poster-card-image';
+            if (rec.poster_url) {
+                const img = document.createElement('img');
+                img.src = rec.poster_url;
+                img.alt = '';
+                img.loading = 'lazy';
+                imageBox.appendChild(img);
+            } else {
+                // Same fallback glyph the dashboard's poster grid uses for a
+                // show with no poster, so an unmatched/un-posterable
+                // recommendation still looks intentional rather than broken.
+                imageBox.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h16A1.5 1.5 0 0 1 21.5 7v10A1.5 1.5 0 0 1 20 18.5H4A1.5 1.5 0 0 1 2.5 17V7A1.5 1.5 0 0 1 4 5.5zM7.5 9.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM3 16l5-5 3.5 3.5L16 9l5 6"/></svg>';
+            }
+
+            const body = document.createElement('div');
+            body.className = 'poster-card-body';
+            const title = document.createElement('div');
+            title.className = 'poster-card-title';
+            title.textContent = rec.name;
+            const meta = document.createElement('div');
+            meta.className = 'poster-card-meta';
+            meta.textContent = rec.matched_genres.join(', ');
+            const actions = document.createElement('div');
+            actions.className = 'poster-card-actions';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn-sm';
+            btn.textContent = 'queue this';
+            btn.onclick = () => {
+                document.getElementById('queueShowName').value = rec.name;
+                document.getElementById('queueShowName').scrollIntoView({ behavior: 'smooth', block: 'center' });
+            };
+            actions.appendChild(btn);
+
+            body.appendChild(title);
+            body.appendChild(meta);
+            body.appendChild(actions);
+            card.appendChild(imageBox);
+            card.appendChild(body);
+            list.appendChild(card);
+        });
+        box.style.display = 'block';
+    } catch (err) {
+        // Quiet failure - recommendations are a convenience, not core to the
+        // page, so a network hiccup here shouldn't show an alarming error
+        // on a page that otherwise loaded fine.
+    }
+}
+
+loadUnmatchedFiles();
+loadQueue();
+loadRecommendations();
+</script>
+{% endblock %}

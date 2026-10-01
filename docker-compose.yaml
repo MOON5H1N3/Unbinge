@@ -1,0 +1,33 @@
+services:
+  plex-drip:
+    build: .
+    container_name: plex-drip
+    ports:
+      - "5000:5000"
+    environment:
+      # Scheduling timezone. Without this the container runs on UTC, so a drip
+      # configured for 03:00 actually fired at 04:00 local during BST and
+      # release-day boundaries drifted twice a year.
+      - TZ=Europe/London
+      - PLEX_URL=${PLEX_URL}
+      - PLEX_TOKEN=${PLEX_TOKEN}
+      - PLEX_LIBRARY_ID=${PLEX_LIBRARY_ID}
+      - POOL_DIR=/media/A/TV100
+      # NOTE: these must be container-side paths (they live under the /media/A
+      # mount below), not the host's Windows path - the container never sees
+      # your "A:" drive letter directly.
+      - VAULT_DIR=/media/A/driparr/media/vault
+      - PLEX_BASE_DIR=/media/A/driparr/media/Plex Path
+      - DB_PATH=/config/drip_schedule.db
+    volumes:
+      - ./config:/config
+      # Maps your Windows A: drive root into the container as /media/A.
+      # Adjust the drive letter/path here to match your actual host setup.
+      - "A:\\:/media/A"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+      retries: 3

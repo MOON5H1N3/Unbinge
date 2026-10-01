@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Driparr{% endblock %}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%233AA6D6%22 stroke-width=%222%22><path d=%22M12 2.5C9 6.5 5.5 10.5 5.5 14.5a6.5 6.5 0 0 0 13 0C18.5 10.5 15 6.5 12 2.5z%22/></svg>">
+    <meta name="theme-color" content="#14161C">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+{% from "icons.html" import icon %}
+<div class="app-shell">
+    <button type="button" class="sidebar-toggle" onclick="document.querySelector('.sidebar').classList.toggle('open')" aria-label="Toggle menu">
+        {{ icon('menu', 18) }}
+    </button>
+
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            {{ icon('droplet', 20) }}
+            <span class="wordmark">Driparr</span>
+            <span class="version">v{{ app_version }}</span>
+        </div>
+        <div class="sidebar-nav">
+            <a href="/" class="sidebar-link {{ 'active' if active_tab == 'dashboard' else '' }}">{{ icon('grid', 16) }}<span>series</span></a>
+            <a href="/schedule" class="sidebar-link {{ 'active' if active_tab == 'schedule' else '' }}">{{ icon('calendar', 16) }}<span>calendar</span></a>
+            <a href="/history" class="sidebar-link {{ 'active' if active_tab == 'history' else '' }}">{{ icon('history', 16) }}<span>history</span></a>
+            <a href="/system" class="sidebar-link {{ 'active' if active_tab == 'system' else '' }}">
+                {{ icon('server', 16) }}<span>system</span>
+                <span class="check-dot check-ok" id="sidebarHealthDot" style="margin-left:auto; width:7px; height:7px; border-radius:50%;"></span>
+            </a>
+            <a href="/settings" class="sidebar-link {{ 'active' if active_tab == 'settings' else '' }}">{{ icon('settings', 16) }}<span>settings</span></a>
+            {% if auth_is_enabled %}
+            <form action="/logout" method="POST" style="margin:0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="sidebar-link" style="background:none; border:none; width:100%; text-align:left; cursor:pointer; font-family:inherit; font-size:inherit;">{{ icon('x', 16) }}<span>sign out</span></button>
+            </form>
+            {% endif %}
+        </div>
+    </nav>
+
+    <main class="main">
+        {% if dry_run_active %}
+        <div class="banner banner-warning">
+            {{ icon('flask', 15) }}
+            <span>dry-run mode is on - drips are being previewed only, nothing is actually moving. turn it off in settings when you're ready.</span>
+        </div>
+        {% endif %}
+
+        {% block content %}{% endblock %}
+    </main>
+</div>
+
+<script>window.DRIPARR_CSRF_TOKEN = "{{ csrf_token }}";</script>
+<script src="{{ url_for('static', filename='driparr.js') }}"></script>
+<script>
+(function () {
+    const dot = document.getElementById('sidebarHealthDot');
+    if (!dot) return;
+    function refresh() {
+        fetch('/api/system-status')
+            .then(res => res.json())
+            .then(data => {
+                dot.className = 'check-dot check-' + (data.overall || 'ok');
+            })
+            .catch(() => {});
+    }
+    refresh();
+    setInterval(refresh, 60000);
+})();
+</script>
+{% block extra_scripts %}{% endblock %}
+</body>
+</html>

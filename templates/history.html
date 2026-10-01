@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}History - Driparr{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>history{% if total %} <span class="page-sub">({{ total }} total)</span>{% endif %}</h1>
+</div>
+
+<form method="GET" class="history-toolbar">
+    <input type="text" name="show" value="{{ show_filter }}" placeholder="filter by show...">
+    <select name="action" onchange="this.form.submit()">
+        <option value="">all actions</option>
+        {% for a in all_actions %}
+        <option value="{{ a }}" {% if a == action_filter %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+    </select>
+    <button type="submit" class="btn btn-sm">filter</button>
+    {% if show_filter or action_filter %}
+    <a href="/history" class="btn btn-sm">clear</a>
+    {% endif %}
+</form>
+
+{% if events %}
+<table class="data-table responsive-table">
+    <thead>
+        <tr><th>when</th><th>show</th><th>action</th><th>detail</th></tr>
+    </thead>
+    <tbody>
+        {% for ev in events %}
+        <tr>
+            <td data-label="When" class="cell-muted relative-time" title="{{ ev.occurred_at.replace('T', ' ')[:19] }}">
+                {{ ev.occurred_at.replace('T', ' ')[:19] }}
+            </td>
+            <td data-label="Show">{{ ev.show_name }}</td>
+            <td data-label="Action"><span class="action-tag action-{{ ev.action }}">{{ ev.action }}</span></td>
+            <td data-label="Detail" class="cell-muted">{{ ev.detail }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{% if total_pages > 1 %}
+<div class="pagination">
+    <a href="/history?page={{ page - 1 }}&show={{ show_filter }}&action={{ action_filter }}" class="{{ 'disabled' if page <= 1 else '' }}">← prev</a>
+    <span>page {{ page }} of {{ total_pages }}</span>
+    <a href="/history?page={{ page + 1 }}&show={{ show_filter }}&action={{ action_filter }}" class="{{ 'disabled' if page >= total_pages else '' }}">next →</a>
+</div>
+{% endif %}
+{% else %}
+<p class="empty-note">
+    {% if show_filter or action_filter %}no events match that filter.
+    {% else %}nothing has happened yet - once a drip runs, it'll show up here.
+    {% endif %}
+</p>
+{% endif %}
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.querySelectorAll('.relative-time').forEach(el => {
+    const then = new Date(el.title.replace(' ', 'T'));
+    const diffSec = Math.floor((new Date() - then) / 1000);
+    if (isNaN(diffSec) || diffSec < 0) return;
+    let text;
+    if (diffSec < 60) text = 'just now';
+    else if (diffSec < 3600) text = Math.floor(diffSec / 60) + 'm ago';
+    else if (diffSec < 86400) text = Math.floor(diffSec / 3600) + 'h ago';
+    else text = Math.floor(diffSec / 86400) + 'd ago';
+    el.textContent = text;
+});
+</script>
+{% endblock %}
