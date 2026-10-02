@@ -1050,6 +1050,20 @@ def resolve_pool_folder_tvdb_id(conn, folder_name):
     return tvdb_id
 
 
+def get_pool_folder_poster(conn, folder_name):
+    """Poster URL for a pool folder name, if TVDB has a confident match -
+    for the pool page and the add-series search, which both want a small
+    thumbnail next to a folder someone hasn't added yet. Shares its two
+    cache tables (pool_tvdb_cache, tvdb_genre_cache) with the genre
+    recommendation matching above, so a folder resolved by either feature
+    costs nothing extra in the other. Returns '' when there's no TVDB key
+    configured, no match, or TVDB lists no artwork."""
+    tvdb_id = resolve_pool_folder_tvdb_id(conn, folder_name)
+    if not tvdb_id:
+        return ''
+    return get_genre_data_for_tvdb_id(conn, tvdb_id).get('poster_url', '') or ''
+
+
 def get_recommendations_for_show(show_id):
     """The recommendation logic behind /api/recommendations/<id>: genre-
     overlap matches for show_id, drawn only from POOL_DIR (shows you
@@ -3512,7 +3526,9 @@ def pool_page():
     query = request.args.get('q', '').strip()
     query_lower = query.lower()
 
-    active_names = {s['show_name'] for s in load_shows()}
+    shows = load_shows()
+    active_names = {s['show_name'] for s in shows}
+    poster_by_show = {s['show_name']: s.get('poster_url') for s in shows}
 
     entries = []
     pool_exists = os.path.exists(POOL_DIR)
@@ -3525,14 +3541,31 @@ def pool_page():
         except Exception as e:
             log.error("Could not read pool directory: %s", e)
             names = []
-        for name in names:
-            if query_lower and query_lower not in name.lower():
-                continue
-            entries.append({
-                'name': name,
-                'episode_count': count_video_files(os.path.join(POOL_DIR, name)),
-                'already_added': name in active_names,
-            })
+
+        # Already-added shows already have a poster cached on the show
+        # record - free. A not-yet-added folder needs a TVDB lookup, which
+        # is cached after the first call but costs a network round-trip on
+        # a cold cache, so (like the genre recommendations above) that's
+        # capped per request rather than run against the whole pool at once.
+        scanned = 0
+        with closing(get_db()) as conn:
+            for name in names:
+                if query_lower and query_lower not in name.lower():
+                    continue
+                already_added = name in active_names
+                if already_added:
+                    poster_url = poster_by_show.get(name) or ''
+                elif scanned < POOL_RECOMMENDATION_SCAN_CAP:
+                    poster_url = get_pool_folder_poster(conn, name)
+                    scanned += 1
+                else:
+                    poster_url = ''
+                entries.append({
+                    'name': name,
+                    'episode_count': count_video_files(os.path.join(POOL_DIR, name)),
+                    'already_added': already_added,
+                    'poster_url': poster_url,
+                })
 
     return render_template(
         'pool.html', entries=entries, query=query,
@@ -3647,8 +3680,23 @@ def get_pool():
         filtered = [s for s in pool_shows if query in s.lower()]
     else:
         filtered = pool_shows
+    filtered.sort(key=str.lower)
 
-    return jsonify({"shows": filtered})
+    # Small poster thumbnails for the add-series search results - capped
+    # the same way the pool page and genre recommendations are, so typing
+    # a broad query against a cold cache doesn't fire off a TVDB call per
+    # keystroke per folder. `shows` stays a plain list of names (unchanged
+    # shape, since show_detail.html's queue datalist also reads this
+    # endpoint and just wants strings); `posters` is an additive lookup
+    # the add-series modal uses to show a thumbnail where one's available.
+    posters = {}
+    with closing(get_db()) as conn:
+        for name in filtered[:POOL_RECOMMENDATION_SCAN_CAP]:
+            poster_url = get_pool_folder_poster(conn, name)
+            if poster_url:
+                posters[name] = poster_url
+
+    return jsonify({"shows": filtered, "posters": posters})
 
 
 @app.route('/api/recommendations/<int:show_id>', methods=['GET'])

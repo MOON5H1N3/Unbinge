@@ -566,10 +566,18 @@ function fetchPoolShows(query) {
                 container.innerHTML = '<p class="result-loading">no matching shows found.</p>';
                 return;
             }
+            const posters = data.posters || {};
             data.shows.forEach(show => {
                 const card = document.createElement('div');
                 card.className = 'result-card';
                 card.onclick = () => selectShow(show);
+                if (posters[show]) {
+                    const img = document.createElement('img');
+                    img.src = posters[show];
+                    img.alt = '';
+                    img.onerror = () => { img.style.display = 'none'; };
+                    card.appendChild(img);
+                }
                 const h4 = document.createElement('h4');
                 h4.textContent = show;
                 card.appendChild(h4);

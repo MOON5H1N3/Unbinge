@@ -22,7 +22,12 @@
 <div class="pool-grid">
     {% for entry in entries %}
     <div class="pool-card {{ 'pool-card-active' if entry.already_added }}">
+        {% if entry.poster_url %}
+        <img class="pool-card-poster" src="{{ entry.poster_url }}" alt="" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+        <div class="pool-card-avatar" style="display:none;">{{ entry.name[:2]|upper }}</div>
+        {% else %}
         <div class="pool-card-avatar">{{ entry.name[:2]|upper }}</div>
+        {% endif %}
         <div class="pool-card-body">
             <div class="pool-card-title">{{ entry.name }}</div>
             <div class="pool-card-meta">{{ entry.episode_count }} episode{{ 's' if entry.episode_count != 1 }}</div>
