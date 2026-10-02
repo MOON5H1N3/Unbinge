@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Stats - Unbinge{% endblock %}
+
+{% block extra_head %}
+<style>
+    .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 1rem; }
+    .stat-card {
+        background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+        padding: 14px 16px;
+    }
+    .stat-card .stat-value { font-family: var(--font-mast); font-style: italic; font-weight: 600; font-size: 28px; line-height: 1.1; }
+    .stat-card .stat-label { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+
+    .bar-chart { display: flex; align-items: flex-end; gap: 3px; height: 100px; margin-top: 10px; }
+    .bar-chart .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; gap: 4px; }
+    .bar-chart .bar { width: 100%; max-width: 18px; background: var(--accent-bg); border-radius: 2px 2px 0 0; min-height: 2px; }
+    .bar-chart .bar.bar-filled { background: var(--accent); }
+    .weekday-chart .bar-col { max-width: 60px; }
+    .weekday-chart .bar-label { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.02em; }
+    .activity-chart .bar-col:nth-child(7n+1) .bar-label,
+    .activity-chart .bar-col:last-child .bar-label { display: block; }
+    .activity-chart .bar-label { font-size: 9.5px; color: var(--text-faint); display: none; writing-mode: vertical-rl; }
+
+    .leaderboard-row {
+        display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border);
+        font-size: 12.5px;
+    }
+    .leaderboard-row:last-child { border-bottom: none; }
+    .leaderboard-rank { color: var(--text-faint); font-size: 11px; width: 16px; flex-shrink: 0; }
+    .leaderboard-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+    .leaderboard-count { color: var(--text-muted); font-size: 11.5px; flex-shrink: 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="mast">stats</h1>
+</div>
+
+<div class="stat-row">
+    <div class="stat-card">
+        <div class="stat-value">{{ total_shows }}</div>
+        <div class="stat-label">{{ show_counts.active }} active &middot; {{ show_counts.cooldown }} in cooldown &middot; {{ show_counts.paused }} paused</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ total_episodes }}</div>
+        <div class="stat-label">episodes dripped all-time</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ avg_per_week if avg_per_week is not none else '—' }}</div>
+        <div class="stat-label">avg. episodes / week{% if avg_per_week is none %} (not enough history yet){% endif %}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ failure_count }}</div>
+        <div class="stat-label">failed drips logged</div>
+    </div>
+</div>
+
+<div class="panel-grid">
+    <div class="panel">
+        <h2>{{ icon('bar-chart', 14) }}drip activity - last 30 days</h2>
+        {% if max_activity > 0 %}
+        <div class="bar-chart activity-chart">
+            {% for p in activity_series %}
+            <div class="bar-col">
+                <div class="bar {{ 'bar-filled' if p.count > 0 }}" style="height: {{ ((p.count / max_activity) * 100)|round(0, 'floor')|int if max_activity else 0 }}%;" title="{{ p.date }}: {{ p.count }} episode{{ 's' if p.count != 1 }}"></div>
+                <span class="bar-label">{{ p.date[5:] }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        <p class="panel-hint" style="margin-top:10px;">{{ activity_series|sum(attribute='count') }} episode{{ 's' if activity_series|sum(attribute='count') != 1 }} dripped in the last 30 days.</p>
+        {% else %}
+        <p class="empty-note">nothing dripped in the last 30 days.</p>
+        {% endif %}
+    </div>
+
+    <div class="panel">
+        <h2>{{ icon('calendar', 14) }}busiest release day</h2>
+        {% if max_weekday > 0 %}
+        <div class="bar-chart weekday-chart">
+            {% for p in weekday_series %}
+            <div class="bar-col">
+                <div class="bar {{ 'bar-filled' if p.label == busiest_day }}" style="height: {{ ((p.count / max_weekday) * 100)|round(0, 'floor')|int if max_weekday else 0 }}%;" title="{{ p.label }}: {{ p.count }} episode{{ 's' if p.count != 1 }}"></div>
+                <span class="bar-label">{{ p.label }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        <p class="panel-hint" style="margin-top:10px;">most episodes land on <strong>{{ busiest_day }}</strong>, all-time.</p>
+        {% else %}
+        <p class="empty-note">no drip history yet.</p>
+        {% endif %}
+    </div>
+</div>
+
+<div class="panel">
+    <h2>{{ icon('droplet', 14) }}top shows by episodes dripped</h2>
+    {% if top_shows %}
+    {% for s in top_shows %}
+    <div class="leaderboard-row">
+        <span class="leaderboard-rank">{{ loop.index }}</span>
+        <span class="leaderboard-name">{{ s.show_name }}</span>
+        <span class="leaderboard-count">{{ s.count }} episode{{ 's' if s.count != 1 }}</span>
+    </div>
+    {% endfor %}
+    {% else %}
+    <p class="empty-note">nothing dripped yet.</p>
+    {% endif %}
+</div>
+{% endblock %}

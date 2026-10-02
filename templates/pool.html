@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Pool - Unbinge{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="mast">pool</h1>
+</div>
+
+{% if not pool_exists %}
+<p class="empty-note">pool directory not found ({{ pool_dir }}) - check POOL_DIR in your docker-compose.yaml.</p>
+{% else %}
+
+<div class="toolbar" style="margin-bottom:1rem;">
+    <form method="GET" style="flex:1; max-width:360px;">
+        <input type="text" name="q" value="{{ query }}" placeholder="filter by name..." onchange="this.form.submit()">
+    </form>
+    <span class="cell-faint" style="font-size:12.5px;">{{ entries|length }} show{{ 's' if entries|length != 1 }} in {{ pool_dir }}</span>
+</div>
+
+{% if entries %}
+<div class="pool-grid">
+    {% for entry in entries %}
+    <div class="pool-card {{ 'pool-card-active' if entry.already_added }}">
+        <div class="pool-card-avatar">{{ entry.name[:2]|upper }}</div>
+        <div class="pool-card-body">
+            <div class="pool-card-title">{{ entry.name }}</div>
+            <div class="pool-card-meta">{{ entry.episode_count }} episode{{ 's' if entry.episode_count != 1 }}</div>
+        </div>
+        {% if entry.already_added %}
+        <span class="pill pill-complete">already dripping</span>
+        {% else %}
+        <a href="/?promote={{ entry.name|urlencode }}" class="btn btn-sm btn-primary">{{ icon('plus', 13) }}promote</a>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<p class="empty-note">
+    {% if query %}no shows in the pool match "{{ query }}".{% else %}the pool directory is empty.{% endif %}
+</p>
+{% endif %}
+
+{% endif %}
+{% endblock %}

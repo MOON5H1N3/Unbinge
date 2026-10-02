@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import time
 import shutil
 import sqlite3
 import secrets
@@ -25,6 +27,10 @@ def inject_shared_template_context():
     path = request.path
     if path == '/':
         tab = 'dashboard'
+    elif path.startswith('/pool'):
+        tab = 'pool'
+    elif path.startswith('/stats'):
+        tab = 'stats'
     elif path.startswith('/schedule'):
         tab = 'schedule'
     elif path.startswith('/history'):
@@ -198,6 +204,8 @@ EXCLUDED_TABLE = 'excluded_episodes'
 QUEUE_TABLE = 'show_queue'
 POOL_TVDB_CACHE_TABLE = 'pool_tvdb_cache'
 TVDB_GENRE_CACHE_TABLE = 'tvdb_genre_cache'
+TVDB_SERIES_CACHE_TABLE = 'tvdb_series_cache'
+TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 
 # Season 0 is the specials folder. Specials are deliberately never dripped:
 # they're skipped when choosing the next batch AND ignored when deciding
@@ -206,9 +214,10 @@ TVDB_GENRE_CACHE_TABLE = 'tvdb_genre_cache'
 # graduates back to the pool, so nothing is lost - they just don't get a slot.
 SPECIALS_SEASON = 0
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 SCHEDULER_JOB_ID = 'daily_drip_check'
+DIGEST_JOB_ID = 'daily_digest'
 _scheduler_holder = {'scheduler': None}
 
 APP_VERSION = '0.2.0'
@@ -461,6 +470,9 @@ def init_db():
         'notify_on_drip': '1',
         'notify_on_failure': '1',
         'notify_on_missed_run': '1',
+        'digest_enabled': '0',
+        'digest_hour': '8',
+        'digest_minute': '0',
         'auto_backup_enabled': '0',
         'backup_retention_count': '7',
         'last_auto_backup': '',
@@ -572,6 +584,70 @@ def send_notification(event, message, extra=None, poster_url=None):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         log.warning("Notification webhook failed (non-fatal): %s", e)
+
+
+DIGEST_ACTION_EMOJI = {
+    'dripped': '📺', 'failed': '⚠️', 'cooldown': '⏳', 'graduated': '🎉',
+    'promoted': '▶️', 'resumed': '▶️', 'paused': '⏸️',
+}
+
+
+def build_digest_message():
+    """One daily summary instead of a ping per event: everything that
+    happened in the last 24h (grouped by kind, with a failure count called
+    out up front since that's the one thing worth noticing at a glance),
+    plus what's scheduled to drip later today. Returns None when there is
+    nothing to report, so an empty digest is never sent on a quiet day."""
+    since = (now_local() - timedelta(hours=24)).isoformat()
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            f"SELECT action, show_name, detail, occurred_at FROM {HISTORY_TABLE} "
+            f"WHERE occurred_at >= ? ORDER BY occurred_at ASC",
+            (since,),
+        ).fetchall()
+    events = [dict(r) for r in rows]
+
+    today = today_local()
+    todays_events = [
+        ev for ev in project_schedule(weeks_ahead=1) if ev['date'] == today
+    ]
+
+    if not events and not todays_events:
+        return None
+
+    lines = []
+    failures = [e for e in events if e['action'] == 'failed']
+    if failures:
+        lines.append(f"⚠️ {len(failures)} failure(s) in the last 24h — check history for details.")
+
+    if events:
+        lines.append("")
+        lines.append("last 24h:")
+        for ev in events:
+            emoji = DIGEST_ACTION_EMOJI.get(ev['action'], '•')
+            lines.append(f"{emoji} {ev['show_name']} — {ev['action']}{': ' + ev['detail'] if ev['detail'] else ''}")
+
+    if todays_events:
+        lines.append("")
+        lines.append("later today:")
+        for ev in todays_events:
+            emoji = DISCORD_ACTION_EMOJI.get(ev['action'], '•')
+            lines.append(f"{emoji} {ev['show_name']} — {ev['detail']}")
+
+    header = f"daily digest — {len(events)} event(s) in the last 24h" + (f", {len(failures)} failure(s)" if failures else "")
+    return header + "\n" + "\n".join(lines)
+
+
+def run_digest_job():
+    try:
+        message = build_digest_message()
+        if message is None:
+            log.info("Daily digest skipped - nothing to report.")
+            return
+        send_notification('digest', message)
+        log.info("Daily digest sent.")
+    except Exception as e:
+        log.error("Daily digest failed: %s", e)
 
 
 DISCORD_ACTION_EMOJI = {'drip': '📺', 'cooldown': '⏳', 'graduate': '🎉'}
@@ -793,6 +869,54 @@ def tvdb_get_series_details(tvdb_id):
         'season_episode_counts': season_counts,
         'genres': _extract_tvdb_genres(series),
     }, None
+
+
+def get_series_details_for_tvdb_id(conn, tvdb_id):
+    """tvdb_get_series_details, cached for TVDB_SERIES_CACHE_MAX_AGE_HOURS -
+    this is what build_episode_grid calls on every show-detail page view,
+    so without a cache a linked show means two live TVDB requests (up to
+    ~30s combined on a slow/down TVDB) on every single visit to that page.
+    Returns (details: dict|None, error: str|None), same shape as
+    tvdb_get_series_details; a cache hit always reports no error."""
+    row = conn.execute(
+        f"SELECT poster_url, name, season_episode_counts, cached_at FROM {TVDB_SERIES_CACHE_TABLE} WHERE tvdb_id = ?",
+        (tvdb_id,)
+    ).fetchone()
+    if row:
+        try:
+            cached_at = datetime.fromisoformat(row['cached_at'])
+            fresh = (now_local() - cached_at) < timedelta(hours=TVDB_SERIES_CACHE_MAX_AGE_HOURS)
+        except (TypeError, ValueError):
+            fresh = False
+        if fresh:
+            try:
+                counts = {int(k): v for k, v in json.loads(row['season_episode_counts']).items()}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                counts = {}
+            return {
+                'poster_url': row['poster_url'] or '',
+                'name': row['name'] or '',
+                'season_episode_counts': counts,
+                'genres': [],  # not needed by any current cached-path caller
+            }, None
+
+    details, err = tvdb_get_series_details(tvdb_id)
+    if err or not details:
+        # Don't cache a failure - an unreachable TVDB shouldn't poison the
+        # cache for the next TVDB_SERIES_CACHE_MAX_AGE_HOURS; next request
+        # just retries live, same as today's uncached behavior.
+        return details, err
+
+    conn.execute(
+        f"""INSERT INTO {TVDB_SERIES_CACHE_TABLE} (tvdb_id, poster_url, name, season_episode_counts, cached_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(tvdb_id) DO UPDATE SET poster_url = excluded.poster_url, name = excluded.name,
+                season_episode_counts = excluded.season_episode_counts, cached_at = excluded.cached_at""",
+        (tvdb_id, details.get('poster_url', ''), details.get('name', ''),
+         json.dumps(details.get('season_episode_counts', {})), now_local().isoformat())
+    )
+    conn.commit()
+    return details, None
 
 
 def _extract_tvdb_genres(series_data):
@@ -1157,7 +1281,7 @@ def parse_discord_webhook(url):
     return match.group(1), match.group(2)
 
 
-def build_next_up_events(weeks_ahead=3):
+def build_next_up_events(weeks_ahead=3, shows=None):
     """Returns just the single next scheduled event (drip/cooldown/graduate)
     for each active show, rather than the full multi-week projection used by
     the /schedule page - this is 'what's coming up next and when' per show.
@@ -1165,9 +1289,12 @@ def build_next_up_events(weeks_ahead=3):
     release-day occurrences to reach 'graduate', so this avoids computing
     the full remaining-episode projection that project_schedule would do for
     a much longer window (the /schedule page's own default is 6 weeks and is
-    unaffected - it's passed explicitly there)."""
+    unaffected - it's passed explicitly there).
+
+    `shows`: forwarded to project_schedule - pass an already-loaded list to
+    avoid a second load_shows() pass (see project_schedule's docstring)."""
     next_by_show = {}
-    for ev in project_schedule(weeks_ahead=weeks_ahead):
+    for ev in project_schedule(weeks_ahead=weeks_ahead, shows=shows):
         if ev['show_name'] not in next_by_show:
             next_by_show[ev['show_name']] = ev
     return sorted(next_by_show.values(), key=lambda e: (e['date'], e['show_name']))
@@ -1425,6 +1552,14 @@ def load_shows(sort='name'):
 
             shows_list.append({
                 'id': show_id,
+                # Private cache of this show's already-computed dripped/excluded
+                # sets, so a caller that also needs the schedule projection
+                # (project_schedule) doesn't have to re-run these two queries
+                # per show - see project_schedule's `shows` param. Leading
+                # underscore keeps these out of anything that treats a show
+                # dict as a clean serializable record.
+                '_dripped_set': dripped,
+                '_excluded_set': excluded,
                 'show_name': safe_get(r, 'show_name', 'Unknown'),
                 'vault_path': vault_path,
                 'plex_path': safe_get(r, 'plex_path', ''),
@@ -1616,6 +1751,21 @@ def count_files(root_dir):
     return sum(len(files) for _dir, _subdirs, files in os.walk(root_dir))
 
 
+def count_video_files(root_dir):
+    """Video-file count under root_dir (VIDEO_EXTENSIONS only), for the pool
+    page's 'N episodes' line - count_files() above counts everything
+    (nfo, posters, subs), which overstates episode count for a show whose
+    folder has the usual Sonarr/Plex sidecar files."""
+    if not os.path.isdir(root_dir):
+        return 0
+    total = 0
+    for _dirpath, _dirs, filenames in os.walk(root_dir):
+        for fname in filenames:
+            if os.path.splitext(fname)[1].lower() in VIDEO_EXTENSIONS:
+                total += 1
+    return total
+
+
 def run_migrations(conn):
     """Sequential, idempotent schema migrations keyed off a stored version.
 
@@ -1661,6 +1811,9 @@ def run_migrations(conn):
 
     if current < 13:
         _migrate_v13_retry_pool_tvdb_matches(conn)
+
+    if current < 14:
+        _migrate_v14_tvdb_series_cache(conn)
 
     conn.execute(
         f"INSERT INTO {SETTINGS_TABLE} (key, value) VALUES ('schema_version', ?) "
@@ -1941,6 +2094,27 @@ def _migrate_v13_retry_pool_tvdb_matches(conn):
     Just a cache; the next recommendations request repopulates it."""
     conn.execute(f"DELETE FROM {POOL_TVDB_CACHE_TABLE};")
     log.info("Cleared pool_tvdb_cache so pool folders get re-matched with cleaned-up search terms.")
+
+
+def _migrate_v14_tvdb_series_cache(conn):
+    """tvdb_get_series_details (poster + per-season episode counts, used to
+    detect genuinely-missing episodes on the show detail page) was making
+    two live TVDB requests on every single show-detail page view for a
+    linked show, with no caching at all - unlike the genre lookups, which
+    already had a cache table. A season's episode count barely ever
+    changes mid-run, so a short (12-hour) cache removes that from the
+    request path almost entirely while still picking up a new season
+    within half a day of it appearing on TVDB."""
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TVDB_SERIES_CACHE_TABLE} (
+            tvdb_id INTEGER PRIMARY KEY,
+            poster_url TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            season_episode_counts TEXT NOT NULL DEFAULT '{{}}',
+            cached_at TEXT NOT NULL
+        );
+    """)
+    log.info("Added tvdb_series_cache table.")
 
 
 def get_setting_conn(conn, key, default=''):
@@ -2355,17 +2529,25 @@ def build_ical_feed():
     return '\r\n'.join(ics_fold_line(l) for l in lines) + '\r\n'
 
 
-def project_schedule(weeks_ahead=6):
+def project_schedule(weeks_ahead=6, shows=None):
     """Builds a forward-looking agenda of expected drip/cooldown/graduation
     events for every active, non-paused show, based on its actual remaining
     vault episodes and configured release days. This is a projection, not a
     guarantee - if a show is paused, edited, or files change on disk, the
-    real outcome may differ from what's shown here."""
+    real outcome may differ from what's shown here.
+
+    `shows`: pass an already-loaded list from load_shows() when the caller
+    has one (e.g. the dashboard, which needs both the raw show list and the
+    schedule projection for the same request) to skip a second full
+    load_shows() pass - that's a DB query plus a vault directory walk per
+    show, so reusing one list instead of loading twice roughly halves the
+    dashboard's per-request cost. Defaults to a fresh load_shows() so every
+    other existing caller (Discord embed, /schedule page) is unaffected."""
     events = []
     today = today_local()
     horizon = today + timedelta(days=weeks_ahead * 7)
 
-    for show in load_shows():
+    for show in (shows if shows is not None else load_shows()):
         if show['paused']:
             continue
         days = parse_release_days(show['release_days'])
@@ -2379,9 +2561,17 @@ def project_schedule(weeks_ahead=6):
                                 'detail': 'Returns to the main library', 'poster_url': show['poster_url']})
             continue
 
-        with closing(get_db()) as conn:
-            dripped = get_dripped_set(conn, show['id'])
-            excluded = get_excluded_set(conn, show['id'])
+        # Reuse the dripped/excluded sets load_shows() already computed for
+        # this show rather than re-querying them, when they're available
+        # (load_shows() always attaches them; a plain dict passed in from
+        # elsewhere falls back to a fresh lookup).
+        if '_dripped_set' in show and '_excluded_set' in show:
+            dripped = show['_dripped_set']
+            excluded = show['_excluded_set']
+        else:
+            with closing(get_db()) as conn:
+                dripped = get_dripped_set(conn, show['id'])
+                excluded = get_excluded_set(conn, show['id'])
         seen_eps = distinct_episode_tags(
             remaining_episode_files(show['vault_path'], dripped, excluded)
         )
@@ -2979,6 +3169,14 @@ def start_scheduler():
         run_drip_job, 'cron', hour=hour, minute=minute,
         id=SCHEDULER_JOB_ID, max_instances=1, coalesce=True,
     )
+    if get_setting('digest_enabled', '0') == '1':
+        dhour = int(get_setting('digest_hour', '8') or 8)
+        dminute = int(get_setting('digest_minute', '0') or 0)
+        scheduler.add_job(
+            run_digest_job, 'cron', hour=dhour, minute=dminute,
+            id=DIGEST_JOB_ID, max_instances=1, coalesce=True,
+        )
+
     scheduler.start()
     _scheduler_holder['scheduler'] = scheduler
     log.info(
@@ -2994,6 +3192,28 @@ def reschedule_drip_job(hour, minute):
         scheduler.reschedule_job(
             SCHEDULER_JOB_ID, trigger='cron', hour=hour, minute=minute, timezone=LOCAL_TZ
         )
+
+
+def reschedule_digest_job(enabled, hour, minute):
+    """Adds, reschedules or removes the digest job in place, since (unlike
+    the drip job) it's optional - most of its life is spent either not
+    existing yet or being toggled off again."""
+    scheduler = _scheduler_holder.get('scheduler')
+    if not scheduler:
+        return
+    existing = scheduler.get_job(DIGEST_JOB_ID)
+    if enabled:
+        if existing:
+            scheduler.reschedule_job(DIGEST_JOB_ID, trigger='cron', hour=hour, minute=minute, timezone=LOCAL_TZ)
+        else:
+            scheduler.add_job(
+                run_digest_job, 'cron', hour=hour, minute=minute,
+                id=DIGEST_JOB_ID, max_instances=1, coalesce=True,
+            )
+        log.info("Daily digest scheduled at %02d:%02d %s.", hour, minute, LOCAL_TZ)
+    elif existing:
+        scheduler.remove_job(DIGEST_JOB_ID)
+        log.info("Daily digest disabled.")
         log.info("Rescheduled drip job to %02d:%02d %s.", hour, minute, LOCAL_TZ)
 
 
@@ -3041,7 +3261,11 @@ def index():
     # Reuses the same projection built for the Discord schedule message -
     # one lookup, keyed by show name, so the dashboard can show "what's
     # dripping next and when" without duplicating the scheduling logic.
-    next_up_map = {ev['show_name']: ev for ev in build_next_up_events()}
+    # Passing `shows` (already loaded above) skips a second load_shows()
+    # pass inside build_next_up_events/project_schedule, which would
+    # otherwise re-run a DB query and a vault directory walk per show on
+    # every single dashboard load.
+    next_up_map = {ev['show_name']: ev for ev in build_next_up_events(shows=shows)}
 
     counts = {
         'active': sum(1 for s in shows if not s['paused'] and not s['completed_at']),
@@ -3212,14 +3436,36 @@ def system_page():
     return render_template('system.html', checks=checks, overall=overall, app_version=APP_VERSION)
 
 
+# gather_system_checks() makes a live Sonarr request (and a TVDB token
+# check) every time it runs. The sidebar health dot on EVERY page polls
+# /api/system-status every 60s from every open browser tab, so without
+# this cache, two tabs open is two live Sonarr calls a minute indefinitely
+# - a background cost that scales with how long the app sits open, not
+# with anything the user is actually doing. A ~45s TTL means at most one
+# real check per polling interval, shared across tabs, while staying
+# close enough to real-time for a status dot. The full /system page (an
+# explicit visit, not a background poll) always computes fresh.
+_SYSTEM_STATUS_CACHE_TTL_SECONDS = 45
+_system_status_cache = {'at': None, 'data': None}
+
+
 @app.route('/api/system-status', methods=['GET'])
 def api_system_status():
     """Lightweight version of the same checks, for the sidebar's health dot -
-    polled periodically without needing the full page."""
+    polled periodically without needing the full page. Cached briefly (see
+    _SYSTEM_STATUS_CACHE_TTL_SECONDS) since this is a background poll, not
+    a user-initiated check."""
+    cached_at = _system_status_cache['at']
+    if cached_at and (time.monotonic() - cached_at) < _SYSTEM_STATUS_CACHE_TTL_SECONDS:
+        return jsonify(_system_status_cache['data'])
+
     checks = gather_system_checks()
     overall = 'error' if any(c['status'] == 'error' for c in checks) else \
               ('warn' if any(c['status'] == 'warn' for c in checks) else 'ok')
-    return jsonify({'overall': overall, 'checks': checks})
+    payload = {'overall': overall, 'checks': checks}
+    _system_status_cache['at'] = time.monotonic()
+    _system_status_cache['data'] = payload
+    return jsonify(payload)
 
 
 @app.route('/health', methods=['GET'])
@@ -3254,6 +3500,136 @@ def health():
         payload['next_run'] = job.next_run_time.isoformat()
 
     return jsonify(payload), (200 if healthy else 503)
+
+
+@app.route('/pool')
+def pool_page():
+    """Everything in POOL_DIR, not just the shows currently being dripped -
+    the promote modal's search only shows up once you already know the name
+    you're looking for. This is the browse-first view: what's actually in
+    the library, what's already active, and a one-click way to start
+    dripping one of the rest."""
+    query = request.args.get('q', '').strip()
+    query_lower = query.lower()
+
+    active_names = {s['show_name'] for s in load_shows()}
+
+    entries = []
+    pool_exists = os.path.exists(POOL_DIR)
+    if pool_exists:
+        try:
+            names = sorted(
+                (d for d in os.listdir(POOL_DIR) if os.path.isdir(os.path.join(POOL_DIR, d))),
+                key=str.lower,
+            )
+        except Exception as e:
+            log.error("Could not read pool directory: %s", e)
+            names = []
+        for name in names:
+            if query_lower and query_lower not in name.lower():
+                continue
+            entries.append({
+                'name': name,
+                'episode_count': count_video_files(os.path.join(POOL_DIR, name)),
+                'already_added': name in active_names,
+            })
+
+    return render_template(
+        'pool.html', entries=entries, query=query,
+        pool_exists=pool_exists, pool_dir=POOL_DIR,
+    )
+
+
+STATS_WEEKDAY_LABELS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
+
+
+@app.route('/stats')
+def stats_page():
+    """A quiet library this size doesn't need a dashboard full of charts,
+    just the handful of numbers someone would actually want to know:
+    how much has shipped, whether it's still shipping, and when it
+    tends to land. Everything here reads from dripped_episodes (one row
+    per episode) rather than drip_history (one row per batch), since the
+    former is the authoritative per-episode record."""
+    shows = load_shows()
+    show_counts = {
+        'active': sum(1 for s in shows if not s['paused'] and not s['completed_at']),
+        'cooldown': sum(1 for s in shows if not s['paused'] and s['completed_at']),
+        'paused': sum(1 for s in shows if s['paused']),
+    }
+    total_shows = len(shows)
+
+    since_30d = (now_local() - timedelta(days=30)).isoformat()
+
+    with closing(get_db()) as conn:
+        total_episodes = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {DRIPPED_TABLE}"
+        ).fetchone()['c']
+
+        activity_rows = conn.execute(
+            f"SELECT date(dripped_at) AS d, COUNT(*) AS c FROM {DRIPPED_TABLE} "
+            f"WHERE dripped_at >= ? GROUP BY d ORDER BY d ASC",
+            (since_30d,),
+        ).fetchall()
+
+        weekday_rows = conn.execute(
+            f"SELECT strftime('%w', dripped_at) AS wd, COUNT(*) AS c "
+            f"FROM {DRIPPED_TABLE} GROUP BY wd"
+        ).fetchall()
+
+        top_shows = conn.execute(f"""
+            SELECT s.show_name AS show_name, COUNT(*) AS c
+            FROM {DRIPPED_TABLE} d
+            JOIN {TABLE_NAME} s ON s.id = d.show_id
+            GROUP BY d.show_id
+            ORDER BY c DESC
+            LIMIT 5
+        """).fetchall()
+
+        failure_count = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {HISTORY_TABLE} WHERE action = 'failed'"
+        ).fetchone()['c']
+
+        first_drip = conn.execute(
+            f"SELECT MIN(dripped_at) AS m FROM {DRIPPED_TABLE}"
+        ).fetchone()['m']
+
+    # Day-by-day series for the last 30 days, zero-filled so the chart
+    # doesn't silently skip quiet days.
+    activity_by_date = {r['d']: r['c'] for r in activity_rows}
+    today = today_local()
+    activity_series = []
+    for i in range(29, -1, -1):
+        d = (today - timedelta(days=i)).isoformat()
+        activity_series.append({'date': d, 'count': activity_by_date.get(d, 0)})
+    max_activity = max((p['count'] for p in activity_series), default=0)
+
+    weekday_counts = {int(r['wd']): r['c'] for r in weekday_rows}
+    weekday_series = [
+        {'label': STATS_WEEKDAY_LABELS[i], 'count': weekday_counts.get(i, 0)}
+        for i in range(7)
+    ]
+    max_weekday = max((p['count'] for p in weekday_series), default=0)
+    busiest_day = max(weekday_series, key=lambda p: p['count'])['label'] if max_weekday else None
+
+    days_tracked = None
+    if first_drip:
+        try:
+            first_date = datetime.fromisoformat(first_drip).date()
+            days_tracked = max(1, (today - first_date).days)
+        except ValueError:
+            days_tracked = None
+    avg_per_week = round(total_episodes / (days_tracked / 7), 1) if days_tracked else None
+
+    return render_template(
+        'stats.html',
+        show_counts=show_counts, total_shows=total_shows,
+        total_episodes=total_episodes, failure_count=failure_count,
+        activity_series=activity_series, max_activity=max_activity,
+        weekday_series=weekday_series, max_weekday=max_weekday, busiest_day=busiest_day,
+        top_shows=[{'show_name': r['show_name'], 'count': r['c']} for r in top_shows],
+        avg_per_week=avg_per_week,
+    )
 
 
 @app.route('/api/pool', methods=['GET'])
@@ -3698,6 +4074,20 @@ def settings_page():
         set_setting('notify_on_drip', '1' if request.form.get('notify_on_drip') == 'on' else '0')
         set_setting('notify_on_failure', '1' if request.form.get('notify_on_failure') == 'on' else '0')
         set_setting('notify_on_missed_run', '1' if request.form.get('notify_on_missed_run') == 'on' else '0')
+
+        digest_enabled = request.form.get('digest_enabled') == 'on'
+        try:
+            digest_hour = int(request.form.get('digest_hour', 8))
+            digest_minute = int(request.form.get('digest_minute', 0))
+            if not (0 <= digest_hour <= 23 and 0 <= digest_minute <= 59):
+                raise ValueError
+        except ValueError:
+            digest_hour, digest_minute = 8, 0
+        set_setting('digest_enabled', '1' if digest_enabled else '0')
+        set_setting('digest_hour', digest_hour)
+        set_setting('digest_minute', digest_minute)
+        reschedule_digest_job(digest_enabled, digest_hour, digest_minute)
+
         set_setting('auto_backup_enabled', '1' if request.form.get('auto_backup_enabled') == 'on' else '0')
         theme_pref = request.form.get('theme_preference', 'auto')
         if theme_pref not in ('auto', 'dark', 'light'):
@@ -3730,6 +4120,11 @@ def settings_page():
     if job and job.next_run_time:
         next_run = job.next_run_time.strftime('%Y-%m-%d %H:%M %Z')
 
+    next_digest_run = None
+    digest_job = scheduler.get_job(DIGEST_JOB_ID) if scheduler else None
+    if digest_job and digest_job.next_run_time:
+        next_digest_run = digest_job.next_run_time.strftime('%Y-%m-%d %H:%M %Z')
+
     settings = {
         'drip_hour': get_setting('drip_hour', '3'),
         'drip_minute': get_setting('drip_minute', '0'),
@@ -3744,6 +4139,9 @@ def settings_page():
         'notify_on_drip': get_setting('notify_on_drip', '1') == '1',
         'notify_on_failure': get_setting('notify_on_failure', '1') == '1',
         'notify_on_missed_run': get_setting('notify_on_missed_run', '1') == '1',
+        'digest_enabled': get_setting('digest_enabled', '0') == '1',
+        'digest_hour': get_setting('digest_hour', '8'),
+        'digest_minute': get_setting('digest_minute', '0'),
         'auto_backup_enabled': get_setting('auto_backup_enabled', '0') == '1',
         'backup_retention_count': get_setting('backup_retention_count', '7'),
         'last_auto_backup': get_setting('last_auto_backup', ''),
@@ -3752,7 +4150,7 @@ def settings_page():
     discord_configured = bool(parse_discord_webhook(settings['discord_webhook_url']))
     discord_message_live = discord_configured and bool(get_setting('schedule_message_id', '').strip())
     return render_template(
-        'settings.html', settings=settings, next_run=next_run,
+        'settings.html', settings=settings, next_run=next_run, next_digest_run=next_digest_run,
         plex_configured=bool(PLEX_URL and PLEX_TOKEN),
         discord_configured=discord_configured, discord_message_live=discord_message_live,
         container_tz=str(LOCAL_TZ),
@@ -4151,7 +4549,8 @@ def build_episode_grid(show_id, show):
     # than just being invisible.
     tvdb_counts = {}
     if show.get('tvdb_id'):
-        details, err = tvdb_get_series_details(show['tvdb_id'])
+        with closing(get_db()) as tvdb_conn:
+            details, err = get_series_details_for_tvdb_id(tvdb_conn, show['tvdb_id'])
         if not err and details:
             tvdb_counts = details.get('season_episode_counts', {})
 

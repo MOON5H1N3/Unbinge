@@ -138,7 +138,7 @@
                 <span class="ep-list-num">{{ ep.episode }}</span>
                 <span class="ep-list-title">S{{ '%02d'|format(season) }}E{{ '%02d'|format(ep.episode) }}</span>
                 <span class="ep-list-status">
-                    {% if ep.status == 'dripped' %}released
+                    {% if ep.status == 'dripped' %}<span class="pill pill-complete">released</span>
                     {% elif ep.status == 'waiting' %}in vault
                     {% elif ep.status == 'excluded' %}excluded
                     {% else %}missing{% endif %}

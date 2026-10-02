@@ -26,8 +26,10 @@
         </div>
         <div class="sidebar-nav">
             <a href="/" class="sidebar-link {{ 'active' if active_tab == 'dashboard' else '' }}">{{ icon('grid', 16) }}<span>series</span></a>
+            <a href="/pool" class="sidebar-link {{ 'active' if active_tab == 'pool' else '' }}">{{ icon('list', 16) }}<span>pool</span></a>
             <a href="/schedule" class="sidebar-link {{ 'active' if active_tab == 'schedule' else '' }}">{{ icon('calendar', 16) }}<span>calendar</span></a>
             <a href="/history" class="sidebar-link {{ 'active' if active_tab == 'history' else '' }}">{{ icon('history', 16) }}<span>history</span></a>
+            <a href="/stats" class="sidebar-link {{ 'active' if active_tab == 'stats' else '' }}">{{ icon('bar-chart', 16) }}<span>stats</span></a>
             <a href="/system" class="sidebar-link {{ 'active' if active_tab == 'system' else '' }}">
                 {{ icon('server', 16) }}<span>system</span>
                 <span class="check-dot check-ok" id="sidebarHealthDot" style="margin-left:auto; width:7px; height:7px; border-radius:50%;"></span>

@@ -103,6 +103,21 @@
         </div>
 
         <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
+            <label class="checkbox-row"><input type="checkbox" id="digest_enabled" name="digest_enabled" {% if settings.digest_enabled %}checked{% endif %} onchange="document.getElementById('digestTimeRow').style.display = this.checked ? 'flex' : 'none';"> <span style="font-size:12.5px; font-weight:500;">send a daily digest instead of (or alongside) per-event notifications</span></label>
+            <p class="hint" style="margin:4px 0 0 24px;">one summary of everything that happened in the last 24h, plus what's dripping later today{% if next_digest_run %} - next digest {{ next_digest_run }}{% endif %}.</p>
+            <div id="digestTimeRow" class="field-row" style="margin-top:0.7rem; display:{{ 'flex' if settings.digest_enabled else 'none' }};">
+                <div class="field">
+                    <label for="digest_hour">hour (0-23)</label>
+                    <input type="number" id="digest_hour" name="digest_hour" min="0" max="23" value="{{ settings.digest_hour }}">
+                </div>
+                <div class="field">
+                    <label for="digest_minute">minute</label>
+                    <input type="number" id="digest_minute" name="digest_minute" min="0" max="59" value="{{ settings.digest_minute }}">
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.7rem;">
                 <span style="font-size:12.5px; font-weight:500;">discord schedule message</span>
                 <span style="font-size:11.5px;"><span class="dot {{ 'dot-ok' if discord_configured else 'dot-off' }}"></span>{% if discord_message_live %}live{% elif discord_configured %}configured{% else %}not configured{% endif %}</span>

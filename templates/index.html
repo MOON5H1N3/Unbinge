@@ -149,12 +149,12 @@
             </td>
             <td data-label="Status">
                 {% if show.paused %}
-                    <span class="status-word status-paused">paused</span>
+                    <span class="pill pill-idle">paused</span>
                 {% elif show.completed_at %}
                     {% set nu = next_up_map.get(show.show_name) %}
-                    <span class="status-word status-cooldown">cooldown{% if nu and nu.action == 'graduate' %} · back {{ nu.date.strftime('%a %b %d') }}{% endif %}</span>
+                    <span class="pill pill-partial">cooldown{% if nu and nu.action == 'graduate' %} · back {{ nu.date.strftime('%a %b %d') }}{% endif %}</span>
                 {% else %}
-                    <span class="status-word status-active">active</span>
+                    <span class="pill pill-complete">active</span>
                 {% endif %}
             </td>
             <td data-label="Actions" class="actions-cell" data-show-id="{{ show.id }}" data-show-name="{{ show.show_name }}">
@@ -830,5 +830,19 @@ async function deleteShow(button, showId, showName, episodeCount) {
     document.body.appendChild(form);
     form.submit();
 }
+
+// Pool page links here with ?promote=<name> so one click there opens
+// the add-series modal straight to that show's inspect step, instead of
+// landing on the dashboard and making the person search for it again.
+document.addEventListener('DOMContentLoaded', () => {
+    const params = new URLSearchParams(window.location.search);
+    const promoteName = params.get('promote');
+    if (!promoteName) return;
+    openPoolModal();
+    selectShow(promoteName);
+    params.delete('promote');
+    const cleanUrl = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+    history.replaceState(null, '', cleanUrl);
+});
 </script>
 {% endblock %}
