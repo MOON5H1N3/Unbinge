@@ -284,6 +284,7 @@
                     <label><input type="checkbox" class="release-day-cb" value="5"> sat</label>
                     <label><input type="checkbox" class="release-day-cb" value="6"> sun</label>
                 </div>
+                <p class="hint" id="dayHint" style="display:none;"></p>
             </div>
             <div class="field">
                 <label for="episodes_per_drop">episodes per drop</label>
@@ -617,6 +618,33 @@ function selectShow(showName) {
             if (warnings.length) { warning.innerText = warnings.join(' '); warning.style.display = 'block'; }
         })
         .catch(() => { summary.innerText = 'could not inspect this folder.'; });
+
+    applySuggestedReleaseDay(showName);
+}
+
+function applySuggestedReleaseDay(showName) {
+    const hint = document.getElementById('dayHint');
+    hint.style.display = 'none';
+    const dailyCb = document.getElementById('promoteDailyCb');
+    if (dailyCb.checked) { dailyCb.checked = false; toggleDailyDrip(dailyCb, '.release-day-cb'); }
+
+    fetch('/api/suggest-release-day?show=' + encodeURIComponent(showName))
+        .then(res => res.json())
+        .then(data => {
+            const dayBoxes = document.querySelectorAll('.release-day-cb');
+            if (typeof data.day !== 'number') {
+                dayBoxes.forEach(cb => { cb.checked = (cb.value === '3'); });
+                return;
+            }
+            dayBoxes.forEach(cb => { cb.checked = (Number(cb.value) === data.day); });
+            if (data.reason) {
+                hint.textContent = 'suggested so your drips spread across the week: ' + data.reason;
+                hint.style.display = 'block';
+            }
+        })
+        .catch(() => {
+            document.querySelectorAll('.release-day-cb').forEach(cb => { cb.checked = (cb.value === '3'); });
+        });
 }
 
 function formatBytes(bytes) {

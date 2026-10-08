@@ -1064,6 +1064,60 @@ def get_pool_folder_poster(conn, folder_name):
     return get_genre_data_for_tvdb_id(conn, tvdb_id).get('poster_url', '') or ''
 
 
+WEEKDAY_NAMES = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+
+
+def suggest_release_day(candidate_genres=None):
+    """Picks a weekday for a show being added, instead of the form always
+    landing on the same hardcoded default regardless of what's already
+    scheduled. Primarily load-balances: counts how many of your other
+    shows already drip on each weekday (active, cooldown, and paused all
+    still hold their configured day) and picks the lightest one. When
+    several days are tied for lightest and TVDB genres are available for
+    both the candidate and your existing shows, ties are broken toward
+    the day that shares the fewest genres with the new show, so a pile of
+    similar shows doesn't all land on the same day just because it was
+    the first bucket. Returns (day: int 0-6, reason: str)."""
+    shows = load_shows()
+    day_counts = {d: 0 for d in range(7)}
+    day_genres = {d: set() for d in range(7)}
+    candidate_genre_set = set(candidate_genres or [])
+
+    if candidate_genre_set:
+        with closing(get_db()) as conn:
+            for s in shows:
+                genres = set()
+                if s.get('tvdb_id'):
+                    genres = set(get_genre_data_for_tvdb_id(conn, s['tvdb_id']).get('genres', []))
+                for d in parse_release_days(s['release_days']):
+                    day_counts[d] += 1
+                    day_genres[d] |= genres
+    else:
+        for s in shows:
+            for d in parse_release_days(s['release_days']):
+                day_counts[d] += 1
+
+    lightest = min(day_counts.values())
+    tied_days = [d for d in range(7) if day_counts[d] == lightest]
+
+    if len(tied_days) == 1 or not candidate_genre_set:
+        best_day = tied_days[0]
+    else:
+        best_day = min(tied_days, key=lambda d: (len(day_genres[d] & candidate_genre_set), d))
+
+    if lightest == 0:
+        reason = f"nothing else drips on {WEEKDAY_NAMES[best_day]} yet."
+    else:
+        reason = (
+            f"{WEEKDAY_NAMES[best_day]} is your lightest day "
+            f"({lightest} show{'s' if lightest != 1 else ''} already there)."
+        )
+        if candidate_genre_set and len(tied_days) > 1 and not (day_genres[best_day] & candidate_genre_set):
+            reason += " it's also clear of shows in the same genre."
+
+    return best_day, reason
+
+
 def get_recommendations_for_show(show_id):
     """The recommendation logic behind /api/recommendations/<id>: genre-
     overlap matches for show_id, drawn only from POOL_DIR (shows you
@@ -3697,6 +3751,23 @@ def get_pool():
                 posters[name] = poster_url
 
     return jsonify({"shows": filtered, "posters": posters})
+
+
+@app.route('/api/suggest-release-day', methods=['GET'])
+def api_suggest_release_day():
+    """Backs the add-series modal's day suggestion: which weekday a show
+    being promoted from the pool should drip on, load-balanced against
+    what's already scheduled (see suggest_release_day)."""
+    folder_name = request.args.get('show', '').strip()
+    candidate_genres = []
+    if folder_name:
+        with closing(get_db()) as conn:
+            tvdb_id = resolve_pool_folder_tvdb_id(conn, folder_name)
+            if tvdb_id:
+                candidate_genres = get_genre_data_for_tvdb_id(conn, tvdb_id).get('genres', [])
+
+    day, reason = suggest_release_day(candidate_genres=candidate_genres)
+    return jsonify({'day': day, 'reason': reason})
 
 
 @app.route('/api/recommendations/<int:show_id>', methods=['GET'])
