@@ -470,6 +470,9 @@ def init_db():
         'notify_on_drip': '1',
         'notify_on_failure': '1',
         'notify_on_missed_run': '1',
+        'cooldown_grace_days': '7',
+        'sonarr_sync_paths': '1',
+        'sonarr_path_map': '',
         'digest_enabled': '0',
         'digest_hour': '8',
         'digest_minute': '0',
@@ -1336,6 +1339,120 @@ def sonarr_get_series(query_or_tvdb_id):
     }, None
 
 
+def sonarr_translate_path(path):
+    """Unbinge and Sonarr often see the same folder under different mount
+    points (Unbinge at /media/vault, Sonarr at /tv, say). The optional
+    sonarr_path_map setting - one 'unbinge_prefix=sonarr_prefix' per line -
+    translates a path into Sonarr's view of it, longest matching prefix
+    first. With no map, paths pass through unchanged."""
+    path = (path or '').rstrip('/')
+    pairs = []
+    for line in get_setting('sonarr_path_map', '').splitlines():
+        if '=' not in line:
+            continue
+        ours, theirs = (part.strip().rstrip('/') for part in line.split('=', 1))
+        if ours:
+            pairs.append((ours, theirs))
+    for ours, theirs in sorted(pairs, key=lambda p: -len(p[0])):
+        if path == ours or path.startswith(ours + '/'):
+            return theirs + path[len(ours):]
+    return path
+
+
+def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
+    """Points the show's Sonarr series at new_path, WITHOUT moving, renaming
+    or re-downloading anything (moveFiles=false: Unbinge has already moved the
+    folder itself, Sonarr just needs to know where it went).
+
+    Finds the series by its current path in Sonarr first (the most reliable
+    link, since Unbinge is what moved it), then by TVDB id, then by exact
+    title - the last two only when they identify exactly one series, so an
+    ambiguous match is skipped rather than guessed at.
+
+    Returns (status, detail) with status one of 'updated', 'unchanged',
+    'skipped' (not configured / sync off / no unambiguous match) or 'error'.
+    Never raises - a Sonarr problem must not interrupt a promote or delete.
+    Written from Sonarr's documented v3 API and never run against a live
+    instance."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    api_key = get_setting('sonarr_api_key', '').strip()
+    if not base or not api_key:
+        return 'skipped', 'Sonarr is not configured'
+    if get_setting('sonarr_sync_paths', '1') != '1':
+        return 'skipped', 'Sonarr path sync is switched off'
+
+    old_s, new_s = sonarr_translate_path(old_path), sonarr_translate_path(new_path)
+    if old_s == new_s:
+        return 'unchanged', 'path is the same from Sonarr\'s point of view'
+
+    headers = {'X-Api-Key': api_key}
+    try:
+        resp = requests.get(f'{base}/api/v3/series', headers=headers, timeout=15)
+        resp.raise_for_status()
+        all_series = resp.json()
+
+        def norm(p):
+            return (p or '').rstrip('/')
+
+        matches = [s for s in all_series if norm(s.get('path')) == old_s]
+        how = 'path'
+        if not matches and tvdb_id:
+            matches = [s for s in all_series if s.get('tvdbId') == tvdb_id]
+            how = 'TVDB id'
+        if not matches:
+            matches = [s for s in all_series if (s.get('title') or '').strip().lower() == show_name.strip().lower()]
+            how = 'title'
+        if len(matches) != 1:
+            return 'skipped', (
+                f"no unambiguous Sonarr series for '{show_name}'" if not matches
+                else f"{len(matches)} Sonarr series matched '{show_name}' by {how} - left alone"
+            )
+
+        series = matches[0]
+        if norm(series.get('path')) == new_s:
+            return 'unchanged', 'Sonarr already has this path'
+
+        full = requests.get(f"{base}/api/v3/series/{series['id']}", headers=headers, timeout=15)
+        full.raise_for_status()
+        body = full.json()
+        previous = body.get('path')
+        body['path'] = new_s
+        put = requests.put(
+            f"{base}/api/v3/series/{series['id']}", params={'moveFiles': 'false'},
+            headers=headers, json=body, timeout=30,
+        )
+        put.raise_for_status()
+        return 'updated', f"Sonarr series path {previous} -> {new_s} (matched by {how}, no files moved)"
+    except requests.RequestException as e:
+        log.error("Sonarr path sync for '%s' failed: %s", show_name, e)
+        return 'error', f"Sonarr path update failed: {e}"
+    except (ValueError, KeyError) as e:
+        log.error("Sonarr path sync for '%s' got an unexpected response: %s", show_name, e)
+        return 'error', "Sonarr returned an unexpected response - see logs"
+
+
+def sync_sonarr_path_async(show_id, show_name, tvdb_id, old_path, new_path):
+    """Fire-and-forget Sonarr path update for use inside request handlers and
+    the drip job, so a slow Sonarr can't stall them. A successful update or a
+    failure is written to history (so you can see Unbinge touched Sonarr);
+    'skipped' and 'unchanged' just go to the log."""
+    if not old_path or not new_path or old_path == new_path:
+        return
+
+    def _run():
+        status, detail = sonarr_set_series_path(show_name, tvdb_id, old_path, new_path)
+        log.info("Sonarr path sync for '%s': %s - %s", show_name, status, detail)
+        if status in ('updated', 'error'):
+            try:
+                with closing(get_db()) as conn:
+                    log_history(conn, show_id, show_name, 'sonarr' if status == 'updated' else 'failed', detail)
+                    conn.commit()
+            except Exception as e:
+                log.error("Could not record Sonarr sync in history: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def parse_discord_webhook(url):
     """Extracts (webhook_id, webhook_token) from a Discord webhook URL, or
     None if the URL isn't a recognizable Discord webhook. Needed because
@@ -1507,6 +1624,47 @@ def next_occurrence(from_date, days_list, inclusive=True):
     return None
 
 
+def get_cooldown_grace_days():
+    """Minimum days a finished show sits in cooldown before it may graduate
+    back to the pool. A show that's still airing on its own schedule (weekly,
+    say) can gain episodes after the vault first runs dry; graduating after a
+    single release cycle - one day for a daily show - would send it back to the
+    pool before those episodes arrive."""
+    try:
+        return max(0, int(get_setting('cooldown_grace_days', '7') or 7))
+    except (TypeError, ValueError):
+        return 7
+
+
+def cooldown_graduation_date(completed_at_iso):
+    """Earliest date a show whose cooldown began at completed_at_iso may
+    graduate, or None if the timestamp is unreadable (callers treat that as
+    'no extra wait')."""
+    try:
+        started = datetime.fromisoformat(completed_at_iso).date()
+    except (TypeError, ValueError):
+        return None
+    return started + timedelta(days=get_cooldown_grace_days())
+
+
+def estimate_end_date(remaining_episodes, episodes_per_drop, release_days_raw, ran_today=False):
+    """Date the last remaining episode will drip, from the drip schedule
+    alone (remaining episodes / episodes per drop / release weekdays).
+    Returns a date, or None when there's nothing left or no release day set.
+    It ignores episodes Sonarr hasn't delivered yet, so it moves later if the
+    show gains episodes. ran_today skips today's slot when today's drip has
+    already happened."""
+    days = parse_release_days(release_days_raw)
+    if remaining_episodes <= 0 or not days:
+        return None
+    per_drop = max(1, int(episodes_per_drop or 1))
+    drops = -(-remaining_episodes // per_drop)
+    d = next_occurrence(today_local(), days, inclusive=not ran_today)
+    for _ in range(drops - 1):
+        d = next_occurrence(d, days, inclusive=False)
+    return d
+
+
 def safe_get(row, key, default=None):
     """Coalesces a NULL column value to a default.
 
@@ -1576,6 +1734,9 @@ def reconcile_show_paths():
             conn.commit()
     finally:
         conn.close()
+    for r in repairs:
+        if r['field'] == 'vault_path':
+            sync_sonarr_path_async(None, r['show_name'], None, r['old'], r['new'])
     return repairs
 
 
@@ -1640,6 +1801,13 @@ def load_shows(sort='name'):
                 'episodes_dripped': episodes_dripped,
                 'episodes_remaining': episodes_remaining,
                 'episodes_total': episodes_dripped + episodes_remaining,
+                'estimated_end': (
+                    None if (safe_get(r, 'paused', 0) or safe_get(r, 'completed_at', None))
+                    else estimate_end_date(
+                        episodes_remaining, safe_get(r, 'episodes_per_drop', 1), release_days_raw,
+                        ran_today=(safe_get(r, 'last_run_date', None) == today_local().isoformat()),
+                    )
+                ),
                 'poster_url': safe_get(r, 'poster_url', None),
                 'tags': parse_tags(safe_get(r, 'tags', '')),
                 'tvdb_id': safe_get(r, 'tvdb_id', None),
@@ -2623,7 +2791,8 @@ def project_schedule(weeks_ahead=6, shows=None):
             continue
 
         if show['completed_at']:
-            d = next_occurrence(today, days)
+            ready = cooldown_graduation_date(show['completed_at']) or today
+            d = next_occurrence(max(today, ready), days)
             if d and d <= horizon:
                 events.append({'date': d, 'show_name': show['show_name'], 'action': 'graduate',
                                 'detail': 'Returns to the main library', 'poster_url': show['poster_url']})
@@ -2654,8 +2823,10 @@ def project_schedule(weeks_ahead=6, shows=None):
             batch = seen_eps[idx:idx + per_drop]
             idx += len(batch)
             label = ", ".join(f"S{s:02d}E{e:02d}" for s, e in batch)
+            is_final = idx >= len(seen_eps)
             events.append({'date': cursor_date, 'show_name': show['show_name'], 'action': 'drip',
-                            'detail': label, 'poster_url': show['poster_url']})
+                            'detail': label + (" · final episode" if is_final else ""),
+                            'poster_url': show['poster_url']})
             cursor_date = cursor_date + timedelta(days=1)
 
         if idx >= len(seen_eps) and cursor_date <= horizon:
@@ -2663,7 +2834,8 @@ def project_schedule(weeks_ahead=6, shows=None):
             if cooldown_date and cooldown_date <= horizon:
                 events.append({'date': cooldown_date, 'show_name': show['show_name'], 'action': 'cooldown',
                                 'detail': 'No episodes left - cooldown begins', 'poster_url': show['poster_url']})
-                graduate_date = next_occurrence(cooldown_date + timedelta(days=1), days)
+                graduate_date = next_occurrence(
+                    cooldown_date + timedelta(days=max(1, get_cooldown_grace_days())), days)
                 if graduate_date and graduate_date <= horizon:
                     events.append({'date': graduate_date, 'show_name': show['show_name'], 'action': 'graduate',
                                     'detail': 'Returns to the main library', 'poster_url': show['poster_url']})
@@ -2685,6 +2857,9 @@ def preview_show_drip(show):
         recheck_remaining = remaining_episode_files(show['vault_path'], dripped, excluded)
         if recheck_remaining:
             return {'action': 'resume', 'detail': f"Cooldown would be cancelled - {len(recheck_remaining)} file(s) found waiting in the vault"}
+        ready = cooldown_graduation_date(show['completed_at'])
+        if ready and ready > today_local():
+            return {'action': 'cooldown', 'detail': f"Still cooling down until {ready.isoformat()} - would not graduate yet"}
         return {'action': 'graduate', 'detail': f"Would move the completed folder back to {POOL_DIR}"}
 
     target_eps, batch = compute_next_batch(
@@ -2933,9 +3108,15 @@ def process_show_drip(conn, show):
             show = dict(show)
             show['completed_at'] = None
             log_history(conn, show['id'], show_name, 'resumed', 'Episodes reappeared in vault - cooldown cancelled')
+        elif (cooldown_graduation_date(show['completed_at']) or today_local()) > today_local():
+            # Still inside the cooldown grace window - a show that's airing on
+            # its own schedule may yet gain episodes (the nightly cooldown
+            # check will resume it if so).
+            ready = cooldown_graduation_date(show['completed_at'])
+            return f"'{show_name}' is cooling down until {ready.isoformat()} before returning to the pool"
         else:
-            # Already finished dripping last cycle - this scheduled run is the
-            # "one week later" trigger to send the whole show back to the pool.
+            # Cooldown grace period is over - this scheduled run sends the
+            # whole show back to the pool.
             log.info("'%s' finished its cooldown - graduating back to the pool.", show_name)
             dest = os.path.join(POOL_DIR, show_name)
             # Specials ride along here: they were never dripped, but
@@ -2965,6 +3146,7 @@ def process_show_drip(conn, show):
             msg = f"'{show_name}' graduated back to {dest}"
             send_notification('graduated', f"🎉 '{show_name}' finished its full run and is back in your main library.", poster_url=show.get('poster_url'))
             conn.commit()
+            sync_sonarr_path_async(show['id'], show_name, show.get('tvdb_id'), show['vault_path'], dest)
             check_and_advance_queue(trigger_show_id=show['id'])
             return msg
 
@@ -3062,6 +3244,41 @@ def process_show_drip(conn, show):
     return f"'{show_name}' dripped {label} ({len(batch)} file(s))"
 
 
+def resume_cooled_down_shows(conn, dry_run=False):
+    """Nightly check (every night, not just a show's release day): a show in
+    cooldown whose vault has gained episodes - Sonarr grabbed a new weekly
+    episode, say - goes back to active so it drips on its next release day.
+    Returns a list of (show_name, new_episode_count)."""
+    resumed = []
+    rows = conn.execute(
+        f"SELECT * FROM {TABLE_NAME} WHERE completed_at IS NOT NULL AND paused = 0"
+    ).fetchall()
+    for row in rows:
+        show = dict(row)
+        dripped = get_dripped_set(conn, show['id'])
+        excluded = get_excluded_set(conn, show['id'])
+        new_eps = distinct_episode_tags(
+            remaining_episode_files(show['vault_path'], dripped, excluded)
+        )
+        if not new_eps:
+            continue
+        n = len(new_eps)
+        detail = f"{n} new episode{'s' if n != 1 else ''} found - cooldown cancelled"
+        if dry_run:
+            log.info("[DRY RUN] '%s': %s", show['show_name'], detail)
+            continue
+        conn.execute(f"UPDATE {TABLE_NAME} SET completed_at = NULL WHERE id = ?", (show['id'],))
+        log_history(conn, show['id'], show['show_name'], 'resumed', detail)
+        conn.commit()
+        log.info("'%s' gained %d episode(s) during cooldown - resuming.", show['show_name'], n)
+        send_notification(
+            'resumed', f"▶️ '{show['show_name']}' gained {n} new episode{'s' if n != 1 else ''} and is dripping again.",
+            poster_url=show.get('poster_url'),
+        )
+        resumed.append((show['show_name'], n))
+    return resumed
+
+
 def run_drip_job(force_show_id=None):
     """Scheduled entry point. Processes every show whose release_days
     includes today and that hasn't already been processed today - unless
@@ -3112,6 +3329,12 @@ def run_drip_job(force_show_id=None):
 
     conn = get_db()
     try:
+        if force_show_id is None:
+            try:
+                resume_cooled_down_shows(conn, dry_run=dry_run)
+            except Exception as e:
+                log.error("Cooldown wake-up check failed: %s", e)
+
         if force_show_id is not None:
             rows = conn.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (force_show_id,)).fetchall()
             if not rows:
@@ -4072,6 +4295,7 @@ def promote_show_internal(show_name, release_days_str, episodes_per_drop):
 
     send_notification('promoted', f"➕ '{show_name}' was added to the drip schedule.")
     sync_discord_schedule_message_async()
+    sync_sonarr_path_async(new_id, show_name, None, source_dir, vault_path)
     return True, f"{show_name} successfully promoted!", new_id, 200
 
 
@@ -4180,6 +4404,13 @@ def settings_page():
 
         set_setting('drip_hour', hour)
         set_setting('drip_minute', minute)
+        try:
+            grace = int(request.form.get('cooldown_grace_days', 7))
+            if not (0 <= grace <= 365):
+                raise ValueError
+        except ValueError:
+            grace = 7
+        set_setting('cooldown_grace_days', grace)
         set_setting('webhook_url', request.form.get('webhook_url', '').strip())
         set_setting('dry_run', '1' if request.form.get('dry_run') == 'on' else '0')
         new_tvdb_key = request.form.get('tvdb_api_key', '').strip()
@@ -4190,6 +4421,8 @@ def settings_page():
         set_setting('tvdb_pin', request.form.get('tvdb_pin', '').strip())
         set_setting('sonarr_url', request.form.get('sonarr_url', '').strip())
         set_setting('sonarr_api_key', request.form.get('sonarr_api_key', '').strip())
+        set_setting('sonarr_sync_paths', '1' if request.form.get('sonarr_sync_paths') == 'on' else '0')
+        set_setting('sonarr_path_map', request.form.get('sonarr_path_map', '').strip())
         set_setting('notify_on_drip', '1' if request.form.get('notify_on_drip') == 'on' else '0')
         set_setting('notify_on_failure', '1' if request.form.get('notify_on_failure') == 'on' else '0')
         set_setting('notify_on_missed_run', '1' if request.form.get('notify_on_missed_run') == 'on' else '0')
@@ -4255,9 +4488,12 @@ def settings_page():
         'tvdb_pin': get_setting('tvdb_pin', ''),
         'sonarr_url': get_setting('sonarr_url', ''),
         'sonarr_api_key': get_setting('sonarr_api_key', ''),
+        'sonarr_sync_paths': get_setting('sonarr_sync_paths', '1') == '1',
+        'sonarr_path_map': get_setting('sonarr_path_map', ''),
         'notify_on_drip': get_setting('notify_on_drip', '1') == '1',
         'notify_on_failure': get_setting('notify_on_failure', '1') == '1',
         'notify_on_missed_run': get_setting('notify_on_missed_run', '1') == '1',
+        'cooldown_grace_days': get_cooldown_grace_days(),
         'digest_enabled': get_setting('digest_enabled', '0') == '1',
         'digest_hour': get_setting('digest_hour', '8'),
         'digest_minute': get_setting('digest_minute', '0'),
@@ -4714,6 +4950,12 @@ def show_detail(show_id):
     total_eps = sum(len(v) for v in grid.values())
     dripped_count = sum(1 for eps in grid.values() for e in eps if e['status'] == 'dripped')
 
+    waiting_count = sum(1 for eps in grid.values() for e in eps if e['status'] == 'waiting')
+    show['estimated_end'] = None if (show.get('paused') or show.get('completed_at')) else estimate_end_date(
+        waiting_count, show.get('episodes_per_drop', 1), release_days_raw,
+        ran_today=(show.get('last_run_date') == today_local().isoformat()),
+    )
+
     return render_template(
         'show_detail.html', show=show, grid=grid, seasons_sorted=seasons_sorted,
         total_eps=total_eps, dripped_count=dripped_count,
@@ -4957,6 +5199,10 @@ def save_edit(show_id):
                 )
                 return _error_redirect('duplicate_name')
 
+            before = conn.execute(
+                f"SELECT vault_path, tvdb_id FROM {TABLE_NAME} WHERE id = ?", (show_id,)
+            ).fetchone()
+
             conn.execute(f"""
                 UPDATE {TABLE_NAME}
                 SET show_name = ?, vault_path = ?, plex_path = ?, release_day = ?, release_days = ?,
@@ -4966,6 +5212,8 @@ def save_edit(show_id):
                   current_season, current_episode, episodes_per_drop, tags_str, show_id))
             conn.commit()
         sync_discord_schedule_message_async()
+        if before and before['vault_path'] != vault_path:
+            sync_sonarr_path_async(show_id, show_name, before['tvdb_id'], before['vault_path'], vault_path)
     except sqlite3.IntegrityError:
         # Belt and braces: catches a duplicate name even if it somehow slips
         # past the explicit check above (e.g. a race between two edits).
@@ -5037,6 +5285,8 @@ def delete_show(show_id):
                     show['show_name'], vault_files + plex_files, dest
                 )
                 check_and_advance_queue(trigger_show_id=show_id)
+                if not problems:
+                    sync_sonarr_path_async(show_id, show['show_name'], show.get('tvdb_id'), show['vault_path'], dest)
                 # U9 - names the show and gives a real count, instead of a
                 # silent redirect that looked identical whether it worked or
                 # not.

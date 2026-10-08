@@ -787,6 +787,7 @@ table.data-table a:hover { text-decoration: underline; }
 .action-deleted { background: var(--pill-missing-bg); color: var(--pill-missing-text); }
 .action-failed { background: #7A2020; color: #F5C6C4; }
 .action-undone { background: #8B4FA8; color: #F0DFF5; }
+.action-sonarr { background: var(--pill-idle-bg); color: var(--pill-idle-text); }
 .action-paused, .action-generic { background: var(--pill-idle-bg); color: var(--pill-idle-text); }
 
 .history-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }

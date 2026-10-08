@@ -44,7 +44,7 @@
             {% if status == 'paused' %}<span class="pill pill-idle">paused</span>
             {% elif status == 'cooldown' %}<span class="pill pill-partial">cooldown</span>
             {% else %}<span class="pill pill-complete">dripping</span>{% endif %}
-            <span>episode {{ show.current_episode }} of {{ total_eps }} &middot; {{ dripped_count }} dripped{% if show.release_days_display %} &middot; drops {{ show.release_days_display }}{% endif %}</span>
+            <span>episode {{ show.current_episode }} of {{ total_eps }} &middot; {{ dripped_count }} dripped{% if show.release_days_display %} &middot; drops {{ show.release_days_display }}{% endif %}{% if show.estimated_end %} &middot; finishes ~{{ show.estimated_end.strftime('%-d %b %Y') }}{% endif %}</span>
         </div>
     </div>
     <div class="show-hero-actions">

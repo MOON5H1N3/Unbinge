@@ -144,7 +144,7 @@
                     <span class="pill {{ 'pill-complete' if ratio >= 0.9 else ('pill-partial' if ratio >= 0.5 else 'pill-missing') }}">
                         {{ show.episodes_dripped }} / {{ show.episodes_total }}
                     </span>
-                    {% if show.episodes_remaining > 0 %}<div class="cell-faint" style="margin-top:4px;">{{ show.episodes_remaining }} left</div>{% endif %}
+                    {% if show.episodes_remaining > 0 %}<div class="cell-faint" style="margin-top:4px;">{{ show.episodes_remaining }} left{% if show.estimated_end %} · ends {{ show.estimated_end.strftime('%-d %b') }}{% endif %}</div>{% endif %}
                 {% endif %}
             </td>
             <td data-label="Status">
@@ -199,7 +199,7 @@
                     {% if show.paused %}
                         paused
                     {% elif status == 'active' and show.episodes_total > 0 %}
-                        ep {{ show.episodes_dripped }} of {{ show.episodes_total }}{% if nu and nu.date %} · drops {{ nu.date.strftime('%a') }}{% endif %}
+                        ep {{ show.episodes_dripped }} of {{ show.episodes_total }}{% if nu and nu.date %} · drops {{ nu.date.strftime('%a') }}{% endif %}{% if show.estimated_end %} · ends {{ show.estimated_end.strftime('%-d %b') }}{% endif %}
                     {% elif status == 'cooldown' %}
                         cooldown{% if nu and nu.action == 'graduate' %} · back {{ nu.date.strftime('%a %b %d') }}{% endif %}
                     {% else %}
