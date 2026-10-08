@@ -107,6 +107,26 @@
             <input type="number" id="settingsEpisodesPerDrop" name="episodes_per_drop" value="{{ show.episodes_per_drop }}" min="1" required>
         </div>
         <div class="field">
+            <label for="settingsTargetDate">finish by (optional)</label>
+            <div class="date-row">
+                <input type="date" id="settingsTargetDate" name="target_end_date" value="{{ show.target_end_date or '' }}" onchange="loadSettingsPlan()">
+                <button type="button" class="btn btn-sm" onclick="document.getElementById('settingsTargetDate').value=''; document.getElementById('settingsPlanMode').value=''; document.getElementById('settingsPlanOptions').innerHTML='';">clear</button>
+            </div>
+            <input type="hidden" id="settingsPlanMode" name="plan_mode" value="{{ show.plan_mode or '' }}">
+            <div id="settingsPlanOptions" class="plan-options"></div>
+            {% if show.target_end %}
+            <span class="hint">
+                {% if show.estimated_end and show.estimated_end > show.target_end %}
+                <span style="color:var(--accent);">running behind - ends ~{{ show.estimated_end.strftime('%-d %b') }}, target {{ show.target_end.strftime('%-d %b') }}.</span> it re-plans each night, only ever speeding up.
+                {% else %}
+                target {{ show.target_end.strftime('%-d %b') }} - on track. unbinge re-plans each night if it falls behind, only ever speeding up.
+                {% endif %}
+            </span>
+            {% else %}
+            <span class="hint">set a date to get schedules that finish on or before it. blank keeps your schedule as is.</span>
+            {% endif %}
+        </div>
+        <div class="field">
             <label for="settingsTags">tags</label>
             <input type="text" id="settingsTags" name="tags" value="{{ show.tags }}" placeholder="anime, kids, drama...">
             <span class="hint">comma-separated. used for filtering the dashboard.</span>
@@ -227,6 +247,26 @@
 {% block extra_scripts %}
 <script>
 const SHOW_ID = {{ show.id }};
+
+function loadSettingsPlan() {
+    const target = document.getElementById('settingsTargetDate').value;
+    const box = document.getElementById('settingsPlanOptions');
+    document.getElementById('settingsPlanMode').value = '';
+    if (!target) { box.innerHTML = ''; return; }
+    const days = Array.from(document.querySelectorAll('.settings-day-cb:checked')).map(cb => cb.value);
+    unbingePlanOptions({
+        query: {
+            show_id: SHOW_ID, target: target, days: days.join(','),
+            per_drop: document.getElementById('settingsEpisodesPerDrop').value || '1',
+        },
+        container: box,
+        onPick: (opt) => {
+            document.getElementById('settingsPlanMode').value = opt.key;
+            unbingeApplyPlan(opt, document.getElementById('settingsDailyCb'), '.settings-day-cb',
+                             document.getElementById('settingsEpisodesPerDrop'));
+        },
+    });
+}
 
 async function toggleExclude(season, episode, currentStatus) {
     const action = currentStatus === 'excluded' ? 'unexclude' : 'exclude';

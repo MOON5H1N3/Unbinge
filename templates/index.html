@@ -290,6 +290,15 @@
                 <label for="episodes_per_drop">episodes per drop</label>
                 <input type="number" id="episodes_per_drop" value="1" min="1">
             </div>
+            <div class="field">
+                <label for="targetEndDate">finish by (optional)</label>
+                <div class="date-row">
+                    <input type="date" id="targetEndDate" onchange="loadPlanOptions()">
+                    <button type="button" class="btn btn-sm" onclick="clearTargetDate()">clear</button>
+                </div>
+                <div id="planOptions" class="plan-options"></div>
+                <span class="hint">leave blank to drip on the schedule above. with a date, pick one of the schedules that finish on or before it - unbinge keeps it on track from then on.</span>
+            </div>
             <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:1.2rem;">
                 <button type="button" class="btn" onclick="backToStep1()">back</button>
                 <button type="button" class="btn btn-primary" id="confirmPromoteBtn" onclick="submitPromotion(event)">confirm & start drip</button>
@@ -619,7 +628,51 @@ function selectShow(showName) {
         })
         .catch(() => { summary.innerText = 'could not inspect this folder.'; });
 
+    resetTargetPlan();
     applySuggestedReleaseDay(showName);
+}
+
+let planChosen = null;   // the option picked for the finish-by date, if any
+
+function resetTargetPlan() {
+    planChosen = null;
+    document.getElementById('targetEndDate').value = '';
+    document.getElementById('planOptions').innerHTML = '';
+}
+
+function clearTargetDate() { resetTargetPlan(); }
+
+// Changing the days or batch size by hand makes any chosen schedule stale,
+// so the options are worked out again for what's on screen now.
+let planRefreshTimer = null;
+function refreshPlanIfDateSet() {
+    if (!document.getElementById('targetEndDate').value) return;
+    clearTimeout(planRefreshTimer);
+    planRefreshTimer = setTimeout(loadPlanOptions, 300);
+}
+document.querySelectorAll('.release-day-cb, #promoteDailyCb').forEach(el => el.addEventListener('change', refreshPlanIfDateSet));
+document.getElementById('episodes_per_drop').addEventListener('input', refreshPlanIfDateSet);
+
+function loadPlanOptions() {
+    const target = document.getElementById('targetEndDate').value;
+    planChosen = null;
+    const box = document.getElementById('planOptions');
+    if (!target) { box.innerHTML = ''; return; }
+    const days = Array.from(document.querySelectorAll('.release-day-cb:checked')).map(cb => cb.value);
+    unbingePlanOptions({
+        query: {
+            show: document.getElementById('selectedShowInput').value,
+            target: target,
+            days: days.join(','),
+            per_drop: document.getElementById('episodes_per_drop').value || '1',
+        },
+        container: box,
+        onPick: (opt) => {
+            planChosen = opt;
+            unbingeApplyPlan(opt, document.getElementById('promoteDailyCb'), '.release-day-cb',
+                             document.getElementById('episodes_per_drop'));
+        },
+    });
 }
 
 function applySuggestedReleaseDay(showName) {
@@ -675,6 +728,11 @@ function submitPromotion(e) {
 
     if (!showName) { unbingeToast('please select a show first.', 'error'); return; }
     if (days.length === 0) { unbingeToast('pick at least one release day.', 'error'); return; }
+    const targetDate = document.getElementById('targetEndDate').value;
+    if (targetDate && !planChosen) {
+        unbingeToast('pick one of the schedules for that finish-by date, or clear the date.', 'error');
+        return;
+    }
 
     document.getElementById('loadingTitle').innerText = `promoting "${showName}"...`;
     document.getElementById('modalStep1').style.display = 'none';
@@ -685,6 +743,10 @@ function submitPromotion(e) {
     formData.append('show_name', showName);
     days.forEach(d => formData.append('release_days', d));
     formData.append('episodes_per_drop', episodesPerDrop);
+    if (targetDate && planChosen) {
+        formData.append('target_end_date', targetDate);
+        formData.append('plan_mode', planChosen.key);
+    }
 
     fetchWithTimeout('/promote', { method: 'POST', body: formData })
         .then(async response => {

@@ -120,3 +120,70 @@ function toggleDailyDrip(dailyCb, dayCbSelector) {
         cb.disabled = dailyCb.checked;
     });
 }
+
+// Finish-by planner, shared by the add-series window and the show page.
+// Asks the server for schedules that would finish by a date, draws them as
+// pick-one cards in `container`, and calls onPick(option) when one is chosen
+// (a lone option - "already on track" - is chosen automatically). Resolves
+// to true if there is something to choose, false on an error.
+function unbingePlanOptions({ query, container, onPick }) {
+    container.innerHTML = '';
+    const note = document.createElement('p');
+    note.className = 'plan-note';
+    note.textContent = 'working out options…';
+    container.appendChild(note);
+
+    return fetch('/api/plan-options?' + new URLSearchParams(query))
+        .then(res => res.json().then(data => ({ ok: res.ok, data })))
+        .then(({ ok, data }) => {
+            container.innerHTML = '';
+            if (!ok || data.status !== 'success') {
+                const err = document.createElement('p');
+                err.className = 'plan-note plan-note-error';
+                err.textContent = data.message || 'could not work out a schedule.';
+                container.appendChild(err);
+                return false;
+            }
+            const cards = [];
+            data.options.forEach(opt => {
+                const card = document.createElement('button');
+                card.type = 'button';
+                card.className = 'plan-option';
+                const title = document.createElement('span');
+                title.className = 'plan-option-title';
+                title.textContent = opt.label;
+                const detail = document.createElement('span');
+                detail.className = 'plan-option-detail';
+                detail.textContent = `${opt.days_display} · ${opt.per_drop} per drop · ends ${opt.end_display}`;
+                card.appendChild(title);
+                card.appendChild(detail);
+                card.onclick = () => {
+                    cards.forEach(c => c.classList.remove('selected'));
+                    card.classList.add('selected');
+                    onPick(opt);
+                };
+                container.appendChild(card);
+                cards.push(card);
+            });
+            if (cards.length === 1) cards[0].click();
+            return true;
+        })
+        .catch(() => {
+            container.innerHTML = '';
+            const err = document.createElement('p');
+            err.className = 'plan-note plan-note-error';
+            err.textContent = 'could not reach the server.';
+            container.appendChild(err);
+            return false;
+        });
+}
+
+// Puts a chosen plan into a day-checkbox group + episodes-per-drop input.
+function unbingeApplyPlan(opt, dailyCb, daySelector, perDropInput) {
+    dailyCb.checked = false;
+    toggleDailyDrip(dailyCb, daySelector);
+    const wanted = new Set(opt.days.map(String));
+    document.querySelectorAll(daySelector).forEach(cb => { cb.checked = wanted.has(cb.value); });
+    if (opt.days.length === 7) { dailyCb.checked = true; toggleDailyDrip(dailyCb, daySelector); }
+    perDropInput.value = opt.per_drop;
+}

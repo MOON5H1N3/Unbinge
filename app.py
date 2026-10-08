@@ -214,7 +214,7 @@ TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 # graduates back to the pool, so nothing is lost - they just don't get a slot.
 SPECIALS_SEASON = 0
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 SCHEDULER_JOB_ID = 'daily_drip_check'
 DIGEST_JOB_ID = 'daily_digest'
@@ -1624,6 +1624,151 @@ def next_occurrence(from_date, days_list, inclusive=True):
     return None
 
 
+PLAN_MODES = ('per_drop', 'days', 'balanced')
+
+
+def _circular_gap(a, b):
+    d = abs(a - b)
+    return min(d, 7 - d)
+
+
+def _days_with_added(base_days, count, load):
+    """base_days plus `count` more weekdays, each chosen to sit as far from
+    the days already picked as possible (so extra days spread through the
+    week rather than bunching up), preferring the weekday with the fewest of
+    your other shows on it. Returns the sequence of day-lists, one per step,
+    starting with base_days itself."""
+    days = sorted(set(base_days))
+    steps = [list(days)]
+    for _ in range(count):
+        candidates = [d for d in range(7) if d not in days]
+        if not candidates:
+            break
+        best = max(candidates, key=lambda d: (
+            min((_circular_gap(d, x) for x in days), default=7), -load.get(d, 0), -d))
+        days = sorted(days + [best])
+        steps.append(list(days))
+    return steps
+
+
+def _plan_finish(remaining, days, per_drop, ran_today):
+    return estimate_end_date(remaining, per_drop, ",".join(str(d) for d in days), ran_today)
+
+
+def plan_per_drop(remaining, target, days, per_drop, ran_today=False):
+    """Same release days, the smallest batch size (never below the current
+    one) that finishes on or before target. (days, per_drop) or None."""
+    if not days:
+        return None
+    for p in range(max(1, per_drop), max(1, remaining) + 1):
+        end = _plan_finish(remaining, days, p, ran_today)
+        if end and end <= target:
+            return list(days), p
+    return None
+
+
+def plan_more_days(remaining, target, days, per_drop, load, ran_today=False):
+    """Same batch size, the fewest extra release days that finish on or
+    before target. (days, per_drop) or None if even seven days a week isn't
+    enough."""
+    if not days:
+        return None
+    for step_days in _days_with_added(days, 7 - len(days), load):
+        end = _plan_finish(remaining, step_days, per_drop, ran_today)
+        if end and end <= target:
+            return step_days, per_drop
+    return None
+
+
+def plan_balanced(remaining, target, days, per_drop, load, ran_today=False):
+    """Whichever mix of extra days and bigger batches finishes in time with
+    the fewest episodes per week - the gentlest overall. (days, per_drop) or
+    None."""
+    if not days:
+        return None
+    best = None
+    for step_days in _days_with_added(days, 7 - len(days), load):
+        for p in range(max(1, per_drop), max(1, remaining) + 1):
+            end = _plan_finish(remaining, step_days, p, ran_today)
+            if end and end <= target:
+                key = (p * len(step_days), p, len(step_days))
+                if best is None or key < best[0]:
+                    best = (key, step_days, p)
+                break  # larger p only adds load for this day-count
+    return (best[1], best[2]) if best else None
+
+
+def plan_for_mode(mode, remaining, target, days, per_drop, load, ran_today=False):
+    if mode == 'per_drop':
+        return plan_per_drop(remaining, target, days, per_drop, ran_today)
+    if mode == 'days':
+        return plan_more_days(remaining, target, days, per_drop, load, ran_today)
+    if mode == 'balanced':
+        return plan_balanced(remaining, target, days, per_drop, load, ran_today)
+    return None
+
+
+def build_plan_options(remaining, target, days, per_drop, load, ran_today=False):
+    """The schedules offered for a finish-by date. If the current schedule
+    already makes it, that's the only option; otherwise up to three ways to
+    catch up. Returns a list of {key, label, days, per_drop, end}."""
+    def entry(key, label, plan):
+        d, p = plan
+        return {'key': key, 'label': label, 'days': d, 'per_drop': p,
+                'end': _plan_finish(remaining, d, p, ran_today)}
+
+    current_end = _plan_finish(remaining, days, per_drop, ran_today)
+    if current_end and current_end <= target:
+        return [entry('hold', 'keep the schedule as it is', (list(days), per_drop))]
+
+    options, seen = [], set()
+    for key, label, plan in (
+        ('per_drop', 'same days, bigger batches', plan_per_drop(remaining, target, days, per_drop, ran_today)),
+        ('days', 'same batch size, more days', plan_more_days(remaining, target, days, per_drop, load, ran_today)),
+        ('balanced', 'a bit of both (gentlest overall)', plan_balanced(remaining, target, days, per_drop, load, ran_today)),
+    ):
+        if not plan:
+            continue
+        sig = (tuple(plan[0]), plan[1])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        options.append(entry(key, label, plan))
+    return options
+
+
+def weekday_load(exclude_show_id=None):
+    """How many of your other shows release on each weekday."""
+    load = {d: 0 for d in range(7)}
+    for s in load_shows():
+        if exclude_show_id is not None and s['id'] == exclude_show_id:
+            continue
+        for d in parse_release_days(s['release_days']):
+            load[d] += 1
+    return load
+
+
+def normalize_target_plan(target_raw, mode_raw):
+    """Form values -> (target_iso, plan_mode), both None when there's no
+    usable target. 'hold' (the schedule already made the date) is kept as
+    'balanced', the gentlest dial, in case the show later falls behind."""
+    target = parse_target_date(target_raw)
+    if not target:
+        return None, None
+    mode = 'balanced' if mode_raw in (None, '', 'hold') else mode_raw
+    if mode not in PLAN_MODES:
+        mode = 'balanced'
+    return target.isoformat(), mode
+
+
+def parse_target_date(raw):
+    """A YYYY-MM-DD string -> date, or None for blank/invalid."""
+    try:
+        return date.fromisoformat((raw or '').strip())
+    except ValueError:
+        return None
+
+
 def get_cooldown_grace_days():
     """Minimum days a finished show sits in cooldown before it may graduate
     back to the pool. A show that's still airing on its own schedule (weekly,
@@ -1813,6 +1958,8 @@ def load_shows(sort='name'):
                 'tvdb_id': safe_get(r, 'tvdb_id', None),
                 'completed_at': safe_get(r, 'completed_at', None),
                 'paused': bool(safe_get(r, 'paused', 0)),
+                'target_end_date': safe_get(r, 'target_end_date', None),
+                'plan_mode': safe_get(r, 'plan_mode', None),
             })
 
         if sort == 'day':
@@ -2051,6 +2198,9 @@ def run_migrations(conn):
     if current < 14:
         _migrate_v14_tvdb_series_cache(conn)
 
+    if current < 15:
+        _migrate_v15_target_end_date(conn)
+
     conn.execute(
         f"INSERT INTO {SETTINGS_TABLE} (key, value) VALUES ('schema_version', ?) "
         f"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2234,6 +2384,19 @@ def _migrate_v8_show_queue_table(conn):
         f"CREATE INDEX IF NOT EXISTS idx_queue_pending ON {QUEUE_TABLE}(triggered_at);"
     )
     log.info("Added show_queue table.")
+
+
+def _migrate_v15_target_end_date(conn):
+    """Optional 'finish by' date per show, plus which dial the planner may
+    turn to keep that date ('per_drop', 'days' or 'balanced'). Both NULL for
+    a show with no target, which then behaves exactly as before."""
+    existing_cols = {r['name'] for r in conn.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall()}
+    if 'target_end_date' not in existing_cols:
+        conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN target_end_date TEXT;")
+        log.info("Added target_end_date column.")
+    if 'plan_mode' not in existing_cols:
+        conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN plan_mode TEXT;")
+        log.info("Added plan_mode column.")
 
 
 def _migrate_v9_tags_column(conn):
@@ -3244,6 +3407,63 @@ def process_show_drip(conn, show):
     return f"'{show_name}' dripped {label} ({len(batch)} file(s))"
 
 
+def replan_target_shows(conn, dry_run=False):
+    """Nightly: any active show with a finish-by date that its current
+    schedule would now miss (episodes arrived, runs were missed, it was
+    paused for a while) is re-planned along the same dial the user chose when
+    they set the date - bigger batches, more days, or both. It only ever
+    tightens; a show running ahead is left alone. A date that can't be met
+    even with every dial turned is left as it is (the UI flags it).
+    Returns a list of (show_name, detail)."""
+    changes = []
+    today = today_local()
+    rows = conn.execute(
+        f"SELECT * FROM {TABLE_NAME} WHERE target_end_date IS NOT NULL AND plan_mode IS NOT NULL "
+        f"AND completed_at IS NULL AND paused = 0"
+    ).fetchall()
+    load = None
+    for row in rows:
+        show = dict(row)
+        target = parse_target_date(show['target_end_date'])
+        if not target or target < today or show['plan_mode'] not in PLAN_MODES:
+            continue
+        dripped = get_dripped_set(conn, show['id'])
+        excluded = get_excluded_set(conn, show['id'])
+        remaining = len(distinct_episode_tags(
+            remaining_episode_files(show['vault_path'], dripped, excluded)))
+        if remaining <= 0:
+            continue
+        days = parse_release_days(show.get('release_days') or show.get('release_day'))
+        per_drop = max(1, int(show['episodes_per_drop'] or 1))
+        ran_today = show.get('last_run_date') == today.isoformat()
+        end = _plan_finish(remaining, days, per_drop, ran_today)
+        if end and end <= target:
+            continue
+        if load is None:
+            load = weekday_load()
+        plan = plan_for_mode(show['plan_mode'], remaining, target, days, per_drop, load, ran_today)
+        if not plan:
+            log.warning("'%s' can't finish by %s even after re-planning (%s).",
+                        show['show_name'], target.isoformat(), show['plan_mode'])
+            continue
+        new_days, new_per_drop = plan
+        new_end = _plan_finish(remaining, new_days, new_per_drop, ran_today)
+        detail = (f"behind its {target.strftime('%-d %b')} target - now {format_release_days(','.join(map(str, new_days)))}, "
+                  f"{new_per_drop} per drop, ends {new_end.strftime('%-d %b')}")
+        if dry_run:
+            log.info("[DRY RUN] '%s': %s", show['show_name'], detail)
+            continue
+        conn.execute(
+            f"UPDATE {TABLE_NAME} SET release_days = ?, release_day = ?, episodes_per_drop = ? WHERE id = ?",
+            (",".join(map(str, new_days)), new_days[0], new_per_drop, show['id']))
+        log_history(conn, show['id'], show['show_name'], 'replanned', detail)
+        conn.commit()
+        log.info("'%s' re-planned: %s", show['show_name'], detail)
+        send_notification('replanned', f"🗓️ '{show['show_name']}' {detail}.", poster_url=show.get('poster_url'))
+        changes.append((show['show_name'], detail))
+    return changes
+
+
 def resume_cooled_down_shows(conn, dry_run=False):
     """Nightly check (every night, not just a show's release day): a show in
     cooldown whose vault has gained episodes - Sonarr grabbed a new weekly
@@ -3334,6 +3554,10 @@ def run_drip_job(force_show_id=None):
                 resume_cooled_down_shows(conn, dry_run=dry_run)
             except Exception as e:
                 log.error("Cooldown wake-up check failed: %s", e)
+            try:
+                replan_target_shows(conn, dry_run=dry_run)
+            except Exception as e:
+                log.error("Target-date re-plan failed: %s", e)
 
         if force_show_id is not None:
             rows = conn.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (force_show_id,)).fetchall()
@@ -3976,6 +4200,71 @@ def get_pool():
     return jsonify({"shows": filtered, "posters": posters})
 
 
+@app.route('/api/plan-options', methods=['GET'])
+def api_plan_options():
+    """Schedules that would finish a show by a target date. Takes either
+    ?show=<pool folder> (a show being added) or ?show_id=<id> (one already
+    dripping), plus target=YYYY-MM-DD and the schedule currently on screen
+    (days=0,3 &per_drop=1), since the form may hold unsaved changes."""
+    target = parse_target_date(request.args.get('target'))
+    if not target:
+        return jsonify({'status': 'error', 'message': 'pick a valid finish-by date.'}), 400
+    today = today_local()
+    if target < today:
+        return jsonify({'status': 'error', 'message': 'that date has already passed.'}), 400
+
+    days = parse_release_days(request.args.get('days'))
+    try:
+        per_drop = max(1, int(request.args.get('per_drop', 1)))
+    except ValueError:
+        per_drop = 1
+    if not days:
+        return jsonify({'status': 'error', 'message': 'pick at least one release day first.'}), 400
+
+    ran_today = False
+    exclude_id = None
+    show_id = request.args.get('show_id', type=int)
+    if show_id is not None:
+        with closing(get_db()) as conn:
+            row = conn.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
+            if not row:
+                return jsonify({'status': 'error', 'message': 'show not found.'}), 404
+            dripped = get_dripped_set(conn, show_id)
+            excluded = get_excluded_set(conn, show_id)
+        remaining_files = remaining_episode_files(row['vault_path'], dripped, excluded)
+        ran_today = row['last_run_date'] == today.isoformat()
+        exclude_id = show_id
+    else:
+        folder = request.args.get('show', '').strip()
+        try:
+            source_dir = safe_show_path(POOL_DIR, folder)
+        except ValueError:
+            return jsonify({'status': 'error', 'message': 'unknown show.'}), 400
+        remaining_files = remaining_episode_files(source_dir, set(), frozenset())
+
+    remaining = len(distinct_episode_tags(remaining_files))
+    if remaining == 0:
+        return jsonify({'status': 'error', 'message': 'no episodes are waiting, so there is nothing to schedule.'}), 400
+
+    first_drop = next_occurrence(today, days, inclusive=not ran_today)
+    if first_drop and target < first_drop:
+        return jsonify({'status': 'error',
+                        'message': f"the first drop can't happen before {first_drop.strftime('%-d %b')}, so that date is too soon."}), 400
+
+    options = build_plan_options(remaining, target, days, per_drop, weekday_load(exclude_id), ran_today)
+    if not options:
+        return jsonify({'status': 'error',
+                        'message': f"{remaining} episodes can't be fitted by {target.strftime('%-d %b')} with this setup."}), 400
+    return jsonify({
+        'status': 'success', 'remaining': remaining,
+        'options': [{
+            'key': o['key'], 'label': o['label'], 'days': o['days'], 'per_drop': o['per_drop'],
+            'days_display': format_release_days(','.join(map(str, o['days']))),
+            'end': o['end'].isoformat(), 'end_display': o['end'].strftime('%-d %b'),
+        } for o in options],
+    })
+
+
 @app.route('/api/suggest-release-day', methods=['GET'])
 def api_suggest_release_day():
     """Backs the add-series modal's day suggestion: which weekday a show
@@ -4219,7 +4508,7 @@ def api_inspect():
     })
 
 
-def promote_show_internal(show_name, release_days_str, episodes_per_drop):
+def promote_show_internal(show_name, release_days_str, episodes_per_drop, target_end_date=None, plan_mode=None):
     """The actual promote logic, shared by the /promote HTTP route and the
     show-queue auto-promotion. Extracted so the two can't drift apart the
     way process_show_drip and preview_show_drip once did (H1) - a queued
@@ -4253,6 +4542,8 @@ def promote_show_internal(show_name, release_days_str, episodes_per_drop):
     except ValueError:
         return False, "episodes_per_drop must be a positive integer", None, 400
 
+    target_iso, plan_mode = normalize_target_plan(target_end_date, plan_mode)
+
     with closing(get_db()) as conn:
         cursor = conn.cursor()
 
@@ -4273,9 +4564,10 @@ def promote_show_internal(show_name, release_days_str, episodes_per_drop):
         cursor.execute(f"""
             INSERT INTO {TABLE_NAME}
                 (show_name, vault_path, plex_path, release_day, release_days, current_season,
-                 current_episode, episodes_per_drop, last_run_date)
-            VALUES (?, ?, ?, ?, ?, 1, 0, ?, NULL)
-        """, (show_name, vault_path, plex_path, release_day_ints[0], release_days_str, episodes_per_drop))
+                 current_episode, episodes_per_drop, last_run_date, target_end_date, plan_mode)
+            VALUES (?, ?, ?, ?, ?, 1, 0, ?, NULL, ?, ?)
+        """, (show_name, vault_path, plex_path, release_day_ints[0], release_days_str, episodes_per_drop,
+              target_iso, plan_mode))
         new_id = cursor.lastrowid
 
         try:
@@ -4312,7 +4604,9 @@ def promote():
     release_days_str = ",".join(release_day_ints_raw)
 
     try:
-        ok, message, new_id, status_code = promote_show_internal(show_name, release_days_str, episodes_per_drop_raw)
+        ok, message, new_id, status_code = promote_show_internal(
+            show_name, release_days_str, episodes_per_drop_raw,
+            request.form.get('target_end_date'), request.form.get('plan_mode'))
         return jsonify({"status": "success" if ok else "error", "message": message}), status_code
     except Exception as e:
         log.error("Promote failed: %s", e)
@@ -4950,6 +5244,7 @@ def show_detail(show_id):
     total_eps = sum(len(v) for v in grid.values())
     dripped_count = sum(1 for eps in grid.values() for e in eps if e['status'] == 'dripped')
 
+    show['target_end'] = parse_target_date(show.get('target_end_date'))
     waiting_count = sum(1 for eps in grid.values() for e in eps if e['status'] == 'waiting')
     show['estimated_end'] = None if (show.get('paused') or show.get('completed_at')) else estimate_end_date(
         waiting_count, show.get('episodes_per_drop', 1), release_days_raw,
@@ -5202,6 +5497,16 @@ def save_edit(show_id):
             before = conn.execute(
                 f"SELECT vault_path, tvdb_id FROM {TABLE_NAME} WHERE id = ?", (show_id,)
             ).fetchone()
+
+            # Only touch the finish-by date when the form actually carried
+            # the field - the older /edit page doesn't, and saving it
+            # shouldn't wipe a date set from the show's own page.
+            if 'target_end_date' in request.form:
+                target_iso, plan_mode = normalize_target_plan(
+                    request.form.get('target_end_date'), request.form.get('plan_mode'))
+                conn.execute(
+                    f"UPDATE {TABLE_NAME} SET target_end_date = ?, plan_mode = ? WHERE id = ?",
+                    (target_iso, plan_mode, show_id))
 
             conn.execute(f"""
                 UPDATE {TABLE_NAME}

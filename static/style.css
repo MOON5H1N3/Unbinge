@@ -835,3 +835,20 @@ table.data-table a:hover { text-decoration: underline; }
     #toast-stack { left: 1rem; right: 1rem; max-width: none; }
     .poster-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; }
 }
+
+/* Finish-by planner (add-series window + show settings) */
+.plan-options { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.plan-option {
+    display: flex; flex-direction: column; gap: 2px; text-align: left; cursor: pointer;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 9px 12px; color: var(--text); font-family: inherit;
+}
+.plan-option:hover { border-color: var(--accent); }
+.plan-option.selected { border-color: var(--accent); background: var(--accent-bg); }
+.plan-option-title { font-size: 12.5px; font-weight: 600; }
+.plan-option-detail { font-size: 11.5px; color: var(--text-muted); }
+.plan-note { font-size: 11.5px; color: var(--text-faint); margin: 2px 0 0; }
+.plan-note-error { color: var(--pill-missing-text, #d98a8a); }
+.action-replanned { background: var(--pill-partial-bg); color: var(--pill-partial-text); }
+.date-row { display: flex; gap: 8px; align-items: center; }
+.date-row input[type="date"] { flex: 1; }
