@@ -1289,6 +1289,25 @@ def sonarr_get_calendar(days_ahead=14):
     return events, None
 
 
+_SONARR_SERIES_CACHE = {'key': None, 'at': 0.0, 'data': None}
+
+
+def sonarr_fetch_series(base, api_key, use_cache=True):
+    """Whole-library series list from Sonarr. Large libraries on slow hardware
+    can take well over 20 seconds to answer, so this waits up to 90 s, and
+    reuses the last answer for 60 s so a burst of checks doesn't repeat the
+    slow call. Raises requests.RequestException / ValueError."""
+    key = (base, api_key)
+    c = _SONARR_SERIES_CACHE
+    if use_cache and c['key'] == key and c['data'] is not None and time.time() - c['at'] < 60:
+        return c['data']
+    resp = requests.get(f'{base}/api/v3/series', headers={'X-Api-Key': api_key}, timeout=(10, 90))
+    resp.raise_for_status()
+    data = resp.json()
+    c.update(key=key, at=time.time(), data=data)
+    return data
+
+
 def sonarr_get_series(query_or_tvdb_id):
     """Optional enrichment - looks up a series in the user's own Sonarr
     instance, by TVDB id if given (more reliable) or by title match.
@@ -1304,13 +1323,7 @@ def sonarr_get_series(query_or_tvdb_id):
         return None, "Sonarr isn't configured (optional) - add a URL and API key in Settings to enable it."
 
     try:
-        resp = requests.get(
-            f'{base}/api/v3/series',
-            headers={'X-Api-Key': api_key},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        all_series = resp.json()
+        all_series = sonarr_fetch_series(base, api_key)
     except requests.RequestException as e:
         log.error("Sonarr lookup failed: %s", e)
         return None, f"Could not reach Sonarr: {e}"
@@ -1387,9 +1400,7 @@ def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
 
     headers = {'X-Api-Key': api_key}
     try:
-        resp = requests.get(f'{base}/api/v3/series', headers=headers, timeout=15)
-        resp.raise_for_status()
-        all_series = resp.json()
+        all_series = sonarr_fetch_series(base, api_key)
 
         def norm(p):
             return (p or '').rstrip('/')
@@ -1419,6 +1430,7 @@ def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
             headers=headers, json=body, timeout=30,
         )
         put.raise_for_status()
+        _SONARR_SERIES_CACHE['data'] = None
         return 'updated', f"Sonarr series path {previous} -> {new_s} (matched by {how}, no files moved)"
     except requests.RequestException as e:
         log.error("Sonarr path sync for '%s' failed: %s", show_name, e)
@@ -4460,9 +4472,7 @@ def sonarr_status_report(base, api_key):
     st = requests.get(f'{base}/api/v3/system/status', headers=headers, timeout=15)
     st.raise_for_status()
     version = (st.json() or {}).get('version', '?')
-    resp = requests.get(f'{base}/api/v3/series', headers=headers, timeout=20)
-    resp.raise_for_status()
-    all_series = resp.json()
+    all_series = sonarr_fetch_series(base, api_key, use_cache=False)
 
     conn = get_db()
     try:
