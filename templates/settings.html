@@ -298,6 +298,7 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
     const body = new FormData();
     body.append('sonarr_url', document.getElementById('sonarr_url').value);
     body.append('sonarr_api_key', document.getElementById('sonarr_api_key').value);
+    body.append('sonarr_path_map', document.getElementById('sonarr_path_map').value);
     btn.disabled = true; btn.textContent = 'checking…'; box.hidden = true; box.replaceChildren();
     try {
         const res = await fetch('/api/test-sonarr', { method: 'POST', body });
@@ -313,7 +314,13 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
         head.textContent = data.report.shows.length
             ? (data.problems ? data.problems + ' of ' + data.report.shows.length + ' shows need attention' : 'all ' + data.report.shows.length + ' shows match')
             : 'no shows in unbinge yet';
-        box.append(head);
+        const note = document.createElement('div');
+        note.className = 'sonarr-paths';
+        note.style.paddingLeft = '12px';
+        note.textContent = data.report.mapping_rules === undefined
+            ? 'this unbinge build is older than the path-mapping check - update and restart the container.'
+            : 'path mapping applied: ' + data.report.mapping_rules + ' rule' + (data.report.mapping_rules === 1 ? '' : 's') + ' (taken from the box above)';
+        box.append(head, note);
         data.report.shows.forEach(sh => {
             const row = document.createElement('div');
             row.className = 'sonarr-row';

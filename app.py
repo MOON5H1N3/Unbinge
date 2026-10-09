@@ -1352,7 +1352,7 @@ def sonarr_get_series(query_or_tvdb_id):
     }, None
 
 
-def sonarr_translate_path(path):
+def sonarr_translate_path(path, mapping=None):
     """Unbinge and Sonarr often see the same folder under different mount
     points (Unbinge at /media/vault, Sonarr at /tv, say). The optional
     sonarr_path_map setting - one 'unbinge_prefix=sonarr_prefix' per line -
@@ -1360,7 +1360,8 @@ def sonarr_translate_path(path):
     first. With no map, paths pass through unchanged."""
     path = (path or '').rstrip('/')
     pairs = []
-    for line in get_setting('sonarr_path_map', '').splitlines():
+    text = get_setting('sonarr_path_map', '') if mapping is None else mapping
+    for line in text.splitlines():
         if '=' not in line:
             continue
         ours, theirs = (part.strip().rstrip('/') for part in line.split('=', 1))
@@ -4464,7 +4465,7 @@ def sonarr_match_series(all_series, show_name, tvdb_id, path):
     return None, '', 0
 
 
-def sonarr_status_report(base, api_key):
+def sonarr_status_report(base, api_key, mapping=None):
     """Live check: Sonarr version plus, per active show, whether Unbinge can
     find its Sonarr series and whether the folder Sonarr has matches ours.
     Raises requests.RequestException / ValueError on connection problems."""
@@ -4480,7 +4481,7 @@ def sonarr_status_report(base, api_key):
         shows = []
         for r in rows:
             tvdb_id = r['tvdb_id']
-            ours = sonarr_translate_path(r['vault_path'])
+            ours = sonarr_translate_path(r['vault_path'], mapping)
             series, how, n = sonarr_match_series(all_series, r['show_name'], tvdb_id, ours)
             if series:
                 in_sync = (series.get('path') or '').rstrip('/') == (ours or '').rstrip('/')
@@ -4494,10 +4495,12 @@ def sonarr_status_report(base, api_key):
                           'ours': ours, 'theirs': (series or {}).get('path', '')})
     finally:
         conn.close()
-    return {'version': version, 'series_count': len(all_series), 'shows': shows}
+    text = get_setting('sonarr_path_map', '') if mapping is None else mapping
+    rules = sum(1 for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip())
+    return {'version': version, 'series_count': len(all_series), 'shows': shows, 'mapping_rules': rules}
 
 
-def sonarr_repoint_plan(base, api_key):
+def sonarr_repoint_plan(base, api_key, mapping=None):
     """Shows whose Sonarr series is found but points somewhere other than the
     show's vault folder. Returns a list of {name, series_id, from, to}."""
     all_series = sonarr_fetch_series(base, api_key, use_cache=False)
@@ -4505,7 +4508,7 @@ def sonarr_repoint_plan(base, api_key):
     with closing(get_db()) as conn:
         rows = conn.execute(f"SELECT id, show_name, vault_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
     for r in rows:
-        want = sonarr_translate_path(r['vault_path'])
+        want = sonarr_translate_path(r['vault_path'], mapping)
         series, how, _n = sonarr_match_series(all_series, r['show_name'], r['tvdb_id'], want)
         if not series:
             continue
@@ -4526,7 +4529,7 @@ def api_sonarr_repoint():
     if not base or not api_key:
         return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
     try:
-        plan = sonarr_repoint_plan(base, api_key)
+        plan = sonarr_repoint_plan(base, api_key, request.form.get('sonarr_path_map'))
     except requests.RequestException as e:
         return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
     except ValueError:
@@ -4571,7 +4574,7 @@ def api_test_sonarr():
     if not base or not api_key:
         return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
     try:
-        report = sonarr_status_report(base, api_key)
+        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'))
     except requests.RequestException as e:
         log.warning("Sonarr test connection failed: %s", e)
         return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
