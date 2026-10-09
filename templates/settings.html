@@ -272,7 +272,7 @@ async function sonarrRepoint(btn, holder, creds) {
         holder.replaceChildren();
         const intro = document.createElement('div');
         intro.className = 'sonarr-fix-intro';
-        intro.textContent = 'this changes where sonarr looks for ' + d.plan.length + ' show' + (d.plan.length === 1 ? '' : 's') + '. no files are moved. sonarr will look in the folder shown under 'to'.';
+        intro.textContent = 'this changes where sonarr looks for ' + d.plan.length + ' show' + (d.plan.length === 1 ? '' : 's') + '. no files are moved. sonarr will look in the folder shown after to:.';
         holder.append(intro);
         d.plan.forEach(p => {
             const row = document.createElement('div');
