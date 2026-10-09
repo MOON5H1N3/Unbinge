@@ -176,6 +176,7 @@
             </div>
         </div>
         <button type="button" class="btn btn-sm" id="test-sonarr-btn" style="margin-top:0.9rem;">test connection</button>
+        <div id="sonarrReport" class="sonarr-report" hidden></div>
     </div>
     </div>
 
@@ -254,11 +255,45 @@ document.getElementById('test-tvdb-btn').addEventListener('click', (e) => {
     body.append('tvdb_pin', document.getElementById('tvdb_pin').value);
     unbingeRunAction(e.target, '/api/test-tvdb', 'tvdb connection ok.', body);
 });
-document.getElementById('test-sonarr-btn').addEventListener('click', (e) => {
+document.getElementById('test-sonarr-btn').addEventListener('click', async (e) => {
+    const btn = e.currentTarget, original = btn.innerHTML, box = document.getElementById('sonarrReport');
     const body = new FormData();
     body.append('sonarr_url', document.getElementById('sonarr_url').value);
     body.append('sonarr_api_key', document.getElementById('sonarr_api_key').value);
-    unbingeRunAction(e.target, '/api/test-sonarr', 'sonarr connection ok.', body);
+    btn.disabled = true; btn.textContent = 'checking…'; box.hidden = true; box.replaceChildren();
+    try {
+        const res = await fetch('/api/test-sonarr', { method: 'POST', body });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.status === 'error') {
+            unbingeToast(data.message || 'that failed - check the logs.', 'error');
+            return;
+        }
+        unbingeToast(data.message, 'success');
+        const labels = { 'ok': 'in sync', 'path-differs': 'path differs', 'ambiguous': 'ambiguous', 'none': 'not found' };
+        const head = document.createElement('div');
+        head.className = 'sonarr-report-head';
+        head.textContent = data.report.shows.length
+            ? (data.problems ? data.problems + ' of ' + data.report.shows.length + ' shows need attention' : 'all ' + data.report.shows.length + ' shows match')
+            : 'no shows in unbinge yet';
+        box.append(head);
+        data.report.shows.forEach(sh => {
+            const row = document.createElement('div');
+            row.className = 'sonarr-row';
+            const dot = document.createElement('span');
+            dot.className = 'sonarr-dot sonarr-' + sh.state;
+            const name = document.createElement('span');
+            name.className = 'sonarr-row-name'; name.textContent = sh.name;
+            const det = document.createElement('span');
+            det.className = 'sonarr-row-detail'; det.textContent = labels[sh.state] + ' · ' + sh.detail;
+            row.append(dot, name, det);
+            box.append(row);
+        });
+        box.hidden = false;
+    } catch (err) {
+        unbingeToast('request failed - is the container reachable?', 'error');
+    } finally {
+        btn.disabled = false; btn.innerHTML = original;
+    }
 });
 document.getElementById('run-backup-now-btn').addEventListener('click', async (e) => {
     await unbingeRunAction(e.target, '/api/run-backup-now', 'backup created.');

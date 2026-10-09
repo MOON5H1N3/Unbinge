@@ -852,3 +852,69 @@ table.data-table a:hover { text-decoration: underline; }
 .action-replanned { background: var(--pill-partial-bg); color: var(--pill-partial-text); }
 .date-row { display: flex; gap: 8px; align-items: center; }
 .date-row input[type="date"] { flex: 1; }
+
+/* Sonarr live-status report (settings) */
+.sonarr-report { margin-top: 0.9rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); max-height: 260px; overflow: auto; }
+.sonarr-report-head { padding: 8px 12px; font-size: 12px; font-weight: 600; color: var(--text-muted); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); }
+.sonarr-row { display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; font-size: 12.5px; border-bottom: 1px solid var(--border); }
+.sonarr-row:last-child { border-bottom: 0; }
+.sonarr-row-name { font-weight: 500; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sonarr-row-detail { color: var(--text-faint); font-size: 11.5px; margin-left: auto; text-align: right; }
+.sonarr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; background: var(--text-faint); }
+.sonarr-ok { background: var(--success); }
+.sonarr-path-differs, .sonarr-ambiguous { background: var(--warning); }
+.sonarr-none { background: var(--danger); }
+
+/* ---------------------------------------------------------------------
+   Polish layer: consistent form controls, focus rings, quiet motion.
+   Uses the existing theme tokens only, so dark and light both follow.
+   ------------------------------------------------------------------- */
+.toolbar input[type="text"], .toolbar input[type="search"], .toolbar select,
+.history-toolbar input, .history-toolbar select {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border-strong); border-radius: var(--radius);
+    padding: 7px 11px; font: inherit; font-size: 12.5px; line-height: 1.2;
+    min-height: 32px;
+}
+.toolbar input::placeholder { color: var(--text-faint); }
+.toolbar select { padding-right: 8px; cursor: pointer; }
+.toolbar input:focus, .toolbar select:focus { outline: none; border-color: var(--accent); }
+
+/* keyboard focus: visible everywhere, never on plain mouse clicks */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.field input:focus-visible, .field select:focus-visible, .field textarea:focus-visible,
+.toolbar input:focus-visible, .toolbar select:focus-visible { outline-offset: 0; }
+
+/* controls ease between states instead of snapping */
+.btn, .btn-icon, .pill, .show-card, .pool-card, .plan-option,
+.sidebar-link, table.data-table tbody tr {
+    transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, transform 0.14s ease;
+}
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn-primary { box-shadow: 0 1px 0 rgba(0,0,0,0.18); }
+
+/* cards: a single quiet cue on hover, border only */
+.show-card:hover, .pool-card:hover { border-color: var(--accent-fade); }
+.show-card-poster, .pool-card-poster { box-shadow: 0 1px 3px var(--shadow-color); }
+
+/* panels and headings: a little more air, tighter heading rhythm */
+.panel { padding: 1.25rem 1.4rem; }
+.panel h2 { letter-spacing: 0.01em; }
+.page-header { margin-bottom: 1.1rem; }
+.page-header h1, .mast { letter-spacing: -0.01em; }
+table.data-table thead th { font-weight: 600; letter-spacing: 0.02em; }
+table.data-table tbody tr:hover { background: var(--accent-bg); }
+
+/* selection and scrollbars match the palette */
+::selection { background: var(--accent-fade); color: var(--text); }
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+
+.empty-note { padding: 2.2rem 1rem; text-align: center; border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); background: var(--surface); }
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}
+
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+.show-card-select input { width: 15px; height: 15px; cursor: pointer; opacity: 0.55; transition: opacity 0.14s ease; }
+.show-card:hover .show-card-select input, .show-card-select input:checked, .show-card-select input:focus-visible { opacity: 1; }

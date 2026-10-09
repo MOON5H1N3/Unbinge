@@ -4421,23 +4421,80 @@ def api_sonarr_calendar():
     })
 
 
+def sonarr_match_series(all_series, show_name, tvdb_id, path):
+    """Same matching order as the path sync (path, TVDB id, exact title), but
+    read-only. Returns (series|None, how, ambiguous_count)."""
+    def norm(p):
+        return (p or '').rstrip('/')
+    steps = [('path', lambda x: norm(x.get('path')) == norm(path))]
+    if tvdb_id:
+        steps.append(('TVDB id', lambda x: x.get('tvdbId') == tvdb_id))
+    steps.append(('title', lambda x: (x.get('title') or '').strip().lower() == show_name.strip().lower()))
+    for how, fn in steps:
+        found = [x for x in all_series if fn(x)]
+        if found:
+            return (found[0] if len(found) == 1 else None), how, len(found)
+    return None, '', 0
+
+
+def sonarr_status_report(base, api_key):
+    """Live check: Sonarr version plus, per active show, whether Unbinge can
+    find its Sonarr series and whether the folder Sonarr has matches ours.
+    Raises requests.RequestException / ValueError on connection problems."""
+    headers = {'X-Api-Key': api_key}
+    st = requests.get(f'{base}/api/v3/system/status', headers=headers, timeout=15)
+    st.raise_for_status()
+    version = (st.json() or {}).get('version', '?')
+    resp = requests.get(f'{base}/api/v3/series', headers=headers, timeout=20)
+    resp.raise_for_status()
+    all_series = resp.json()
+
+    conn = get_db()
+    try:
+        rows = conn.execute(f"SELECT show_name, plex_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+        shows = []
+        for r in rows:
+            tvdb_id = r['tvdb_id']
+            ours = sonarr_translate_path(r['plex_path'])
+            series, how, n = sonarr_match_series(all_series, r['show_name'], tvdb_id, ours)
+            if series:
+                in_sync = (series.get('path') or '').rstrip('/') == (ours or '').rstrip('/')
+                state = 'ok' if in_sync else 'path-differs'
+                detail = f"matched by {how}" + ("" if in_sync else f" - sonarr has {series.get('path')}")
+            elif n > 1:
+                state, detail = 'ambiguous', f"{n} series match by {how}"
+            else:
+                state, detail = 'none', 'not found in sonarr'
+            shows.append({'name': r['show_name'], 'state': state, 'detail': detail})
+    finally:
+        conn.close()
+    return {'version': version, 'series_count': len(all_series), 'shows': shows}
+
+
 @app.route('/api/test-sonarr', methods=['POST'])
 def api_test_sonarr():
     """Settings page 'Test Connection' button for the optional Sonarr link.
-    Same fix as TVDB's test button - uses the current form values."""
+    Uses the current form values; on success also returns a per-show report
+    so you can see whether path sync will find each show."""
     base = request.form.get('sonarr_url', '').strip().rstrip('/')
     api_key = request.form.get('sonarr_api_key', '').strip()
     log.info("Testing Sonarr connection (url provided: %s, key provided: %s)...", bool(base), bool(api_key))
     if not base or not api_key:
         return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
     try:
-        resp = requests.get(f'{base}/api/v3/system/status', headers={'X-Api-Key': api_key}, timeout=15)
-        resp.raise_for_status()
-        log.info("Sonarr test connection succeeded.")
-        return jsonify({"status": "success", "message": "Sonarr connection OK."})
+        report = sonarr_status_report(base, api_key)
     except requests.RequestException as e:
         log.warning("Sonarr test connection failed: %s", e)
         return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
+    except ValueError:
+        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
+    problems = sum(1 for x in report['shows'] if x['state'] != 'ok')
+    log.info("Sonarr test connection succeeded (v%s).", report['version'])
+    return jsonify({
+        "status": "success",
+        "message": f"Sonarr v{report['version']} OK - {report['series_count']} series.",
+        "report": report, "problems": problems,
+    })
 
 
 @app.route('/api/inspect', methods=['GET'])
