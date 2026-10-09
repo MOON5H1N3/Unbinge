@@ -255,6 +255,46 @@ document.getElementById('test-tvdb-btn').addEventListener('click', (e) => {
     body.append('tvdb_pin', document.getElementById('tvdb_pin').value);
     unbingeRunAction(e.target, '/api/test-tvdb', 'tvdb connection ok.', body);
 });
+
+async function sonarrRepoint(btn, holder, creds) {
+    btn.disabled = true;
+    const post = (extra) => { const f = new FormData(); creds.forEach((v, k) => f.append(k, v)); if (extra) f.append('confirm', '1'); return fetch('/api/sonarr/repoint', { method: 'POST', body: f }).then(r => r.json().then(d => ({ ok: r.ok, d }))); };
+    try {
+        const { ok, d } = await post(false);
+        if (!ok || d.status === 'error') { unbingeToast(d.message || 'that failed.', 'error'); btn.disabled = false; return; }
+        if (!d.plan.length) { unbingeToast('nothing to change.', 'success'); btn.disabled = false; return; }
+        holder.replaceChildren();
+        const intro = document.createElement('div');
+        intro.className = 'sonarr-fix-intro';
+        intro.textContent = 'this changes where sonarr looks for ' + d.plan.length + ' show' + (d.plan.length === 1 ? '' : 's') + '. no files are moved. new episodes sonarr downloads will go to the vault folder.';
+        holder.append(intro);
+        d.plan.forEach(p => {
+            const row = document.createElement('div');
+            row.className = 'sonarr-fix-row';
+            const n = document.createElement('strong'); n.textContent = p.name;
+            const a = document.createElement('div'); a.textContent = 'now: ' + p.from;
+            const c = document.createElement('div'); c.textContent = 'to:  ' + p.to;
+            row.append(n, a, c);
+            holder.append(row);
+        });
+        const go = document.createElement('button');
+        go.type = 'button'; go.className = 'btn btn-sm btn-primary'; go.textContent = 'confirm and change sonarr';
+        const no = document.createElement('button');
+        no.type = 'button'; no.className = 'btn btn-sm'; no.textContent = 'cancel'; no.style.marginLeft = '8px';
+        no.addEventListener('click', () => holder.replaceChildren());
+        go.addEventListener('click', async () => {
+            go.disabled = true; no.disabled = true; go.textContent = 'working…';
+            const r = await post(true);
+            unbingeToast(r.d.message || 'done.', r.ok ? 'success' : 'error');
+            holder.replaceChildren();
+        });
+        holder.append(go, no);
+    } catch (e) {
+        unbingeToast('request failed - is the container reachable?', 'error');
+        btn.disabled = false;
+    }
+}
+
 document.getElementById('test-sonarr-btn').addEventListener('click', async (e) => {
     const btn = e.currentTarget, original = btn.innerHTML, box = document.getElementById('sonarrReport');
     const body = new FormData();
@@ -292,6 +332,17 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
             paths.textContent = 'unbinge: ' + (sh.ours || '-') + '   sonarr: ' + (sh.theirs || 'no series found');
             box.append(paths);
         });
+        const fixable = data.report.shows.filter(x => x.state === 'path-differs').length;
+        if (fixable) {
+            const fix = document.createElement('div');
+            fix.className = 'sonarr-fix';
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'btn btn-sm btn-primary';
+            b.textContent = 'repoint ' + fixable + ' to vault…';
+            b.addEventListener('click', () => sonarrRepoint(b, fix, body));
+            fix.append(b);
+            box.append(fix);
+        }
         box.hidden = false;
     } catch (err) {
         unbingeToast('request failed - is the container reachable?', 'error');

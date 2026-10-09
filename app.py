@@ -4476,11 +4476,11 @@ def sonarr_status_report(base, api_key):
 
     conn = get_db()
     try:
-        rows = conn.execute(f"SELECT show_name, plex_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+        rows = conn.execute(f"SELECT show_name, vault_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
         shows = []
         for r in rows:
             tvdb_id = r['tvdb_id']
-            ours = sonarr_translate_path(r['plex_path'])
+            ours = sonarr_translate_path(r['vault_path'])
             series, how, n = sonarr_match_series(all_series, r['show_name'], tvdb_id, ours)
             if series:
                 in_sync = (series.get('path') or '').rstrip('/') == (ours or '').rstrip('/')
@@ -4495,6 +4495,69 @@ def sonarr_status_report(base, api_key):
     finally:
         conn.close()
     return {'version': version, 'series_count': len(all_series), 'shows': shows}
+
+
+def sonarr_repoint_plan(base, api_key):
+    """Shows whose Sonarr series is found but points somewhere other than the
+    show's vault folder. Returns a list of {name, series_id, from, to}."""
+    all_series = sonarr_fetch_series(base, api_key, use_cache=False)
+    plan = []
+    with closing(get_db()) as conn:
+        rows = conn.execute(f"SELECT id, show_name, vault_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+    for r in rows:
+        want = sonarr_translate_path(r['vault_path'])
+        series, how, _n = sonarr_match_series(all_series, r['show_name'], r['tvdb_id'], want)
+        if not series:
+            continue
+        have = (series.get('path') or '')
+        if have.rstrip('/') != want.rstrip('/'):
+            plan.append({'show_id': r['id'], 'name': r['show_name'], 'series_id': series['id'],
+                         'from': have, 'to': want})
+    return plan
+
+
+@app.route('/api/sonarr/repoint', methods=['POST'])
+def api_sonarr_repoint():
+    """Points Sonarr's series path at each show's vault folder (no files are
+    moved - moveFiles=false). Without confirm=1 it only returns what WOULD
+    change, so the page can ask first."""
+    base = request.form.get('sonarr_url', '').strip().rstrip('/')
+    api_key = request.form.get('sonarr_api_key', '').strip()
+    if not base or not api_key:
+        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
+    try:
+        plan = sonarr_repoint_plan(base, api_key)
+    except requests.RequestException as e:
+        return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
+    except ValueError:
+        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
+    if request.form.get('confirm') != '1':
+        return jsonify({"status": "success", "plan": plan})
+
+    headers = {'X-Api-Key': api_key}
+    done, failed = 0, []
+    for item in plan:
+        try:
+            full = requests.get(f"{base}/api/v3/series/{item['series_id']}", headers=headers, timeout=30)
+            full.raise_for_status()
+            body = full.json()
+            body['path'] = item['to']
+            put = requests.put(f"{base}/api/v3/series/{item['series_id']}", params={'moveFiles': 'false'},
+                               headers=headers, json=body, timeout=60)
+            put.raise_for_status()
+            with closing(get_db()) as conn:
+                log_history(conn, item['show_id'], item['name'], 'sonarr',
+                            f"Sonarr series path {item['from']} -> {item['to']} (repointed to vault, no files moved)")
+                conn.commit()
+            done += 1
+        except (requests.RequestException, ValueError) as e:
+            log.error("Sonarr repoint of '%s' failed: %s", item['name'], e)
+            failed.append(item['name'])
+    _SONARR_SERIES_CACHE['data'] = None
+    msg = f"Repointed {done} show{'s' if done != 1 else ''} in Sonarr."
+    if failed:
+        return jsonify({"status": "error", "message": msg + " Failed: " + ", ".join(failed[:5])}), 502
+    return jsonify({"status": "success", "message": msg, "done": done})
 
 
 @app.route('/api/test-sonarr', methods=['POST'])
