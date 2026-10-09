@@ -472,6 +472,7 @@ def init_db():
         'notify_on_missed_run': '1',
         'cooldown_grace_days': '7',
         'sonarr_sync_paths': '1',
+        'sonarr_target': 'plex',
         'sonarr_path_map': '',
         'digest_enabled': '0',
         'digest_hour': '8',
@@ -1352,6 +1353,19 @@ def sonarr_get_series(query_or_tvdb_id):
     }, None
 
 
+def sonarr_target_field(override=None):
+    """Which of a show's folders Sonarr should point at while it's dripping:
+    'plex_path' (what has been released - Sonarr's count only grows) or
+    'vault_path' (what is still waiting)."""
+    value = get_setting('sonarr_target', 'plex') if override is None else override
+    return 'vault_path' if value == 'vault' else 'plex_path'
+
+
+def sonarr_track_path(show):
+    """The folder Sonarr should currently be pointed at for this show row."""
+    return show[sonarr_target_field()]
+
+
 def sonarr_translate_path(path, mapping=None):
     """Unbinge and Sonarr often see the same folder under different mount
     points (Unbinge at /media/vault, Sonarr at /tv, say). The optional
@@ -1890,7 +1904,7 @@ def reconcile_show_paths():
     finally:
         conn.close()
     for r in repairs:
-        if r['field'] == 'vault_path':
+        if r['field'] == sonarr_target_field():
             sync_sonarr_path_async(None, r['show_name'], None, r['old'], r['new'])
     return repairs
 
@@ -3319,7 +3333,7 @@ def process_show_drip(conn, show):
             msg = f"'{show_name}' graduated back to {dest}"
             send_notification('graduated', f"🎉 '{show_name}' finished its full run and is back in your main library.", poster_url=show.get('poster_url'))
             conn.commit()
-            sync_sonarr_path_async(show['id'], show_name, show.get('tvdb_id'), show['vault_path'], dest)
+            sync_sonarr_path_async(show['id'], show_name, show.get('tvdb_id'), sonarr_track_path(show), dest)
             check_and_advance_queue(trigger_show_id=show['id'])
             return msg
 
@@ -4465,7 +4479,7 @@ def sonarr_match_series(all_series, show_name, tvdb_id, path):
     return None, '', 0
 
 
-def sonarr_status_report(base, api_key, mapping=None):
+def sonarr_status_report(base, api_key, mapping=None, target=None):
     """Live check: Sonarr version plus, per active show, whether Unbinge can
     find its Sonarr series and whether the folder Sonarr has matches ours.
     Raises requests.RequestException / ValueError on connection problems."""
@@ -4477,11 +4491,11 @@ def sonarr_status_report(base, api_key, mapping=None):
 
     conn = get_db()
     try:
-        rows = conn.execute(f"SELECT show_name, vault_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+        rows = conn.execute(f"SELECT show_name, {sonarr_target_field(target)} AS track_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
         shows = []
         for r in rows:
             tvdb_id = r['tvdb_id']
-            ours = sonarr_translate_path(r['vault_path'], mapping)
+            ours = sonarr_translate_path(r['track_path'], mapping)
             series, how, n = sonarr_match_series(all_series, r['show_name'], tvdb_id, ours)
             if series:
                 in_sync = (series.get('path') or '').rstrip('/') == (ours or '').rstrip('/')
@@ -4497,18 +4511,35 @@ def sonarr_status_report(base, api_key, mapping=None):
         conn.close()
     text = get_setting('sonarr_path_map', '') if mapping is None else mapping
     rules = sum(1 for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip())
-    return {'version': version, 'series_count': len(all_series), 'shows': shows, 'mapping_rules': rules}
+    diag = ''
+    try:
+        lefts = [ln.split('=', 1)[0].strip().rstrip('/') for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip()]
+        with closing(get_db()) as c2:
+            vrows = c2.execute(f"SELECT {sonarr_target_field(target)} AS vault_path FROM {TABLE_NAME} LIMIT 200").fetchall()
+        unmatched = [v['vault_path'] for v in vrows
+                     if not any(v['vault_path'] == l or v['vault_path'].startswith(l + '/') for l in lefts)]
+        if lefts and unmatched:
+            vp = unmatched[0]
+            best = max(lefts, key=lambda l: len(os.path.commonprefix([l, vp])))
+            n = len(os.path.commonprefix([best, vp]))
+            diag = (f"{len(unmatched)} of {len(vrows)} vault paths are not covered by any rule. "
+                    f"rule {best!r} vs path {vp!r}: they stop matching at character {n + 1} "
+                    f"(rule has {best[n:n + 8]!r}, path has {vp[n:n + 8]!r}).")
+    except Exception as e:
+        log.warning("Sonarr mapping diagnosis failed: %s", e)
+    return {'version': version, 'series_count': len(all_series), 'shows': shows,
+            'mapping_rules': rules, 'mapping_diag': diag}
 
 
-def sonarr_repoint_plan(base, api_key, mapping=None):
+def sonarr_repoint_plan(base, api_key, mapping=None, target=None):
     """Shows whose Sonarr series is found but points somewhere other than the
     show's vault folder. Returns a list of {name, series_id, from, to}."""
     all_series = sonarr_fetch_series(base, api_key, use_cache=False)
     plan = []
     with closing(get_db()) as conn:
-        rows = conn.execute(f"SELECT id, show_name, vault_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+        rows = conn.execute(f"SELECT id, show_name, {sonarr_target_field(target)} AS track_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
     for r in rows:
-        want = sonarr_translate_path(r['vault_path'], mapping)
+        want = sonarr_translate_path(r['track_path'], mapping)
         series, how, _n = sonarr_match_series(all_series, r['show_name'], r['tvdb_id'], want)
         if not series:
             continue
@@ -4529,7 +4560,7 @@ def api_sonarr_repoint():
     if not base or not api_key:
         return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
     try:
-        plan = sonarr_repoint_plan(base, api_key, request.form.get('sonarr_path_map'))
+        plan = sonarr_repoint_plan(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
     except requests.RequestException as e:
         return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
     except ValueError:
@@ -4550,7 +4581,7 @@ def api_sonarr_repoint():
             put.raise_for_status()
             with closing(get_db()) as conn:
                 log_history(conn, item['show_id'], item['name'], 'sonarr',
-                            f"Sonarr series path {item['from']} -> {item['to']} (repointed to vault, no files moved)")
+                            f"Sonarr series path {item['from']} -> {item['to']} (repointed to {'Plex folder' if sonarr_target_field()=='plex_path' else 'vault'}, no files moved)")
                 conn.commit()
             done += 1
         except (requests.RequestException, ValueError) as e:
@@ -4574,7 +4605,7 @@ def api_test_sonarr():
     if not base or not api_key:
         return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
     try:
-        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'))
+        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
     except requests.RequestException as e:
         log.warning("Sonarr test connection failed: %s", e)
         return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
@@ -4736,7 +4767,7 @@ def promote_show_internal(show_name, release_days_str, episodes_per_drop, target
 
     send_notification('promoted', f"➕ '{show_name}' was added to the drip schedule.")
     sync_discord_schedule_message_async()
-    sync_sonarr_path_async(new_id, show_name, None, source_dir, vault_path)
+    sync_sonarr_path_async(new_id, show_name, None, source_dir, plex_path if sonarr_target_field() == 'plex_path' else vault_path)
     return True, f"{show_name} successfully promoted!", new_id, 200
 
 
@@ -4865,6 +4896,7 @@ def settings_page():
         set_setting('sonarr_url', request.form.get('sonarr_url', '').strip())
         set_setting('sonarr_api_key', request.form.get('sonarr_api_key', '').strip())
         set_setting('sonarr_sync_paths', '1' if request.form.get('sonarr_sync_paths') == 'on' else '0')
+        set_setting('sonarr_target', 'vault' if request.form.get('sonarr_target') == 'vault' else 'plex')
         set_setting('sonarr_path_map', request.form.get('sonarr_path_map', '').strip())
         set_setting('notify_on_drip', '1' if request.form.get('notify_on_drip') == 'on' else '0')
         set_setting('notify_on_failure', '1' if request.form.get('notify_on_failure') == 'on' else '0')
@@ -4933,6 +4965,7 @@ def settings_page():
         'sonarr_api_key': get_setting('sonarr_api_key', ''),
         'sonarr_sync_paths': get_setting('sonarr_sync_paths', '1') == '1',
         'sonarr_path_map': get_setting('sonarr_path_map', ''),
+        'sonarr_target': get_setting('sonarr_target', 'plex'),
         'notify_on_drip': get_setting('notify_on_drip', '1') == '1',
         'notify_on_failure': get_setting('notify_on_failure', '1') == '1',
         'notify_on_missed_run': get_setting('notify_on_missed_run', '1') == '1',
@@ -5644,7 +5677,7 @@ def save_edit(show_id):
                 return _error_redirect('duplicate_name')
 
             before = conn.execute(
-                f"SELECT vault_path, tvdb_id FROM {TABLE_NAME} WHERE id = ?", (show_id,)
+                f"SELECT vault_path, plex_path, tvdb_id FROM {TABLE_NAME} WHERE id = ?", (show_id,)
             ).fetchone()
 
             # Only touch the finish-by date when the form actually carried
@@ -5666,8 +5699,9 @@ def save_edit(show_id):
                   current_season, current_episode, episodes_per_drop, tags_str, show_id))
             conn.commit()
         sync_discord_schedule_message_async()
-        if before and before['vault_path'] != vault_path:
-            sync_sonarr_path_async(show_id, show_name, before['tvdb_id'], before['vault_path'], vault_path)
+        _new_track = plex_path if sonarr_target_field() == 'plex_path' else vault_path
+        if before and sonarr_track_path(before) != _new_track:
+            sync_sonarr_path_async(show_id, show_name, before['tvdb_id'], sonarr_track_path(before), _new_track)
     except sqlite3.IntegrityError:
         # Belt and braces: catches a duplicate name even if it somehow slips
         # past the explicit check above (e.g. a race between two edits).
@@ -5740,7 +5774,7 @@ def delete_show(show_id):
                 )
                 check_and_advance_queue(trigger_show_id=show_id)
                 if not problems:
-                    sync_sonarr_path_async(show_id, show['show_name'], show.get('tvdb_id'), show['vault_path'], dest)
+                    sync_sonarr_path_async(show_id, show['show_name'], show.get('tvdb_id'), sonarr_track_path(show), dest)
                 # U9 - names the show and gives a real count, instead of a
                 # silent redirect that looked identical whether it worked or
                 # not.

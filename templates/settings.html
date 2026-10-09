@@ -170,6 +170,14 @@
             <label class="checkbox-row"><input type="checkbox" id="sonarr_sync_paths" name="sonarr_sync_paths" {% if settings.sonarr_sync_paths %}checked{% endif %}> <span style="font-size:12.5px; font-weight:500;">keep sonarr's series path in step when unbinge moves a show</span></label>
             <p class="hint" style="margin:4px 0 0 24px; font-size:11.5px; color:var(--text-faint); line-height:1.5;">when a show is promoted, finishes, is removed, or has its vault path edited or repaired, sonarr is told the new folder so it keeps finding the show. it only changes the path - nothing is renamed, moved or re-downloaded - and every change is recorded in history.</p>
             <div class="field" style="margin-top:0.7rem;">
+                <label for="sonarr_target">point sonarr at, while a show is dripping</label>
+                <select id="sonarr_target" name="sonarr_target">
+                    <option value="plex" {% if settings.sonarr_target != 'vault' %}selected{% endif %}>the plex folder (episodes already released)</option>
+                    <option value="vault" {% if settings.sonarr_target == 'vault' %}selected{% endif %}>the vault (episodes still waiting)</option>
+                </select>
+                <p class="hint" style="margin-top:4px;">when a show finishes or is removed, sonarr is pointed back at its pool folder.</p>
+            </div>
+            <div class="field" style="margin-top:0.7rem;">
                 <label for="sonarr_path_map">path mapping (only if sonarr sees your folders under different names)</label>
                 <textarea id="sonarr_path_map" name="sonarr_path_map" rows="2" placeholder="/media/vault=/tv/vault&#10;/media/A/TV100=/tv/pool">{{ settings.sonarr_path_map }}</textarea>
                 <p class="hint" style="margin-top:4px;">one per line: unbinge's folder = the same folder as sonarr sees it.</p>
@@ -264,7 +272,7 @@ async function sonarrRepoint(btn, holder, creds) {
         holder.replaceChildren();
         const intro = document.createElement('div');
         intro.className = 'sonarr-fix-intro';
-        intro.textContent = 'this changes where sonarr looks for ' + d.plan.length + ' show' + (d.plan.length === 1 ? '' : 's') + '. no files are moved. new episodes sonarr downloads will go to the vault folder.';
+        intro.textContent = 'this changes where sonarr looks for ' + d.plan.length + ' show' + (d.plan.length === 1 ? '' : 's') + '. no files are moved. sonarr will look in the folder shown under 'to'.';
         holder.append(intro);
         d.plan.forEach(p => {
             const row = document.createElement('div');
@@ -299,6 +307,7 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
     body.append('sonarr_url', document.getElementById('sonarr_url').value);
     body.append('sonarr_api_key', document.getElementById('sonarr_api_key').value);
     body.append('sonarr_path_map', document.getElementById('sonarr_path_map').value);
+    body.append('sonarr_target', document.getElementById('sonarr_target').value);
     btn.disabled = true; btn.textContent = 'checking…'; box.hidden = true; box.replaceChildren();
     try {
         const res = await fetch('/api/test-sonarr', { method: 'POST', body });
@@ -321,6 +330,13 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
             ? 'this unbinge build is older than the path-mapping check - update and restart the container.'
             : 'path mapping applied: ' + data.report.mapping_rules + ' rule' + (data.report.mapping_rules === 1 ? '' : 's') + ' (taken from the box above)';
         box.append(head, note);
+        if (data.report.mapping_diag) {
+            const dg = document.createElement('div');
+            dg.className = 'sonarr-paths';
+            dg.style.cssText = 'padding-left:12px; color:var(--warning);';
+            dg.textContent = data.report.mapping_diag;
+            box.append(dg);
+        }
         data.report.shows.forEach(sh => {
             const row = document.createElement('div');
             row.className = 'sonarr-row';
@@ -343,7 +359,7 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
             fix.className = 'sonarr-fix';
             const b = document.createElement('button');
             b.type = 'button'; b.className = 'btn btn-sm btn-primary';
-            b.textContent = 'repoint ' + fixable + ' to vault…';
+            b.textContent = 'repoint ' + fixable + ' in sonarr…';
             b.addEventListener('click', () => sonarrRepoint(b, fix, body));
             fix.append(b);
             box.append(fix);
