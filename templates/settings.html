@@ -287,6 +287,10 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
             det.className = 'sonarr-row-detail'; det.textContent = labels[sh.state] + ' · ' + sh.detail;
             row.append(dot, name, det);
             box.append(row);
+            const paths = document.createElement('div');
+            paths.className = 'sonarr-paths';
+            paths.textContent = 'unbinge: ' + (sh.ours || '-') + '   sonarr: ' + (sh.theirs || 'no series found');
+            box.append(paths);
         });
         box.hidden = false;
     } catch (err) {

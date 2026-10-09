@@ -1394,14 +1394,11 @@ def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
         def norm(p):
             return (p or '').rstrip('/')
 
-        matches = [s for s in all_series if norm(s.get('path')) == old_s]
-        how = 'path'
-        if not matches and tvdb_id:
-            matches = [s for s in all_series if s.get('tvdbId') == tvdb_id]
-            how = 'TVDB id'
-        if not matches:
-            matches = [s for s in all_series if (s.get('title') or '').strip().lower() == show_name.strip().lower()]
-            how = 'title'
+        matches, how = [], ''
+        for how, fn in sonarr_match_steps(show_name, tvdb_id, old_s):
+            matches = [x for x in all_series if fn(x)]
+            if matches:
+                break
         if len(matches) != 1:
             return 'skipped', (
                 f"no unambiguous Sonarr series for '{show_name}'" if not matches
@@ -4421,16 +4418,34 @@ def api_sonarr_calendar():
     })
 
 
-def sonarr_match_series(all_series, show_name, tvdb_id, path):
-    """Same matching order as the path sync (path, TVDB id, exact title), but
-    read-only. Returns (series|None, how, ambiguous_count)."""
+def _loose_title(t):
+    """Lower-case, drop a trailing (year) and all punctuation, so
+    'Doctor Who (2005)' and 'doctor who' compare equal."""
+    t = re.sub(r'\s*\(\d{4}\)\s*$', '', (t or '').strip())
+    return re.sub(r'[^a-z0-9]+', '', t.lower())
+
+
+def sonarr_match_steps(show_name, tvdb_id, path):
+    """The ordered ways to find a show's Sonarr series, most reliable first.
+    Each step is (label, predicate). Used by both the status report and the
+    path sync so they always agree."""
     def norm(p):
         return (p or '').rstrip('/')
+    folder = os.path.basename(norm(path)) or show_name
     steps = [('path', lambda x: norm(x.get('path')) == norm(path))]
     if tvdb_id:
         steps.append(('TVDB id', lambda x: x.get('tvdbId') == tvdb_id))
     steps.append(('title', lambda x: (x.get('title') or '').strip().lower() == show_name.strip().lower()))
-    for how, fn in steps:
+    steps.append(('folder name', lambda x: os.path.basename(norm(x.get('path'))).lower() == folder.lower()))
+    steps.append(('similar title', lambda x: _loose_title(x.get('title')) == _loose_title(show_name)
+                  and _loose_title(show_name) != ''))
+    return steps
+
+
+def sonarr_match_series(all_series, show_name, tvdb_id, path):
+    """Read-only version of the sync's matching. Returns
+    (series|None, how, count_at_the_first_step_that_found_anything)."""
+    for how, fn in sonarr_match_steps(show_name, tvdb_id, path):
         found = [x for x in all_series if fn(x)]
         if found:
             return (found[0] if len(found) == 1 else None), how, len(found)
@@ -4465,7 +4480,8 @@ def sonarr_status_report(base, api_key):
                 state, detail = 'ambiguous', f"{n} series match by {how}"
             else:
                 state, detail = 'none', 'not found in sonarr'
-            shows.append({'name': r['show_name'], 'state': state, 'detail': detail})
+            shows.append({'name': r['show_name'], 'state': state, 'detail': detail,
+                          'ours': ours, 'theirs': (series or {}).get('path', '')})
     finally:
         conn.close()
     return {'version': version, 'series_count': len(all_series), 'shows': shows}
