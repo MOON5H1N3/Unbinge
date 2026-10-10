@@ -1922,90 +1922,103 @@ def load_shows(sort='name'):
       'status' - Active shows first, then those in cooldown, then paused.
     Ties always fall back to show name."""
     try:
-        conn = get_db()
-        rows = conn.execute(f"SELECT * FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
-        conn.close()
-
-        shows_list = []
-        for r in rows:
-            release_days_raw = safe_get(r, 'release_days', None) or str(safe_get(r, 'release_day', '0'))
-            show_id = safe_get(r, 'id', 0)
-
-            # U3/U4 - "Episode 20 of 22 - 2 left" is far more useful than the
-            # bare "Season 01 - Episode 20" the dashboard showed before, which
-            # also displayed as the confusing "Episode 00" for any show that
-            # hadn't started yet. Cheap enough for a handful of shows; if this
-            # library grows into the hundreds, cache alongside the fix for
-            # R8 (project_schedule's per-show os.walk on every page load),
-            # since this adds a second walk of the same shape.
-            with closing(get_db()) as ep_conn:
-                dripped = get_dripped_set(ep_conn, show_id)
-                excluded = get_excluded_set(ep_conn, show_id)
-            vault_path = safe_get(r, 'vault_path', '')
-            remaining_tags = {
-                (e['season'], e['episode']) for e in remaining_episode_files(vault_path, dripped, excluded)
-            }
-            episodes_dripped = len(dripped)
-            episodes_remaining = len(remaining_tags)
-
-            shows_list.append({
-                'id': show_id,
-                # Private cache of this show's already-computed dripped/excluded
-                # sets, so a caller that also needs the schedule projection
-                # (project_schedule) doesn't have to re-run these two queries
-                # per show - see project_schedule's `shows` param. Leading
-                # underscore keeps these out of anything that treats a show
-                # dict as a clean serializable record.
-                '_dripped_set': dripped,
-                '_excluded_set': excluded,
-                'show_name': safe_get(r, 'show_name', 'Unknown'),
-                'vault_path': vault_path,
-                'plex_path': safe_get(r, 'plex_path', ''),
-                'release_day': str(safe_get(r, 'release_day', '0')),
-                'release_days': release_days_raw,
-                'release_days_display': format_release_days(release_days_raw),
-                'current_season': safe_get(r, 'current_season', 1),
-                'current_episode': safe_get(r, 'current_episode', 0),
-                'episodes_per_drop': safe_get(r, 'episodes_per_drop', 1),
-                'episodes_dripped': episodes_dripped,
-                'episodes_remaining': episodes_remaining,
-                'episodes_total': episodes_dripped + episodes_remaining,
-                'estimated_end': (
-                    None if (safe_get(r, 'paused', 0) or safe_get(r, 'completed_at', None))
-                    else estimate_end_date(
-                        episodes_remaining, safe_get(r, 'episodes_per_drop', 1), release_days_raw,
-                        ran_today=(safe_get(r, 'last_run_date', None) == today_local().isoformat()),
-                    )
-                ),
-                'poster_url': safe_get(r, 'poster_url', None),
-                'tags': parse_tags(safe_get(r, 'tags', '')),
-                'tvdb_id': safe_get(r, 'tvdb_id', None),
-                'completed_at': safe_get(r, 'completed_at', None),
-                'paused': bool(safe_get(r, 'paused', 0)),
-                'target_end_date': safe_get(r, 'target_end_date', None),
-                'plan_mode': safe_get(r, 'plan_mode', None),
-            })
-
-        if sort == 'day':
-            def day_key(s):
-                days = parse_release_days(s['release_days'])
-                return (min(days) if days else 7, s['show_name'].lower())
-            shows_list.sort(key=day_key)
-        elif sort == 'status':
-            def status_rank(s):
-                if s['paused']:
-                    return 2
-                if s['completed_at']:
-                    return 1
-                return 0
-            shows_list.sort(key=lambda s: (status_rank(s), s['show_name'].lower()))
-        # 'name' (and any unrecognized value) keeps the alphabetical order
-        # the SQL query above already produced.
-
-        return shows_list
+        # One connection for the whole page: the per-show dripped/excluded
+        # lookups below used to open (and set up) a fresh connection each.
+        ep_conn = get_db()
+        try:
+            rows = ep_conn.execute(f"SELECT * FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+            shows_list = _build_show_records(ep_conn, rows)
+        finally:
+            ep_conn.close()
+        return _sort_shows(shows_list, sort)
     except Exception as e:
         log.error("Exception while loading shows: %s", e)
         return []
+
+
+def _build_show_records(ep_conn, rows):
+    """The per-show half of load_shows: turns database rows into display
+    records, scanning each show's vault folder once."""
+    shows_list = []
+    for r in rows:
+        release_days_raw = safe_get(r, 'release_days', None) or str(safe_get(r, 'release_day', '0'))
+        show_id = safe_get(r, 'id', 0)
+
+        # U3/U4 - "Episode 20 of 22 - 2 left" is far more useful than the
+        # bare "Season 01 - Episode 20" the dashboard showed before, which
+        # also displayed as the confusing "Episode 00" for any show that
+        # hadn't started yet. The folder is scanned once here and the
+        # result is handed on to project_schedule (see '_remaining_files').
+        dripped = get_dripped_set(ep_conn, show_id)
+        excluded = get_excluded_set(ep_conn, show_id)
+        vault_path = safe_get(r, 'vault_path', '')
+        remaining_files = remaining_episode_files(vault_path, dripped, excluded)
+        remaining_tags = {(e['season'], e['episode']) for e in remaining_files}
+        episodes_dripped = len(dripped)
+        episodes_remaining = len(remaining_tags)
+
+        shows_list.append({
+            'id': show_id,
+            # Private cache of this show's already-computed dripped/excluded
+            # sets, so a caller that also needs the schedule projection
+            # (project_schedule) doesn't have to re-run these two queries
+            # per show - see project_schedule's `shows` param. Leading
+            # underscore keeps these out of anything that treats a show
+            # dict as a clean serializable record.
+            '_dripped_set': dripped,
+            '_excluded_set': excluded,
+            # The scan result for this show's vault folder, so the schedule
+            # projection doesn't walk the same directory a second time.
+            '_remaining_files': remaining_files,
+            'show_name': safe_get(r, 'show_name', 'Unknown'),
+            'vault_path': vault_path,
+            'plex_path': safe_get(r, 'plex_path', ''),
+            'release_day': str(safe_get(r, 'release_day', '0')),
+            'release_days': release_days_raw,
+            'release_days_display': format_release_days(release_days_raw),
+            'current_season': safe_get(r, 'current_season', 1),
+            'current_episode': safe_get(r, 'current_episode', 0),
+            'episodes_per_drop': safe_get(r, 'episodes_per_drop', 1),
+            'episodes_dripped': episodes_dripped,
+            'episodes_remaining': episodes_remaining,
+            'episodes_total': episodes_dripped + episodes_remaining,
+            'estimated_end': (
+                None if (safe_get(r, 'paused', 0) or safe_get(r, 'completed_at', None))
+                else estimate_end_date(
+                    episodes_remaining, safe_get(r, 'episodes_per_drop', 1), release_days_raw,
+                    ran_today=(safe_get(r, 'last_run_date', None) == today_local().isoformat()),
+                )
+            ),
+            'poster_url': safe_get(r, 'poster_url', None),
+            'tags': parse_tags(safe_get(r, 'tags', '')),
+            'tvdb_id': safe_get(r, 'tvdb_id', None),
+            'completed_at': safe_get(r, 'completed_at', None),
+            'paused': bool(safe_get(r, 'paused', 0)),
+            'target_end_date': safe_get(r, 'target_end_date', None),
+            'plan_mode': safe_get(r, 'plan_mode', None),
+        })
+
+    return shows_list
+
+
+def _sort_shows(shows_list, sort):
+    """Orders show records for display (see load_shows for the options)."""
+    if sort == 'day':
+        def day_key(s):
+            days = parse_release_days(s['release_days'])
+            return (min(days) if days else 7, s['show_name'].lower())
+        shows_list.sort(key=day_key)
+    elif sort == 'status':
+        def status_rank(s):
+            if s['paused']:
+                return 2
+            if s['completed_at']:
+                return 1
+            return 0
+        shows_list.sort(key=lambda s: (status_rank(s), s['show_name'].lower()))
+    # 'name' (and any unrecognized value) keeps the alphabetical order
+    # the SQL query above already produced.
+    return shows_list
 
 
 # ---------------------------------------------------------------------------
@@ -2021,12 +2034,15 @@ def scan_episode_files(root_dir):
         return results
 
     for dirpath, _dirs, filenames in os.walk(root_dir):
+        # relpath once per directory rather than once per file - it is the
+        # slowest call in this loop and every file in a directory shares it.
+        rel_dir = os.path.relpath(dirpath, root_dir)
         for fname in filenames:
             tags = extract_episode_tags(fname)
             if not tags:
                 continue
             abs_path = os.path.join(dirpath, fname)
-            rel_path = os.path.relpath(abs_path, root_dir)
+            rel_path = fname if rel_dir == '.' else os.path.join(rel_dir, fname)
             # One entry per tag, not per file. A double-episode file produces
             # two entries sharing the same abs_path/rel_path - group_by_file
             # (used by compute_next_batch) is what recombines them into a
@@ -2996,9 +3012,10 @@ def project_schedule(weeks_ahead=6, shows=None):
             with closing(get_db()) as conn:
                 dripped = get_dripped_set(conn, show['id'])
                 excluded = get_excluded_set(conn, show['id'])
-        seen_eps = distinct_episode_tags(
-            remaining_episode_files(show['vault_path'], dripped, excluded)
-        )
+        remaining_files = show.get('_remaining_files')
+        if remaining_files is None:
+            remaining_files = remaining_episode_files(show['vault_path'], dripped, excluded)
+        seen_eps = distinct_episode_tags(remaining_files)
 
         cursor_date = today
         idx = 0
@@ -3257,16 +3274,6 @@ def get_queue_for_show(show_id):
             f"SELECT * FROM {QUEUE_TABLE} WHERE trigger_type = 'after_show' "
             f"AND trigger_show_id = ? AND triggered_at IS NULL ORDER BY created_at",
             (show_id,)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_all_pending_queue_entries():
-    """Every not-yet-fired queue entry, for the settings/system page and
-    for cleaning up entries pointing at a since-deleted show."""
-    with closing(get_db()) as conn:
-        rows = conn.execute(
-            f"SELECT * FROM {QUEUE_TABLE} WHERE triggered_at IS NULL ORDER BY created_at"
         ).fetchall()
     return [dict(r) for r in rows]
 

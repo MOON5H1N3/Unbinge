@@ -167,7 +167,11 @@
     --shadow-color: rgba(0,0,0,0.4);
 }
 
-* { box-sizing: border-box; }
+* {
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+}
 
 html, body {
     margin: 0;
@@ -243,8 +247,12 @@ html, body {
 }
 
 .page-header {
-    display: flex; align-items: baseline; justify-content: space-between;
-    margin-bottom: 1.1rem; flex-wrap: wrap; gap: 0.5rem;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 1.1rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
 }
 .page-header h1 { font-size: 18px; font-weight: 600; margin: 0; }
 .page-header .page-sub { font-size: 12px; color: var(--text-faint); }
@@ -277,12 +285,18 @@ html, body {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 1.1rem 1.25rem;
+    padding: 1.25rem 1.4rem;
     margin-bottom: 1.1rem;
 }
 .panel h2 {
-    font-size: 13px; font-weight: 600; margin: 0 0 0.9rem;
-    display: flex; align-items: center; gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0 0 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    letter-spacing: 0.01em;
+    margin-bottom: 1rem;
 }
 .panel h2 .icon { color: var(--text-muted); }
 .panel .panel-hint { font-size: 12px; color: var(--text-faint); margin: -0.5rem 0 0.9rem; line-height: 1.5; }
@@ -291,12 +305,17 @@ html, body {
    panels out in pairs instead of one long single-width stack, matching
    the redesign concepts. Collapses to one column on narrow viewports. */
 .panel-grid {
-    display: grid;
+    display: block;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1.1rem;
     align-items: start;
+    column-count: 2;
+    column-gap: 1.1rem;
 }
-.panel-grid .panel { margin-bottom: 0; }
+.panel-grid .panel {
+    margin-bottom: 1.1rem;
+    break-inside: avoid;
+}
 @media (max-width: 860px) {
     .panel-grid { grid-template-columns: 1fr; }
 }
@@ -368,16 +387,23 @@ html, body {
    ------------------------------------------------------------------- */
 table.data-table { width: 100%; border-collapse: collapse; }
 table.data-table thead th {
-    text-align: left; font-size: 11px; font-weight: 600; color: var(--text-faint);
-    text-transform: uppercase; letter-spacing: 0.03em;
-    padding: 0 10px 8px; border-bottom: 1px solid var(--border);
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    padding: 0 10px 8px;
+    border-bottom: 1px solid var(--border);
 }
 table.data-table tbody td {
     padding: 11px 10px; border-bottom: 1px solid var(--border);
     font-size: 13px; vertical-align: middle;
 }
 table.data-table tbody tr:last-child td { border-bottom: none; }
-table.data-table tbody tr:hover { background: rgba(255,255,255,0.015); }
+table.data-table tbody tr:hover {
+    background: var(--accent-bg);
+}
 table.data-table a { color: var(--accent); text-decoration: none; }
 table.data-table a:hover { text-decoration: underline; }
 
@@ -416,7 +442,13 @@ table.data-table a:hover { text-decoration: underline; }
 }
 .btn:hover { background: var(--border-strong); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); font-weight: 600; }
+.btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-contrast);
+    font-weight: 600;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.18);
+}
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-danger { background: var(--danger-strong); border-color: var(--danger-strong); color: #FDEEEE; font-weight: 600; }
 .btn-danger:hover { background: var(--danger); border-color: var(--danger); }
@@ -457,7 +489,12 @@ table.data-table a:hover { text-decoration: underline; }
     padding: 8px 10px; border-radius: var(--radius); font-size: 13px; width: 100%;
 }
 .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
-.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 0.9rem;
+}
 .field .hint { font-size: 11.5px; color: var(--text-faint); }
 .checkbox-row { display: flex; align-items: center; gap: 8px; }
 .checkbox-row input { width: auto; }
@@ -768,10 +805,18 @@ table.data-table a:hover { text-decoration: underline; }
 .weeks-seg a:hover:not(.active) { background: var(--surface-raised); color: var(--text); }
 
 .sonarr-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 7px 4px; border-bottom: 1px solid var(--border); font-size: 12.5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 7px 12px;
+    border-bottom: 0;
+    font-size: 12.5px;
+    gap: 10px;
+    padding-bottom: 2px;
 }
-.sonarr-row:last-child { border-bottom: none; }
+.sonarr-row:last-child {
+    border-bottom: 0;
+}
 .sonarr-row .sr-date { color: var(--text-faint); min-width: 80px; font-size: 12px; }
 .sonarr-row .sr-ep { color: var(--text-faint); font-size: 11.5px; }
 
@@ -800,7 +845,15 @@ table.data-table a:hover { text-decoration: underline; }
 .pagination a:hover { color: var(--text); border-color: var(--accent); }
 .pagination .disabled { opacity: 0.35; pointer-events: none; }
 
-.empty-note { color: var(--text-faint); text-align: center; padding: 2rem 0; font-size: 13px; }
+.empty-note {
+    color: var(--text-faint);
+    text-align: center;
+    padding: 2.2rem 1rem;
+    font-size: 13px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+}
 
 /* ---------------------------------------------------------------------
    Mobile
@@ -856,8 +909,7 @@ table.data-table a:hover { text-decoration: underline; }
 /* Sonarr live-status report (settings) */
 .sonarr-report { margin-top: 0.9rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); max-height: 260px; overflow: auto; }
 .sonarr-report-head { padding: 8px 12px; font-size: 12px; font-weight: 600; color: var(--text-muted); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); }
-.sonarr-row { display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; font-size: 12.5px; border-bottom: 1px solid var(--border); }
-.sonarr-row:last-child { border-bottom: 0; }
+
 .sonarr-row-name { font-weight: 500; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sonarr-row-detail { color: var(--text-faint); font-size: 11.5px; margin-left: auto; text-align: right; }
 .sonarr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; background: var(--text-faint); }
@@ -891,25 +943,16 @@ table.data-table a:hover { text-decoration: underline; }
     transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, transform 0.14s ease;
 }
 .btn:active:not(:disabled) { transform: translateY(1px); }
-.btn-primary { box-shadow: 0 1px 0 rgba(0,0,0,0.18); }
 
 /* cards: a single quiet cue on hover, border only */
 .show-card:hover, .pool-card:hover { border-color: var(--accent-fade); }
 .show-card-poster, .pool-card-poster { box-shadow: 0 1px 3px var(--shadow-color); }
 
-/* panels and headings: a little more air, tighter heading rhythm */
-.panel { padding: 1.25rem 1.4rem; }
-.panel h2 { letter-spacing: 0.01em; }
-.page-header { margin-bottom: 1.1rem; }
+/* heading rhythm */
 .page-header h1, .mast { letter-spacing: -0.01em; }
-table.data-table thead th { font-weight: 600; letter-spacing: 0.02em; }
-table.data-table tbody tr:hover { background: var(--accent-bg); }
 
-/* selection and scrollbars match the palette */
+/* selection colour matches the palette */
 ::selection { background: var(--accent-fade); color: var(--text); }
-* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
-
-.empty-note { padding: 2.2rem 1rem; text-align: center; border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); background: var(--surface); }
 
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
@@ -919,7 +962,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .show-card-select input { width: 15px; height: 15px; cursor: pointer; opacity: 0.55; transition: opacity 0.14s ease; }
 .show-card:hover .show-card-select input, .show-card-select input:checked, .show-card-select input:focus-visible { opacity: 1; }
 .sonarr-paths { padding: 0 12px 7px 30px; font-size: 11px; color: var(--text-faint); font-family: ui-monospace, monospace; word-break: break-all; border-bottom: 1px solid var(--border); white-space: pre-wrap; }
-.sonarr-row { border-bottom: 0; padding-bottom: 2px; }
+
 .sonarr-fix { padding: 10px 12px; border-top: 1px solid var(--border); position: sticky; bottom: 0; background: var(--bg); }
 .sonarr-fix-intro { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-bottom: 8px; }
 .sonarr-fix-row { font-size: 11px; font-family: ui-monospace, monospace; color: var(--text-faint); padding: 6px 0; border-bottom: 1px solid var(--border); word-break: break-all; }
@@ -930,8 +973,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
    Settings layout: panels flow down two columns with no empty gaps,
    notes look the same wherever they sit, and spacing is even.
    ------------------------------------------------------------------- */
-.panel-grid { display: block; column-count: 2; column-gap: 1.1rem; }
-.panel-grid .panel { break-inside: avoid; margin-bottom: 1.1rem; }
+
 @media (max-width: 860px) { .panel-grid { column-count: 1; } }
 
 .hint { font-size: 11.5px; color: var(--text-faint); line-height: 1.5; }
@@ -939,9 +981,8 @@ p.hint { margin: 0 0 0.9rem; }
 .field > .hint, .field > p.hint { margin: 0; }
 .field.hint { margin-top: 0; }
 
-.panel h2 { margin-bottom: 1rem; }
 .panel .field:last-child { margin-bottom: 0; }
 .field-row .field { margin-bottom: 0; }
-.field-row { margin-bottom: 0.9rem; }
+
 form > .btn, form > button.btn { margin-top: 0.4rem; margin-bottom: 1.5rem; }
 .save-row { display: flex; gap: 8px; align-items: center; margin: 0.4rem 0 2rem; }
