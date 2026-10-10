@@ -986,3 +986,32 @@ p.hint { margin: 0 0 0.9rem; }
 
 form > .btn, form > button.btn { margin-top: 0.4rem; margin-bottom: 1.5rem; }
 .save-row { display: flex; gap: 8px; align-items: center; margin: 0.4rem 0 2rem; }
+
+/* Phone pass: comfortable tap targets and header spacing on narrow screens. */
+@media (max-width: 860px) {
+    .btn-icon { min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+    .row-select-cb, #selectAllCb { width: 20px; height: 20px; }
+    .btn-sm, .history-toolbar input, .history-toolbar select { min-height: 38px; }
+    .history-toolbar { flex-wrap: wrap; }
+    .history-toolbar input[type="text"] { flex: 1 1 140px; min-width: 0; }
+    .page-header { margin-top: 0.5rem; }
+}
+
+/* Settings: tabbed sections, one column, sticky save bar. */
+.set-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: 0 0 1.2rem; overflow-x: auto; scrollbar-width: none; }
+.set-tabs::-webkit-scrollbar { display: none; }
+.set-tab {
+    background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    padding: 9px 14px; font: inherit; font-size: 13px; color: var(--text-muted);
+    cursor: pointer; white-space: nowrap;
+}
+.set-tab:hover { color: var(--text); }
+.set-tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.set-section { max-width: 760px; }
+.set-section[hidden] { display: none; }
+.set-section .panel { margin-bottom: 1.1rem; }
+.save-sticky {
+    position: sticky; bottom: 0; z-index: 20; max-width: 760px; margin: 0.6rem 0 1rem;
+    padding: 10px 0; background: var(--bg); border-top: 1px solid var(--border);
+}
+@media (max-width: 860px) { .set-tab { padding: 11px 12px; } }

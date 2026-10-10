@@ -10,7 +10,13 @@
 <form method="POST">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-    <div class="panel-grid">
+    <nav class="set-tabs" role="tablist" aria-label="settings sections">
+        <button type="button" role="tab" class="set-tab" data-tab="general">general</button>
+        <button type="button" role="tab" class="set-tab" data-tab="notifications">notifications</button>
+        <button type="button" role="tab" class="set-tab" data-tab="integrations">integrations</button>
+        <button type="button" role="tab" class="set-tab" data-tab="data">backup &amp; maintenance</button>
+    </nav>
+    <section class="set-section" data-section="general">
     <div class="panel">
         <h2>{{ icon('server', 14) }}scheduler status</h2>
         <div style="display:flex; flex-direction:column; gap:0;">
@@ -65,35 +71,8 @@
             <label><input type="radio" name="theme_preference" value="light" {% if settings.theme_preference == 'light' %}checked{% endif %}> light</label>
         </div>
     </div>
-
-    <div class="panel">
-        <h2>{{ icon('server', 14) }}database backup</h2>
-        <p class="panel-hint">dripped_episodes, drip_moves (for undo), job history, and every show's configuration all live in one file - cheap insurance, especially right before a schema migration on upgrade.</p>
-
-        <div class="checkbox-row">
-            <input type="checkbox" id="auto_backup_enabled" name="auto_backup_enabled" {% if settings.auto_backup_enabled %}checked{% endif %}>
-            <label for="auto_backup_enabled" style="font-size:12.5px; cursor:pointer;">back up automatically once a day</label>
-        </div>
-        <div class="field" style="margin-top:0.7rem;">
-            <label for="backup_retention_count">keep the last</label>
-            <input type="number" id="backup_retention_count" name="backup_retention_count" value="{{ settings.backup_retention_count }}" min="1" max="90" style="max-width:100px;">
-            <span class="hint">older automatic backups beyond this count are deleted.</span>
-        </div>
-        {% if settings.last_auto_backup %}
-        <p class="hint">last automatic backup: {{ settings.last_auto_backup.replace('T', ' ')[:19] }}</p>
-        {% endif %}
-
-        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:0.7rem;">
-            <button type="button" class="btn btn-sm" id="run-backup-now-btn">{{ icon('server', 13) }}back up now</button>
-            <a href="/api/backup-db" class="btn btn-sm">{{ icon('download', 13) }}download a one-off copy</a>
-        </div>
-
-        <div id="backupsList" style="margin-top:1rem; padding-top:0.8rem; border-top:1px solid var(--border);">
-            <p class="cell-faint" style="font-size:12px;">loading backups…</p>
-        </div>
-    </div>
-    </div>
-
+    </section>
+    <section class="set-section" data-section="notifications">
     <div class="panel">
         <h2>notifications</h2>
         <div class="field">
@@ -135,24 +114,8 @@
             </div>
         </div>
     </div>
-
-    <div class="panel-grid">
-    <div class="panel">
-        <h2>{{ icon('image', 14) }}show artwork (tvdb)</h2>
-        <p class="panel-hint">used to fetch posters and season/episode counts when linking a show. get a key at
-            <a href="https://thetvdb.com/dashboard/account/apikeys" target="_blank" style="color:var(--accent);">thetvdb.com/dashboard/account/apikeys</a>
-            (choose "end-user subscriptions" for a personal key).</p>
-        <div class="field">
-            <label for="tvdb_api_key">tvdb api key</label>
-            <input type="text" id="tvdb_api_key" name="tvdb_api_key" value="{{ settings.tvdb_api_key }}" placeholder="your tvdb v4 project api key">
-        </div>
-        <div class="field">
-            <label for="tvdb_pin">subscriber pin <span class="hint" style="display:inline;">(only if end-user subscriptions)</span></label>
-            <input type="text" id="tvdb_pin" name="tvdb_pin" value="{{ settings.tvdb_pin }}" placeholder="optional">
-        </div>
-        <button type="button" class="btn btn-sm" id="test-tvdb-btn">test connection</button>
-    </div>
-
+    </section>
+    <section class="set-section" data-section="integrations">
     <div class="panel">
         <h2>{{ icon('server', 14) }}sonarr <span class="cell-faint" style="font-weight:400;">(optional)</span></h2>
         <p class="panel-hint">cross-checks season/episode counts against your sonarr library, and powers the calendar's upcoming-episodes panel.</p>
@@ -188,6 +151,22 @@
     </div>
 
     <div class="panel">
+        <h2>{{ icon('image', 14) }}show artwork (tvdb)</h2>
+        <p class="panel-hint">used to fetch posters and season/episode counts when linking a show. get a key at
+            <a href="https://thetvdb.com/dashboard/account/apikeys" target="_blank" style="color:var(--accent);">thetvdb.com/dashboard/account/apikeys</a>
+            (choose "end-user subscriptions" for a personal key).</p>
+        <div class="field">
+            <label for="tvdb_api_key">tvdb api key</label>
+            <input type="text" id="tvdb_api_key" name="tvdb_api_key" value="{{ settings.tvdb_api_key }}" placeholder="your tvdb v4 project api key">
+        </div>
+        <div class="field">
+            <label for="tvdb_pin">subscriber pin <span class="hint" style="display:inline;">(only if end-user subscriptions)</span></label>
+            <input type="text" id="tvdb_pin" name="tvdb_pin" value="{{ settings.tvdb_pin }}" placeholder="optional">
+        </div>
+        <button type="button" class="btn btn-sm" id="test-tvdb-btn">test connection</button>
+    </div>
+
+    <div class="panel">
         <h2>{{ icon('calendar', 14) }}calendar feed</h2>
         <p class="panel-hint">subscribe in google/apple/outlook calendar to see your drip schedule (and sonarr's upcoming air dates, if configured) update automatically.</p>
         <div class="field">
@@ -210,6 +189,34 @@
             <a href="/calendar-download" class="btn btn-sm">{{ icon('download', 13) }}download calendar file (.ics)</a>
         </div>
     </div>
+    </section>
+    <section class="set-section" data-section="data">
+    <div class="panel">
+        <h2>{{ icon('server', 14) }}database backup</h2>
+        <p class="panel-hint">dripped_episodes, drip_moves (for undo), job history, and every show's configuration all live in one file - cheap insurance, especially right before a schema migration on upgrade.</p>
+
+        <div class="checkbox-row">
+            <input type="checkbox" id="auto_backup_enabled" name="auto_backup_enabled" {% if settings.auto_backup_enabled %}checked{% endif %}>
+            <label for="auto_backup_enabled" style="font-size:12.5px; cursor:pointer;">back up automatically once a day</label>
+        </div>
+        <div class="field" style="margin-top:0.7rem;">
+            <label for="backup_retention_count">keep the last</label>
+            <input type="number" id="backup_retention_count" name="backup_retention_count" value="{{ settings.backup_retention_count }}" min="1" max="90" style="max-width:100px;">
+            <span class="hint">older automatic backups beyond this count are deleted.</span>
+        </div>
+        {% if settings.last_auto_backup %}
+        <p class="hint">last automatic backup: {{ settings.last_auto_backup.replace('T', ' ')[:19] }}</p>
+        {% endif %}
+
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:0.7rem;">
+            <button type="button" class="btn btn-sm" id="run-backup-now-btn">{{ icon('server', 13) }}back up now</button>
+            <a href="/api/backup-db" class="btn btn-sm">{{ icon('download', 13) }}download a one-off copy</a>
+        </div>
+
+        <div id="backupsList" style="margin-top:1rem; padding-top:0.8rem; border-top:1px solid var(--border);">
+            <p class="cell-faint" style="font-size:12px;">loading backups…</p>
+        </div>
+    </div>
 
     <div class="panel">
         <h2>maintenance</h2>
@@ -219,9 +226,9 @@
             <button type="button" class="btn btn-sm" id="run-drip-btn">{{ icon('refresh', 13) }}run drip check now</button>
         </div>
     </div>
-    </div>
+    </section>
 
-    <div class="save-row">
+    <div class="save-row save-sticky">
         <button type="submit" class="btn btn-primary">save settings</button>
         <button type="button" class="btn" id="discord-sync-btn">sync discord now</button>
     </div>
@@ -229,6 +236,26 @@
 {% endblock %}
 
 {% block extra_scripts %}
+
+<script>
+(function () {
+    const tabs = document.querySelectorAll('.set-tab');
+    const sections = document.querySelectorAll('.set-section');
+    function show(name) {
+        if (![...sections].some(s => s.dataset.section === name)) name = 'general';
+        sections.forEach(s => { s.hidden = s.dataset.section !== name; });
+        tabs.forEach(t => {
+            const on = t.dataset.tab === name;
+            t.classList.toggle('active', on);
+            t.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        try { history.replaceState(null, '', '#' + name); } catch (e) {}
+    }
+    tabs.forEach(t => t.addEventListener('click', () => show(t.dataset.tab)));
+    window.addEventListener('hashchange', () => show((location.hash || '').slice(1)));
+    show((location.hash || '').slice(1));
+})();
+</script>
 <script>
 async function unbingeRunAction(button, url, successMsg, body) {
     const original = button.innerHTML;

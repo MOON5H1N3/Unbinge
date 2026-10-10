@@ -34,5 +34,27 @@
     {% endfor %}
 </div>
 
+{% if sonarr %}
+<div class="panel" style="margin-top:14px;">
+    <h2>{{ icon("server", 14) }}sonarr</h2>
+    {% if sonarr.error %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-error"></span>Connection</div>
+        <div class="check-detail">{{ sonarr.error }}</div></div>
+    {% else %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-ok"></span>Connected</div>
+        <div class="check-detail">v{{ sonarr.version }} · {{ sonarr.series_count }} series</div></div>
+    <div class="check-row"><div class="check-label"><span class="check-dot check-{{ 'ok' if not sonarr.counts['path-differs'] else 'warn' }}"></span>Paths in sync</div>
+        <div class="check-detail">{{ sonarr.counts.ok }} in sync{% if sonarr.counts['path-differs'] %} · {{ sonarr.counts['path-differs'] }} differ{% endif %}</div></div>
+    {% if sonarr.counts.none or sonarr.counts.ambiguous %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-warn"></span>Not matched</div>
+        <div class="check-detail">{{ sonarr.counts.none }} not found{% if sonarr.counts.ambiguous %} · {{ sonarr.counts.ambiguous }} ambiguous{% endif %}</div></div>
+    {% endif %}
+    {% endif %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-{{ 'ok' if sonarr.last_sync else 'warn' }}"></span>Last path sync</div>
+        <div class="check-detail">{% if sonarr.last_sync %}{{ sonarr.last_sync.show_name }} · {{ sonarr.last_sync.occurred_at[:16].replace('T',' ') }}{% else %}none yet{% endif %}</div></div>
+    <p class="cell-faint" style="font-size:11.5px;margin:8px 4px 0;">details and fixes: settings → sonarr → test connection</p>
+</div>
+{% endif %}
+
 <p class="cell-faint" style="font-size:11.5px;">version {{ app_version }} · checks refresh on page load</p>
 {% endblock %}

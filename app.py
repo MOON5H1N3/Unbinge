@@ -518,7 +518,7 @@ def log_history(conn, show_id, show_name, action, detail=''):
     return cursor.lastrowid
 
 
-def load_history(limit=100, offset=0, show_name=None, action=None):
+def load_history(limit=100, offset=0, show_name=None, action=None, text=None):
     """U25 - previously hardcoded to the latest 200 rows with no way to
     filter or page through older entries. Filtering by show reuses the same
     text the dashboard's filter box already accepts, for consistency."""
@@ -530,6 +530,9 @@ def load_history(limit=100, offset=0, show_name=None, action=None):
     if action:
         where.append("action = ?")
         params.append(action)
+    if text:
+        where.append("(detail LIKE ? OR show_name LIKE ?)")
+        params.extend([f"%{text}%", f"%{text}%"])
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     total = conn.execute(
@@ -3974,12 +3977,41 @@ def gather_system_checks():
     return checks
 
 
+def sonarr_health_summary():
+    """Read-only Sonarr card for the System page: version, how many shows are
+    in sync / differ / not found, and the last path-sync result. Uses the
+    cached series list so a visit never triggers a slow 460-series fetch twice.
+    Returns None when Sonarr isn't configured."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    key = get_setting('sonarr_api_key', '').strip()
+    if not base or not key:
+        return None
+    out = {'error': None, 'version': '', 'series_count': 0,
+           'counts': {'ok': 0, 'path-differs': 0, 'ambiguous': 0, 'none': 0}, 'last_sync': None}
+    try:
+        rep = sonarr_status_report(base, key, use_cache=True)
+        out['version'], out['series_count'] = rep['version'], rep['series_count']
+        for sh in rep['shows']:
+            out['counts'][sh['state']] = out['counts'].get(sh['state'], 0) + 1
+    except Exception as e:
+        out['error'] = str(e)
+    try:
+        with closing(get_db()) as conn:
+            r = conn.execute(f"SELECT show_name, detail, occurred_at FROM {HISTORY_TABLE} WHERE action='sonarr' ORDER BY occurred_at DESC LIMIT 1").fetchone()
+        if r:
+            out['last_sync'] = dict(r)
+    except Exception:
+        pass
+    return out
+
+
 @app.route('/system')
 def system_page():
     checks = gather_system_checks()
     overall = 'error' if any(c['status'] == 'error' for c in checks) else \
               ('warn' if any(c['status'] == 'warn' for c in checks) else 'ok')
-    return render_template('system.html', checks=checks, overall=overall, app_version=APP_VERSION)
+    return render_template('system.html', checks=checks, overall=overall, app_version=APP_VERSION,
+                           sonarr=sonarr_health_summary())
 
 
 # gather_system_checks() makes a live Sonarr request (and a TVDB token
@@ -4486,7 +4518,7 @@ def sonarr_match_series(all_series, show_name, tvdb_id, path):
     return None, '', 0
 
 
-def sonarr_status_report(base, api_key, mapping=None, target=None):
+def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=False):
     """Live check: Sonarr version plus, per active show, whether Unbinge can
     find its Sonarr series and whether the folder Sonarr has matches ours.
     Raises requests.RequestException / ValueError on connection problems."""
@@ -4494,7 +4526,7 @@ def sonarr_status_report(base, api_key, mapping=None, target=None):
     st = requests.get(f'{base}/api/v3/system/status', headers=headers, timeout=15)
     st.raise_for_status()
     version = (st.json() or {}).get('version', '?')
-    all_series = sonarr_fetch_series(base, api_key, use_cache=False)
+    all_series = sonarr_fetch_series(base, api_key, use_cache=use_cache)
 
     conn = get_db()
     try:
@@ -4846,6 +4878,7 @@ def history_page():
     PAGE_SIZE = 50
     show_filter = request.args.get('show', '').strip() or None
     action_filter = request.args.get('action', '').strip() or None
+    text_filter = request.args.get('q', '').strip() or None
     try:
         page = max(1, int(request.args.get('page', 1)))
     except (TypeError, ValueError):
@@ -4853,7 +4886,7 @@ def history_page():
 
     events, total = load_history(
         limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE,
-        show_name=show_filter, action=action_filter,
+        show_name=show_filter, action=action_filter, text=text_filter,
     )
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
@@ -4868,7 +4901,8 @@ def history_page():
 
     return render_template(
         'history.html', events=events, total=total, page=page, total_pages=total_pages,
-        show_filter=show_filter or '', action_filter=action_filter or '', all_actions=all_actions,
+        show_filter=show_filter or '', action_filter=action_filter or '', text_filter=text_filter or '',
+        all_actions=all_actions,
     )
 
 
