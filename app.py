@@ -1,22 +1,35 @@
+import json
+import logging
 import os
 import re
-import json
-import time
+import secrets
 import shutil
 import sqlite3
-import secrets
-import logging
+import tempfile
 import threading
+import time
 from contextlib import closing
 from datetime import datetime, date, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
-import tempfile
-from flask import Flask, render_template, request, jsonify, redirect, url_for, send_from_directory, send_file, session
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, render_template, request, jsonify, redirect, url_for, send_from_directory, send_file, session
 
 app = Flask(__name__)
+
+# Static files are fingerprinted by modification time (?v=...), so a browser can
+# keep them for a year and still pick up a new build the moment a file changes.
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 31536000
+
+
+@app.url_defaults
+def _fingerprint_static(endpoint, values):
+    if endpoint == 'static' and 'v' not in values and values.get('filename'):
+        try:
+            values['v'] = int(os.path.getmtime(os.path.join(app.static_folder, values['filename'])))
+        except OSError:
+            pass
 
 
 @app.context_processor
@@ -47,7 +60,7 @@ def inject_shared_template_context():
 
 
 # ---------------------------------------------------------------------------
-# Auth (S3) and CSRF (S2)
+# Auth and CSRF
 #
 # Single shared password, opt-in via the UNBINGE_PASSWORD environment
 # variable. If it's unset, auth is fully disabled and the app behaves
@@ -258,7 +271,7 @@ def now_local():
 def today_local():
     return now_local().date()
 
-# H3 - this dict used to carry every key twice ("0" alongside 0) as a
+# This dict used to carry every key twice ("0" alongside 0) as a
 # workaround for template code that might index it with either type. Turns
 # out neither index.html nor edit.html - the only two templates it was ever
 # passed to - reference it at all; both hardcode their own day-name tuples
@@ -266,7 +279,7 @@ def today_local():
 # solving a problem for a variable nothing reads. Removed outright.
 
 # Matches "S01E02", "s1e2", etc. anywhere in a filename.
-# C7: three formats supported. Each returns every (season, episode) tag a
+# Three formats supported. Each returns every (season, episode) tag a
 # filename covers - a plain "S01E01" covers one; "S01E01E02" or "S01E01-E02"
 # cover two; "1x02" and "1x02x03" are the x-format equivalents.
 #
@@ -430,7 +443,7 @@ def init_db():
         f"CREATE INDEX IF NOT EXISTS idx_history_show_id ON {HISTORY_TABLE}(show_id);"
     )
 
-    # C1: the authoritative record of what has actually been dripped.
+    # The authoritative record of what has actually been dripped.
     # Replaces the single (current_season, current_episode) pointer, which
     # could only express "everything up to here" and so made any episode
     # arriving below that point permanently invisible.
@@ -518,8 +531,8 @@ def log_history(conn, show_id, show_name, action, detail=''):
     return cursor.lastrowid
 
 
-def load_history(limit=100, offset=0, show_name=None, action=None, text=None):
-    """U25 - previously hardcoded to the latest 200 rows with no way to
+def load_history(limit=100, offset=0, show_name=None, action=None, text=None, days=None):
+    """Previously hardcoded to the latest 200 rows with no way to
     filter or page through older entries. Filtering by show reuses the same
     text the dashboard's filter box already accepts, for consistency."""
     conn = get_db()
@@ -530,6 +543,9 @@ def load_history(limit=100, offset=0, show_name=None, action=None, text=None):
     if action:
         where.append("action = ?")
         params.append(action)
+    if days:
+        where.append("occurred_at >= ?")
+        params.append((now_local() - timedelta(days=days)).isoformat())
     if text:
         where.append("(detail LIKE ? OR show_name LIKE ?)")
         params.extend([f"%{text}%", f"%{text}%"])
@@ -1223,263 +1239,6 @@ def get_recommendations_for_show(show_id):
         }
 
 
-def sonarr_get_calendar(days_ahead=14):
-    """Fetches upcoming episode air dates across the user's WHOLE Sonarr
-    library (every monitored show, not just ones synced into Unbinge).
-
-    This is a genuinely different thing from Unbinge's own schedule: Unbinge
-    projects when files ALREADY ON DISK will drip into Plex on a schedule
-    you set; this reports when episodes are actually airing/being released
-    according to Sonarr, which may not be downloaded yet at all.
-
-    Returns (events: list[dict], error: str|None). Each event dict has
-    'show_name', 'season', 'episode', 'episode_title', 'air_date' (date),
-    'air_datetime' (the raw ISO string from Sonarr, or None), 'has_file'.
-
-    Never executed against a live Sonarr instance - written from Sonarr's
-    documented v3 API shape, same caveat as sonarr_get_series."""
-    base = get_setting('sonarr_url', '').strip().rstrip('/')
-    api_key = get_setting('sonarr_api_key', '').strip()
-    if not base or not api_key:
-        return [], "Sonarr isn't configured - add a URL and API key in Settings to enable this."
-
-    start = today_local()
-    end = start + timedelta(days=max(1, days_ahead))
-
-    try:
-        resp = requests.get(
-            f'{base}/api/v3/calendar',
-            params={
-                'start': start.isoformat(),
-                'end': end.isoformat(),
-                'includeSeries': 'true',
-            },
-            headers={'X-Api-Key': api_key},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        raw_episodes = resp.json()
-    except requests.RequestException as e:
-        log.error("Sonarr calendar fetch failed: %s", e)
-        return [], f"Could not reach Sonarr: {e}"
-    except ValueError:
-        return [], "Sonarr returned an unexpected response - see logs."
-
-    events = []
-    for ep in raw_episodes:
-        air_dt_str = ep.get('airDateUtc') or ep.get('airDate')
-        if not air_dt_str:
-            continue
-        try:
-            # airDateUtc is a full ISO datetime; airDate (fallback) is a bare
-            # date. Both parse fine via fromisoformat once 'Z' is normalised.
-            air_dt = datetime.fromisoformat(air_dt_str.replace('Z', '+00:00'))
-            air_date = air_dt.astimezone(LOCAL_TZ).date() if air_dt.tzinfo else air_dt.date()
-        except ValueError:
-            continue
-
-        series = ep.get('series') or {}
-        events.append({
-            'show_name': series.get('title', 'Unknown Show'),
-            'season': ep.get('seasonNumber', 0),
-            'episode': ep.get('episodeNumber', 0),
-            'episode_title': ep.get('title') or '',
-            'air_date': air_date,
-            'air_datetime': air_dt_str,
-            'has_file': bool(ep.get('hasFile')),
-        })
-
-    events.sort(key=lambda e: (e['air_date'], e['show_name']))
-    return events, None
-
-
-_SONARR_SERIES_CACHE = {'key': None, 'at': 0.0, 'data': None}
-
-
-def sonarr_fetch_series(base, api_key, use_cache=True):
-    """Whole-library series list from Sonarr. Large libraries on slow hardware
-    can take well over 20 seconds to answer, so this waits up to 90 s, and
-    reuses the last answer for 60 s so a burst of checks doesn't repeat the
-    slow call. Raises requests.RequestException / ValueError."""
-    key = (base, api_key)
-    c = _SONARR_SERIES_CACHE
-    if use_cache and c['key'] == key and c['data'] is not None and time.time() - c['at'] < 60:
-        return c['data']
-    resp = requests.get(f'{base}/api/v3/series', headers={'X-Api-Key': api_key}, timeout=(10, 90))
-    resp.raise_for_status()
-    data = resp.json()
-    c.update(key=key, at=time.time(), data=data)
-    return data
-
-
-def sonarr_get_series(query_or_tvdb_id):
-    """Optional enrichment - looks up a series in the user's own Sonarr
-    instance, by TVDB id if given (more reliable) or by title match.
-    Returns (details: dict|None, error: str|None). No-ops cleanly with a
-    clear message if Sonarr isn't configured, since this is meant to be
-    fully optional on top of the TVDB-based flow above.
-
-    Also never executed against a live Sonarr instance - written from
-    Sonarr's documented v3 API shape."""
-    base = get_setting('sonarr_url', '').strip().rstrip('/')
-    api_key = get_setting('sonarr_api_key', '').strip()
-    if not base or not api_key:
-        return None, "Sonarr isn't configured (optional) - add a URL and API key in Settings to enable it."
-
-    try:
-        all_series = sonarr_fetch_series(base, api_key)
-    except requests.RequestException as e:
-        log.error("Sonarr lookup failed: %s", e)
-        return None, f"Could not reach Sonarr: {e}"
-    except ValueError:
-        return None, "Sonarr returned an unexpected response - see logs."
-
-    match = None
-    if isinstance(query_or_tvdb_id, int):
-        match = next((s for s in all_series if s.get('tvdbId') == query_or_tvdb_id), None)
-    else:
-        q = str(query_or_tvdb_id).strip().lower()
-        match = next((s for s in all_series if s.get('title', '').strip().lower() == q), None)
-
-    if not match:
-        return None, "No matching show found in Sonarr."
-
-    season_counts = {
-        s['seasonNumber']: s.get('statistics', {}).get('totalEpisodeCount', 0)
-        for s in match.get('seasons', [])
-        if s.get('seasonNumber', 0) > 0
-    }
-    return {
-        'sonarr_id': match.get('id'),
-        'title': match.get('title'),
-        'season_episode_counts': season_counts,
-    }, None
-
-
-def sonarr_target_field(override=None):
-    """Which of a show's folders Sonarr should point at while it's dripping:
-    'plex_path' (what has been released - Sonarr's count only grows) or
-    'vault_path' (what is still waiting)."""
-    value = get_setting('sonarr_target', 'plex') if override is None else override
-    return 'vault_path' if value == 'vault' else 'plex_path'
-
-
-def sonarr_track_path(show):
-    """The folder Sonarr should currently be pointed at for this show row."""
-    return show[sonarr_target_field()]
-
-
-def sonarr_translate_path(path, mapping=None):
-    """Unbinge and Sonarr often see the same folder under different mount
-    points (Unbinge at /media/vault, Sonarr at /tv, say). The optional
-    sonarr_path_map setting - one 'unbinge_prefix=sonarr_prefix' per line -
-    translates a path into Sonarr's view of it, longest matching prefix
-    first. With no map, paths pass through unchanged."""
-    path = (path or '').rstrip('/')
-    pairs = []
-    text = get_setting('sonarr_path_map', '') if mapping is None else mapping
-    for line in text.splitlines():
-        if '=' not in line:
-            continue
-        ours, theirs = (part.strip().rstrip('/') for part in line.split('=', 1))
-        if ours:
-            pairs.append((ours, theirs))
-    for ours, theirs in sorted(pairs, key=lambda p: -len(p[0])):
-        if path == ours or path.startswith(ours + '/'):
-            return theirs + path[len(ours):]
-    return path
-
-
-def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
-    """Points the show's Sonarr series at new_path, WITHOUT moving, renaming
-    or re-downloading anything (moveFiles=false: Unbinge has already moved the
-    folder itself, Sonarr just needs to know where it went).
-
-    Finds the series by its current path in Sonarr first (the most reliable
-    link, since Unbinge is what moved it), then by TVDB id, then by exact
-    title - the last two only when they identify exactly one series, so an
-    ambiguous match is skipped rather than guessed at.
-
-    Returns (status, detail) with status one of 'updated', 'unchanged',
-    'skipped' (not configured / sync off / no unambiguous match) or 'error'.
-    Never raises - a Sonarr problem must not interrupt a promote or delete.
-    Written from Sonarr's documented v3 API and never run against a live
-    instance."""
-    base = get_setting('sonarr_url', '').strip().rstrip('/')
-    api_key = get_setting('sonarr_api_key', '').strip()
-    if not base or not api_key:
-        return 'skipped', 'Sonarr is not configured'
-    if get_setting('sonarr_sync_paths', '1') != '1':
-        return 'skipped', 'Sonarr path sync is switched off'
-
-    old_s, new_s = sonarr_translate_path(old_path), sonarr_translate_path(new_path)
-    if old_s == new_s:
-        return 'unchanged', 'path is the same from Sonarr\'s point of view'
-
-    headers = {'X-Api-Key': api_key}
-    try:
-        all_series = sonarr_fetch_series(base, api_key)
-
-        def norm(p):
-            return (p or '').rstrip('/')
-
-        matches, how = [], ''
-        for how, fn in sonarr_match_steps(show_name, tvdb_id, old_s):
-            matches = [x for x in all_series if fn(x)]
-            if matches:
-                break
-        if len(matches) != 1:
-            return 'skipped', (
-                f"no unambiguous Sonarr series for '{show_name}'" if not matches
-                else f"{len(matches)} Sonarr series matched '{show_name}' by {how} - left alone"
-            )
-
-        series = matches[0]
-        if norm(series.get('path')) == new_s:
-            return 'unchanged', 'Sonarr already has this path'
-
-        full = requests.get(f"{base}/api/v3/series/{series['id']}", headers=headers, timeout=15)
-        full.raise_for_status()
-        body = full.json()
-        previous = body.get('path')
-        body['path'] = new_s
-        put = requests.put(
-            f"{base}/api/v3/series/{series['id']}", params={'moveFiles': 'false'},
-            headers=headers, json=body, timeout=30,
-        )
-        put.raise_for_status()
-        _SONARR_SERIES_CACHE['data'] = None
-        return 'updated', f"Sonarr series path {previous} -> {new_s} (matched by {how}, no files moved)"
-    except requests.RequestException as e:
-        log.error("Sonarr path sync for '%s' failed: %s", show_name, e)
-        return 'error', f"Sonarr path update failed: {e}"
-    except (ValueError, KeyError) as e:
-        log.error("Sonarr path sync for '%s' got an unexpected response: %s", show_name, e)
-        return 'error', "Sonarr returned an unexpected response - see logs"
-
-
-def sync_sonarr_path_async(show_id, show_name, tvdb_id, old_path, new_path):
-    """Fire-and-forget Sonarr path update for use inside request handlers and
-    the drip job, so a slow Sonarr can't stall them. A successful update or a
-    failure is written to history (so you can see Unbinge touched Sonarr);
-    'skipped' and 'unchanged' just go to the log."""
-    if not old_path or not new_path or old_path == new_path:
-        return
-
-    def _run():
-        status, detail = sonarr_set_series_path(show_name, tvdb_id, old_path, new_path)
-        log.info("Sonarr path sync for '%s': %s - %s", show_name, status, detail)
-        if status in ('updated', 'error'):
-            try:
-                with closing(get_db()) as conn:
-                    log_history(conn, show_id, show_name, 'sonarr' if status == 'updated' else 'failed', detail)
-                    conn.commit()
-            except Exception as e:
-                log.error("Could not record Sonarr sync in history: %s", e)
-
-    threading.Thread(target=_run, daemon=True).start()
-
-
 def parse_discord_webhook(url):
     """Extracts (webhook_id, webhook_token) from a Discord webhook URL, or
     None if the URL isn't a recognizable Discord webhook. Needed because
@@ -1840,15 +1599,15 @@ def estimate_end_date(remaining_episodes, episodes_per_drop, release_days_raw, r
 def safe_get(row, key, default=None):
     """Coalesces a NULL column value to a default.
 
-    H4 - this used to also guard against KeyError/IndexError for a column
+    This used to also guard against KeyError/IndexError for a column
     that might not exist on the row at all, back when the schema was
-    patched together with ad-hoc ALTER TABLE checks. Now that H5/H6 give
+    patched together with ad-hoc ALTER TABLE checks. Now that migrations give
     every row a complete, migration-guaranteed set of columns (every call
     site here queries with SELECT *), that guard can never actually fire -
     the column is always present. What's left, and still genuinely useful,
     is defaulting a column that's NULL because it was added via ALTER TABLE
     to a database that already had rows, and nothing ever backfilled it
-    (poster_url and tvdb_id on shows added before F3, for example)."""
+    (poster_url and tvdb_id on shows added before TVDB linking existed, for example)."""
     val = row[key]
     return val if val is not None else default
 
@@ -1947,7 +1706,7 @@ def _build_show_records(ep_conn, rows):
         release_days_raw = safe_get(r, 'release_days', None) or str(safe_get(r, 'release_day', '0'))
         show_id = safe_get(r, 'id', 0)
 
-        # U3/U4 - "Episode 20 of 22 - 2 left" is far more useful than the
+        # "Episode 20 of 22 - 2 left" is far more useful than the
         # bare "Season 01 - Episode 20" the dashboard showed before, which
         # also displayed as the confusing "Episode 00" for any show that
         # hadn't started yet. The folder is scanned once here and the
@@ -2301,7 +2060,7 @@ def _migrate_v2_seed_dripped_episodes(conn):
 
 
 def _migrate_v3_unique_show_name(conn):
-    """C10 - enforces uniqueness on show_name at the database level.
+    """Enforces uniqueness on show_name at the database level.
 
     promote() already checked for an existing name before inserting, but
     save_edit() didn't, so a rename could still produce a duplicate. Two
@@ -2331,7 +2090,7 @@ def _migrate_v3_unique_show_name(conn):
 
 
 def _migrate_v4_job_runs_table(conn):
-    """R3/U11 - adds a table recording each scheduled or manual drip run,
+    """Adds a table recording each scheduled or manual drip run,
     so the dashboard can show 'last run: 6 shows dripped, 1 failed' instead
     of nothing at all. Previously a failed job was only visible in the
     container logs."""
@@ -2354,7 +2113,7 @@ def _migrate_v4_job_runs_table(conn):
 
 
 def _migrate_v5_drip_moves_table(conn):
-    """F2 - undo support. The history table always stored a human-readable
+    """Undo support. The history table always stored a human-readable
     label ('dripped S01E01') but never the actual source/destination paths,
     so reverting a drip meant nothing to automate against. This records
     exactly what moved on each drip, keyed to the history row that
@@ -2378,7 +2137,7 @@ def _migrate_v5_drip_moves_table(conn):
 
 
 def _migrate_v6_tvdb_columns(conn):
-    """F3 - adds tvdb_id so a show's TVDB match is remembered (not
+    """Adds tvdb_id so a show's TVDB match is remembered (not
     re-searched by name every time, which is unreliable for common titles
     and wastes API calls TVDB explicitly asks integrators to avoid)."""
     existing_cols = {r['name'] for r in conn.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall()}
@@ -2752,9 +2511,9 @@ def merge_directory(src_dir, dest_dir):
     Returns {'moved': int, 'duplicates': int, 'conflicts': [rel_path],
              'failures': [(rel_path, error)]}.
 
-    Two behaviours changed here (C3, C4).
+    Two behaviours worth knowing about:
 
-    C3 - collisions are no longer deleted. The previous version called
+    Collisions are no longer deleted. The previous version called
     os.remove() on the source whenever the destination name already existed,
     with no comparison and no log line. That's correct for the artwork case it
     was written for (copied, not moved, so genuinely duplicated) but it also
@@ -2762,7 +2521,7 @@ def merge_directory(src_dir, dest_dir):
     identical files are dropped as before, and differing ones are parked in a
     _unbinge_conflicts folder with a loud warning.
 
-    C4 - every file operation is wrapped. On a Windows/NTFS bind mount Plex
+    Every file operation is wrapped. On a Windows/NTFS bind mount Plex
     takes mandatory locks while scanning or streaming, so a move can fail in
     ways it never would on Linux. Previously one locked file aborted the whole
     merge partway, leaving a show split across two directories with no record
@@ -3571,12 +3330,12 @@ def run_drip_job(force_show_id=None):
 
         run_scheduled_backup_if_due()
 
-    # F1 - global dry-run mode. Lets someone watch a full week of scheduled
+    # Global dry-run mode. Lets someone watch a full week of scheduled
     # behaviour play out with zero files touched and zero database writes,
     # which is the safest way to trust a new install before turning it loose
     # on a real library. Reuses preview_show_drip - the exact same function
     # the Preview button calls - so dry-run mode can't drift from what
-    # Preview already promises to be accurate about (see H1).
+    # Preview already promises to be accurate about.
     dry_run = get_setting('dry_run', '0') == '1'
 
     outcome = {'ran': [], 'skipped': [], 'errors': [], 'not_found': False}
@@ -3637,7 +3396,7 @@ def run_drip_job(force_show_id=None):
         if force_show_id is None and not dry_run:
             set_setting('last_job_run', now_local().isoformat())
 
-        # R3/U11 - every run leaves a record, scheduled or manual, so a
+        # Every run leaves a record, scheduled or manual, so a
         # failed 3am job is visible on the dashboard rather than only in
         # `docker compose logs`. Dry runs are recorded too, marked as such
         # in the detail text, so they don't get confused with a real one.
@@ -3679,7 +3438,7 @@ def get_last_job_run():
 # Scheduler setup (guarded against Flask's debug-mode double reload)
 # ---------------------------------------------------------------------------
 def detect_missed_run():
-    """F5 - if the container was down over a scheduled run, nothing drips
+    """If the container was down over a scheduled run, nothing drips
     and nothing says so; the next 3am run just happens on schedule as if
     yesterday never existed. This computes whether the gap since the last
     recorded run is suspiciously large - more than ~30 hours, giving normal
@@ -3798,6 +3557,641 @@ if _should_start_background_work():
 
 
 # ---------------------------------------------------------------------------
+# Sonarr integration
+# Optional: calendar, series lookup, path sync, status report, repoint,
+# stop-monitoring and undo. Every call is a no-op when Sonarr is not configured.
+# ---------------------------------------------------------------------------
+
+def sonarr_get_calendar(days_ahead=14):
+    """Fetches upcoming episode air dates across the user's WHOLE Sonarr
+    library (every monitored show, not just ones synced into Unbinge).
+
+    This is a genuinely different thing from Unbinge's own schedule: Unbinge
+    projects when files ALREADY ON DISK will drip into Plex on a schedule
+    you set; this reports when episodes are actually airing/being released
+    according to Sonarr, which may not be downloaded yet at all.
+
+    Returns (events: list[dict], error: str|None). Each event dict has
+    'show_name', 'season', 'episode', 'episode_title', 'air_date' (date),
+    'air_datetime' (the raw ISO string from Sonarr, or None), 'has_file'.
+
+    Never executed against a live Sonarr instance - written from Sonarr's
+    documented v3 API shape, same caveat as sonarr_get_series."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    api_key = get_setting('sonarr_api_key', '').strip()
+    if not base or not api_key:
+        return [], "Sonarr isn't configured - add a URL and API key in Settings to enable this."
+
+    start = today_local()
+    end = start + timedelta(days=max(1, days_ahead))
+
+    try:
+        resp = requests.get(
+            f'{base}/api/v3/calendar',
+            params={
+                'start': start.isoformat(),
+                'end': end.isoformat(),
+                'includeSeries': 'true',
+            },
+            headers={'X-Api-Key': api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw_episodes = resp.json()
+    except requests.RequestException as e:
+        log.error("Sonarr calendar fetch failed: %s", e)
+        return [], f"Could not reach Sonarr: {e}"
+    except ValueError:
+        return [], "Sonarr returned an unexpected response - see logs."
+
+    events = []
+    for ep in raw_episodes:
+        air_dt_str = ep.get('airDateUtc') or ep.get('airDate')
+        if not air_dt_str:
+            continue
+        try:
+            # airDateUtc is a full ISO datetime; airDate (fallback) is a bare
+            # date. Both parse fine via fromisoformat once 'Z' is normalised.
+            air_dt = datetime.fromisoformat(air_dt_str.replace('Z', '+00:00'))
+            air_date = air_dt.astimezone(LOCAL_TZ).date() if air_dt.tzinfo else air_dt.date()
+        except ValueError:
+            continue
+
+        series = ep.get('series') or {}
+        events.append({
+            'show_name': series.get('title', 'Unknown Show'),
+            'season': ep.get('seasonNumber', 0),
+            'episode': ep.get('episodeNumber', 0),
+            'episode_title': ep.get('title') or '',
+            'air_date': air_date,
+            'air_datetime': air_dt_str,
+            'has_file': bool(ep.get('hasFile')),
+        })
+
+    events.sort(key=lambda e: (e['air_date'], e['show_name']))
+    return events, None
+
+
+_SONARR_SERIES_CACHE = {'key': None, 'at': 0.0, 'data': None}
+
+
+def sonarr_fetch_series(base, api_key, use_cache=True):
+    """Whole-library series list from Sonarr. Large libraries on slow hardware
+    can take well over 20 seconds to answer, so this waits up to 90 s, and
+    reuses the last answer for 60 s so a burst of checks doesn't repeat the
+    slow call. Raises requests.RequestException / ValueError."""
+    key = (base, api_key)
+    c = _SONARR_SERIES_CACHE
+    if use_cache and c['key'] == key and c['data'] is not None and time.time() - c['at'] < 60:
+        return c['data']
+    resp = requests.get(f'{base}/api/v3/series', headers={'X-Api-Key': api_key}, timeout=(10, 90))
+    resp.raise_for_status()
+    data = resp.json()
+    c.update(key=key, at=time.time(), data=data)
+    return data
+
+
+def sonarr_get_series(query_or_tvdb_id):
+    """Optional enrichment - looks up a series in the user's own Sonarr
+    instance, by TVDB id if given (more reliable) or by title match.
+    Returns (details: dict|None, error: str|None). No-ops cleanly with a
+    clear message if Sonarr isn't configured, since this is meant to be
+    fully optional on top of the TVDB-based flow above.
+
+    Also never executed against a live Sonarr instance - written from
+    Sonarr's documented v3 API shape."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    api_key = get_setting('sonarr_api_key', '').strip()
+    if not base or not api_key:
+        return None, "Sonarr isn't configured (optional) - add a URL and API key in Settings to enable it."
+
+    try:
+        all_series = sonarr_fetch_series(base, api_key)
+    except requests.RequestException as e:
+        log.error("Sonarr lookup failed: %s", e)
+        return None, f"Could not reach Sonarr: {e}"
+    except ValueError:
+        return None, "Sonarr returned an unexpected response - see logs."
+
+    match = None
+    if isinstance(query_or_tvdb_id, int):
+        match = next((s for s in all_series if s.get('tvdbId') == query_or_tvdb_id), None)
+    else:
+        q = str(query_or_tvdb_id).strip().lower()
+        match = next((s for s in all_series if s.get('title', '').strip().lower() == q), None)
+
+    if not match:
+        return None, "No matching show found in Sonarr."
+
+    season_counts = {
+        s['seasonNumber']: s.get('statistics', {}).get('totalEpisodeCount', 0)
+        for s in match.get('seasons', [])
+        if s.get('seasonNumber', 0) > 0
+    }
+    return {
+        'sonarr_id': match.get('id'),
+        'title': match.get('title'),
+        'season_episode_counts': season_counts,
+    }, None
+
+
+def sonarr_target_field(override=None):
+    """Which of a show's folders Sonarr should point at while it's dripping:
+    'plex_path' (what has been released - Sonarr's count only grows) or
+    'vault_path' (what is still waiting)."""
+    value = get_setting('sonarr_target', 'plex') if override is None else override
+    return 'vault_path' if value == 'vault' else 'plex_path'
+
+
+def sonarr_track_path(show):
+    """The folder Sonarr should currently be pointed at for this show row."""
+    return show[sonarr_target_field()]
+
+
+def sonarr_translate_path(path, mapping=None):
+    """Unbinge and Sonarr often see the same folder under different mount
+    points (Unbinge at /media/vault, Sonarr at /tv, say). The optional
+    sonarr_path_map setting - one 'unbinge_prefix=sonarr_prefix' per line -
+    translates a path into Sonarr's view of it, longest matching prefix
+    first. With no map, paths pass through unchanged."""
+    path = (path or '').rstrip('/')
+    pairs = []
+    text = get_setting('sonarr_path_map', '') if mapping is None else mapping
+    for line in text.splitlines():
+        if '=' not in line:
+            continue
+        ours, theirs = (part.strip().rstrip('/') for part in line.split('=', 1))
+        if ours:
+            pairs.append((ours, theirs))
+    for ours, theirs in sorted(pairs, key=lambda p: -len(p[0])):
+        if path == ours or path.startswith(ours + '/'):
+            return theirs + path[len(ours):]
+    return path
+
+
+def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
+    """Points the show's Sonarr series at new_path, WITHOUT moving, renaming
+    or re-downloading anything (moveFiles=false: Unbinge has already moved the
+    folder itself, Sonarr just needs to know where it went).
+
+    Finds the series by its current path in Sonarr first (the most reliable
+    link, since Unbinge is what moved it), then by TVDB id, then by exact
+    title - the last two only when they identify exactly one series, so an
+    ambiguous match is skipped rather than guessed at.
+
+    Returns (status, detail) with status one of 'updated', 'unchanged',
+    'skipped' (not configured / sync off / no unambiguous match) or 'error'.
+    Never raises - a Sonarr problem must not interrupt a promote or delete.
+    Written from Sonarr's documented v3 API and never run against a live
+    instance."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    api_key = get_setting('sonarr_api_key', '').strip()
+    if not base or not api_key:
+        return 'skipped', 'Sonarr is not configured'
+    if get_setting('sonarr_sync_paths', '1') != '1':
+        return 'skipped', 'Sonarr path sync is switched off'
+
+    old_s, new_s = sonarr_translate_path(old_path), sonarr_translate_path(new_path)
+    if old_s == new_s:
+        return 'unchanged', 'path is the same from Sonarr\'s point of view'
+
+    headers = {'X-Api-Key': api_key}
+    try:
+        all_series = sonarr_fetch_series(base, api_key)
+
+        def norm(p):
+            return (p or '').rstrip('/')
+
+        matches, how = [], ''
+        for how, fn in sonarr_match_steps(show_name, tvdb_id, old_s):
+            matches = [x for x in all_series if fn(x)]
+            if matches:
+                break
+        if len(matches) != 1:
+            return 'skipped', (
+                f"no unambiguous Sonarr series for '{show_name}'" if not matches
+                else f"{len(matches)} Sonarr series matched '{show_name}' by {how} - left alone"
+            )
+
+        series = matches[0]
+        if norm(series.get('path')) == new_s:
+            return 'unchanged', 'Sonarr already has this path'
+
+        full = requests.get(f"{base}/api/v3/series/{series['id']}", headers=headers, timeout=15)
+        full.raise_for_status()
+        body = full.json()
+        previous = body.get('path')
+        body['path'] = new_s
+        put = requests.put(
+            f"{base}/api/v3/series/{series['id']}", params={'moveFiles': 'false'},
+            headers=headers, json=body, timeout=30,
+        )
+        put.raise_for_status()
+        _SONARR_SERIES_CACHE['data'] = None
+        return 'updated', f"Sonarr series path {previous} -> {new_s} (matched by {how}, no files moved)"
+    except requests.RequestException as e:
+        log.error("Sonarr path sync for '%s' failed: %s", show_name, e)
+        return 'error', f"Sonarr path update failed: {e}"
+    except (ValueError, KeyError) as e:
+        log.error("Sonarr path sync for '%s' got an unexpected response: %s", show_name, e)
+        return 'error', "Sonarr returned an unexpected response - see logs"
+
+
+def sync_sonarr_path_async(show_id, show_name, tvdb_id, old_path, new_path):
+    """Fire-and-forget Sonarr path update for use inside request handlers and
+    the drip job, so a slow Sonarr can't stall them. A successful update or a
+    failure is written to history (so you can see Unbinge touched Sonarr);
+    'skipped' and 'unchanged' just go to the log."""
+    if not old_path or not new_path or old_path == new_path:
+        return
+
+    def _run():
+        status, detail = sonarr_set_series_path(show_name, tvdb_id, old_path, new_path)
+        log.info("Sonarr path sync for '%s': %s - %s", show_name, status, detail)
+        if status in ('updated', 'error'):
+            try:
+                with closing(get_db()) as conn:
+                    log_history(conn, show_id, show_name, 'sonarr' if status == 'updated' else 'failed', detail)
+                    conn.commit()
+            except Exception as e:
+                log.error("Could not record Sonarr sync in history: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def sonarr_health_summary():
+    """Read-only Sonarr card for the System page: version, how many shows are
+    in sync / differ / not found, and the last path-sync result. Uses the
+    cached series list so a visit never triggers a slow 460-series fetch twice.
+    Returns None when Sonarr isn't configured."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    key = get_setting('sonarr_api_key', '').strip()
+    if not base or not key:
+        return None
+    out = {'error': None, 'version': '', 'series_count': 0,
+           'counts': {'ok': 0, 'path-differs': 0, 'ambiguous': 0, 'none': 0}, 'last_sync': None}
+    try:
+        rep = sonarr_status_report(base, key, use_cache=True)
+        out['version'], out['series_count'] = rep['version'], rep['series_count']
+        for sh in rep['shows']:
+            out['counts'][sh['state']] = out['counts'].get(sh['state'], 0) + 1
+    except Exception as e:
+        out['error'] = str(e)
+    try:
+        with closing(get_db()) as conn:
+            r = conn.execute(f"SELECT show_name, detail, occurred_at FROM {HISTORY_TABLE} WHERE action='sonarr' ORDER BY occurred_at DESC LIMIT 1").fetchone()
+        if r:
+            out['last_sync'] = dict(r)
+    except Exception:
+        pass
+    return out
+
+
+@app.route('/api/sonarr/calendar', methods=['GET'])
+def api_sonarr_calendar():
+    """Upcoming real air dates from the user's whole Sonarr library, for
+    the schedule page's 'Upcoming on Sonarr' panel."""
+    try:
+        days = int(request.args.get('days', 14))
+    except (TypeError, ValueError):
+        days = 14
+    days = max(1, min(days, 60))
+
+    events, err = sonarr_get_calendar(days_ahead=days)
+    if err:
+        # Not configured is an expected, quiet state - not an error the UI
+        # should alarm about, so it still returns 200 with an empty list
+        # plus the message, letting the template decide how to present it.
+        return jsonify({"status": "success", "events": [], "message": err})
+
+    return jsonify({
+        "status": "success",
+        "events": [
+            {**e, 'air_date': e['air_date'].isoformat()} for e in events
+        ],
+        "message": None,
+    })
+
+
+def _loose_title(t):
+    """Lower-case, drop a trailing (year) and all punctuation, so
+    'Doctor Who (2005)' and 'doctor who' compare equal."""
+    t = re.sub(r'\s*\(\d{4}\)\s*$', '', (t or '').strip())
+    return re.sub(r'[^a-z0-9]+', '', t.lower())
+
+
+def sonarr_match_steps(show_name, tvdb_id, path):
+    """The ordered ways to find a show's Sonarr series, most reliable first.
+    Each step is (label, predicate). Used by both the status report and the
+    path sync so they always agree."""
+    def norm(p):
+        return (p or '').rstrip('/')
+    folder = os.path.basename(norm(path)) or show_name
+    steps = [('path', lambda x: norm(x.get('path')) == norm(path))]
+    if tvdb_id:
+        steps.append(('TVDB id', lambda x: x.get('tvdbId') == tvdb_id))
+    steps.append(('title', lambda x: (x.get('title') or '').strip().lower() == show_name.strip().lower()))
+    steps.append(('folder name', lambda x: os.path.basename(norm(x.get('path'))).lower() == folder.lower()))
+    steps.append(('similar title', lambda x: _loose_title(x.get('title')) == _loose_title(show_name)
+                  and _loose_title(show_name) != ''))
+    return steps
+
+
+def sonarr_match_series(all_series, show_name, tvdb_id, path):
+    """Read-only version of the sync's matching. Returns
+    (series|None, how, count_at_the_first_step_that_found_anything)."""
+    for how, fn in sonarr_match_steps(show_name, tvdb_id, path):
+        found = [x for x in all_series if fn(x)]
+        if found:
+            return (found[0] if len(found) == 1 else None), how, len(found)
+    return None, '', 0
+
+
+def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=False):
+    """Live check: Sonarr version plus, per active show, whether Unbinge can
+    find its Sonarr series and whether the folder Sonarr has matches ours.
+    Raises requests.RequestException / ValueError on connection problems."""
+    headers = {'X-Api-Key': api_key}
+    st = requests.get(f'{base}/api/v3/system/status', headers=headers, timeout=15)
+    st.raise_for_status()
+    version = (st.json() or {}).get('version', '?')
+    all_series = sonarr_fetch_series(base, api_key, use_cache=use_cache)
+
+    conn = get_db()
+    try:
+        rows = conn.execute(f"SELECT show_name, {sonarr_target_field(target)} AS track_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+        shows = []
+        for r in rows:
+            tvdb_id = r['tvdb_id']
+            ours = sonarr_translate_path(r['track_path'], mapping)
+            series, how, n = sonarr_match_series(all_series, r['show_name'], tvdb_id, ours)
+            if series:
+                in_sync = (series.get('path') or '').rstrip('/') == (ours or '').rstrip('/')
+                state = 'ok' if in_sync else 'path-differs'
+                detail = f"matched by {how}" + ("" if in_sync else f" - sonarr has {series.get('path')}")
+            elif n > 1:
+                state, detail = 'ambiguous', f"{n} series match by {how}"
+            else:
+                state, detail = 'none', 'not found in sonarr'
+            shows.append({'name': r['show_name'], 'state': state, 'detail': detail,
+                          'ours': ours, 'theirs': (series or {}).get('path', '')})
+    finally:
+        conn.close()
+    text = get_setting('sonarr_path_map', '') if mapping is None else mapping
+    rules = sum(1 for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip())
+    diag = ''
+    try:
+        lefts = [ln.split('=', 1)[0].strip().rstrip('/') for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip()]
+        with closing(get_db()) as c2:
+            vrows = c2.execute(f"SELECT {sonarr_target_field(target)} AS vault_path FROM {TABLE_NAME} LIMIT 200").fetchall()
+        unmatched = [v['vault_path'] for v in vrows
+                     if not any(v['vault_path'] == l or v['vault_path'].startswith(l + '/') for l in lefts)]
+        if lefts and unmatched:
+            vp = unmatched[0]
+            best = max(lefts, key=lambda l: len(os.path.commonprefix([l, vp])))
+            n = len(os.path.commonprefix([best, vp]))
+            diag = (f"{len(unmatched)} of {len(vrows)} vault paths are not covered by any rule. "
+                    f"rule {best!r} vs path {vp!r}: they stop matching at character {n + 1} "
+                    f"(rule has {best[n:n + 8]!r}, path has {vp[n:n + 8]!r}).")
+    except Exception as e:
+        log.warning("Sonarr mapping diagnosis failed: %s", e)
+    return {'version': version, 'series_count': len(all_series), 'shows': shows,
+            'mapping_rules': rules, 'mapping_diag': diag}
+
+
+def sonarr_repoint_plan(base, api_key, mapping=None, target=None):
+    """Shows whose Sonarr series is found but points somewhere other than the
+    show's vault folder. Returns a list of {name, series_id, from, to}."""
+    all_series = sonarr_fetch_series(base, api_key, use_cache=False)
+    plan = []
+    with closing(get_db()) as conn:
+        rows = conn.execute(f"SELECT id, show_name, {sonarr_target_field(target)} AS track_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
+    for r in rows:
+        want = sonarr_translate_path(r['track_path'], mapping)
+        series, how, _n = sonarr_match_series(all_series, r['show_name'], r['tvdb_id'], want)
+        if not series:
+            continue
+        have = (series.get('path') or '')
+        if have.rstrip('/') != want.rstrip('/'):
+            plan.append({'show_id': r['id'], 'name': r['show_name'], 'series_id': series['id'],
+                         'from': have, 'to': want})
+    return plan
+
+
+@app.route('/api/sonarr/repoint', methods=['POST'])
+def api_sonarr_repoint():
+    """Points Sonarr's series path at each show's vault folder (no files are
+    moved - moveFiles=false). Without confirm=1 it only returns what WOULD
+    change, so the page can ask first."""
+    base = request.form.get('sonarr_url', '').strip().rstrip('/')
+    api_key = request.form.get('sonarr_api_key', '').strip()
+    if not base or not api_key:
+        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
+    try:
+        plan = sonarr_repoint_plan(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
+    except requests.RequestException as e:
+        return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
+    except ValueError:
+        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
+    if request.form.get('confirm') != '1':
+        return jsonify({"status": "success", "plan": plan})
+
+    headers = {'X-Api-Key': api_key}
+    done, failed = 0, []
+    for item in plan:
+        try:
+            full = requests.get(f"{base}/api/v3/series/{item['series_id']}", headers=headers, timeout=30)
+            full.raise_for_status()
+            body = full.json()
+            body['path'] = item['to']
+            put = requests.put(f"{base}/api/v3/series/{item['series_id']}", params={'moveFiles': 'false'},
+                               headers=headers, json=body, timeout=60)
+            put.raise_for_status()
+            with closing(get_db()) as conn:
+                log_history(conn, item['show_id'], item['name'], 'sonarr',
+                            f"Sonarr series path {item['from']} -> {item['to']} (repointed to {'Plex folder' if sonarr_target_field()=='plex_path' else 'vault'}, no files moved)")
+                conn.commit()
+            done += 1
+        except (requests.RequestException, ValueError) as e:
+            log.error("Sonarr repoint of '%s' failed: %s", item['name'], e)
+            failed.append(item['name'])
+    _SONARR_SERIES_CACHE['data'] = None
+    msg = f"Repointed {done} show{'s' if done != 1 else ''} in Sonarr."
+    if failed:
+        return jsonify({"status": "error", "message": msg + " Failed: " + ", ".join(failed[:5])}), 502
+    return jsonify({"status": "success", "message": msg, "done": done})
+
+
+def _sonarr_creds_from_form():
+    base = request.form.get('sonarr_url', '').strip().rstrip('/')
+    api_key = request.form.get('sonarr_api_key', '').strip()
+    return base, api_key
+
+
+def sonarr_unmonitor_plan(base, api_key, mapping=None, target=None):
+    """Episodes Sonarr is still monitoring that Unbinge is holding back.
+
+    While a show drips, Sonarr watches the Plex folder, which only holds the
+    episodes released so far - so everything still waiting in the vault looks
+    'missing' and would be searched for and downloaded, defeating the drip.
+    Returns [{name, show_id, series_id, episode_ids, count}] for the shows
+    where such episodes exist. Read-only."""
+    headers = {'X-Api-Key': api_key}
+    all_series = sonarr_fetch_series(base, api_key, use_cache=False)
+    plan = []
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            f"SELECT id, show_name, vault_path, tvdb_id, {sonarr_target_field(target)} AS track_path "
+            f"FROM {TABLE_NAME} WHERE completed_at IS NULL ORDER BY show_name COLLATE NOCASE"
+        ).fetchall()
+        for r in rows:
+            series, _how, _n = sonarr_match_series(
+                all_series, r['show_name'], r['tvdb_id'], sonarr_translate_path(r['track_path'], mapping))
+            if not series:
+                continue
+            waiting = {(e['season'], e['episode']) for e in remaining_episode_files(
+                r['vault_path'], get_dripped_set(conn, r['id']), get_excluded_set(conn, r['id']))}
+            if not waiting:
+                continue
+            resp = requests.get(f"{base}/api/v3/episode", params={'seriesId': series['id']},
+                                headers=headers, timeout=(10, 60))
+            resp.raise_for_status()
+            ids = [ep['id'] for ep in resp.json()
+                   if ep.get('monitored') and (ep.get('seasonNumber'), ep.get('episodeNumber')) in waiting]
+            if ids:
+                plan.append({'name': r['show_name'], 'show_id': r['id'], 'series_id': series['id'],
+                             'episode_ids': ids, 'count': len(ids)})
+    return plan
+
+
+@app.route('/api/sonarr/unmonitor', methods=['POST'])
+def api_sonarr_unmonitor():
+    """Stops Sonarr monitoring episodes still waiting in the vault. Without
+    confirm=1 it only reports what it would change."""
+    base, api_key = _sonarr_creds_from_form()
+    if not base or not api_key:
+        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
+    try:
+        plan = sonarr_unmonitor_plan(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
+    except requests.RequestException as e:
+        return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
+    except ValueError:
+        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
+    if request.form.get('confirm') != '1':
+        return jsonify({"status": "success", "plan": [{k: v for k, v in p.items() if k != 'episode_ids'} for p in plan]})
+
+    headers = {'X-Api-Key': api_key}
+    shows_done, eps_done, failed = 0, 0, []
+    for item in plan:
+        try:
+            put = requests.put(f"{base}/api/v3/episode/monitor", headers=headers, timeout=60,
+                               json={'episodeIds': item['episode_ids'], 'monitored': False})
+            put.raise_for_status()
+            with closing(get_db()) as conn:
+                log_history(conn, item['show_id'], item['name'], 'sonarr',
+                            f"Stopped monitoring {item['count']} episode(s) in Sonarr that are still waiting in the vault")
+                conn.commit()
+            shows_done += 1
+            eps_done += item['count']
+        except requests.RequestException as e:
+            log.error("Sonarr unmonitor for '%s' failed: %s", item['name'], e)
+            failed.append(item['name'])
+    msg = f"Stopped monitoring {eps_done} episode{'s' if eps_done != 1 else ''} across {shows_done} show{'s' if shows_done != 1 else ''}."
+    if failed:
+        return jsonify({"status": "error", "message": msg + " Failed: " + ", ".join(failed[:5])}), 502
+    return jsonify({"status": "success", "message": msg, "done": eps_done})
+
+
+_PATH_CHANGE_RE = re.compile(r'^Sonarr series path (.+?) -> (.+?) \(')
+
+
+def last_sonarr_path_change():
+    """The most recent 'sonarr' history row that records a path change and has
+    not itself been undone. Returns {history_id, show_id, show_name, tvdb_id,
+    from, to} or None. An undo is logged as 'Undid: ...', which ends the
+    chain, so undo can't be pressed twice in a row."""
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            f"SELECT id, show_id, show_name, detail FROM {HISTORY_TABLE} WHERE action = 'sonarr' "
+            f"AND (detail LIKE 'Sonarr series path %' OR detail LIKE 'Undid:%') ORDER BY occurred_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if not row or row['detail'].startswith('Undid:'):
+            return None
+        m = _PATH_CHANGE_RE.match(row['detail'])
+        if not m:
+            return None
+        show = conn.execute(f"SELECT tvdb_id FROM {TABLE_NAME} WHERE id = ?", (row['show_id'],)).fetchone()
+    return {'history_id': row['id'], 'show_id': row['show_id'], 'show_name': row['show_name'],
+            'tvdb_id': show['tvdb_id'] if show else None, 'from': m.group(1), 'to': m.group(2)}
+
+
+@app.route('/api/sonarr/undo-path', methods=['POST'])
+def api_sonarr_undo_path():
+    """Puts Sonarr's series path back to what it was before the last change
+    Unbinge made. Without confirm=1 it only says what it would do."""
+    base, api_key = _sonarr_creds_from_form()
+    if not base or not api_key:
+        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
+    change = last_sonarr_path_change()
+    if not change:
+        return jsonify({"status": "success", "plan": []})
+    if request.form.get('confirm') != '1':
+        return jsonify({"status": "success", "plan": [change]})
+    headers = {'X-Api-Key': api_key}
+    try:
+        all_series = sonarr_fetch_series(base, api_key, use_cache=False)
+        matches = []
+        for _how, fn in sonarr_match_steps(change['show_name'], change['tvdb_id'], change['to']):
+            matches = [x for x in all_series if fn(x)]
+            if matches:
+                break
+        if len(matches) != 1:
+            return jsonify({"status": "error", "message": "Couldn't find exactly one Sonarr series for that show - nothing changed."}), 409
+        sid = matches[0]['id']
+        full = requests.get(f"{base}/api/v3/series/{sid}", headers=headers, timeout=30)
+        full.raise_for_status()
+        body = full.json()
+        body['path'] = change['from']
+        put = requests.put(f"{base}/api/v3/series/{sid}", params={'moveFiles': 'false'},
+                           headers=headers, json=body, timeout=60)
+        put.raise_for_status()
+    except (requests.RequestException, ValueError) as e:
+        return jsonify({"status": "error", "message": f"Sonarr undo failed: {e}"}), 502
+    _SONARR_SERIES_CACHE['data'] = None
+    with closing(get_db()) as conn:
+        log_history(conn, change['show_id'], change['show_name'], 'sonarr',
+                    f"Undid: Sonarr series path put back to {change['from']} (no files moved)")
+        conn.commit()
+    return jsonify({"status": "success", "message": f"Put '{change['show_name']}' back to {change['from']} in Sonarr."})
+
+
+@app.route('/api/test-sonarr', methods=['POST'])
+def api_test_sonarr():
+    """Settings page 'Test Connection' button for the optional Sonarr link.
+    Uses the current form values; on success also returns a per-show report
+    so you can see whether path sync will find each show."""
+    base = request.form.get('sonarr_url', '').strip().rstrip('/')
+    api_key = request.form.get('sonarr_api_key', '').strip()
+    log.info("Testing Sonarr connection (url provided: %s, key provided: %s)...", bool(base), bool(api_key))
+    if not base or not api_key:
+        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
+    try:
+        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
+    except requests.RequestException as e:
+        log.warning("Sonarr test connection failed: %s", e)
+        return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
+    except ValueError:
+        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
+    problems = sum(1 for x in report['shows'] if x['state'] != 'ok')
+    log.info("Sonarr test connection succeeded (v%s).", report['version'])
+    return jsonify({
+        "status": "success",
+        "message": f"Sonarr v{report['version']} OK - {report['series_count']} series.",
+        "report": report, "problems": problems,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.route('/')
@@ -3822,7 +4216,7 @@ def index():
         'paused': sum(1 for s in shows if s['paused']),
     }
 
-    # U5 - "Next drip check in 8h 14m" on the dashboard itself. Settings
+    # "Next drip check in 8h 14m" on the dashboard itself. Settings
     # already showed the next run time, but that's not where anyone actually
     # looks first.
     scheduler = _scheduler_holder.get('scheduler')
@@ -3977,32 +4371,46 @@ def gather_system_checks():
     return checks
 
 
-def sonarr_health_summary():
-    """Read-only Sonarr card for the System page: version, how many shows are
-    in sync / differ / not found, and the last path-sync result. Uses the
-    cached series list so a visit never triggers a slow 460-series fetch twice.
-    Returns None when Sonarr isn't configured."""
-    base = get_setting('sonarr_url', '').strip().rstrip('/')
-    key = get_setting('sonarr_api_key', '').strip()
-    if not base or not key:
-        return None
-    out = {'error': None, 'version': '', 'series_count': 0,
-           'counts': {'ok': 0, 'path-differs': 0, 'ambiguous': 0, 'none': 0}, 'last_sync': None}
+def build_next_run_plan():
+    """What the next scheduled run will do, without touching anything: the
+    date/time it fires and, for each show due on that weekday, the same
+    answer the Preview button gives. Mirrors run_drip_job's own gating
+    (paused, release day, already ran that day)."""
+    now = now_local()
     try:
-        rep = sonarr_status_report(base, key, use_cache=True)
-        out['version'], out['series_count'] = rep['version'], rep['series_count']
-        for sh in rep['shows']:
-            out['counts'][sh['state']] = out['counts'].get(sh['state'], 0) + 1
-    except Exception as e:
-        out['error'] = str(e)
-    try:
-        with closing(get_db()) as conn:
-            r = conn.execute(f"SELECT show_name, detail, occurred_at FROM {HISTORY_TABLE} WHERE action='sonarr' ORDER BY occurred_at DESC LIMIT 1").fetchone()
-        if r:
-            out['last_sync'] = dict(r)
-    except Exception:
-        pass
-    return out
+        hour = int(get_setting('drip_hour', '3') or 3)
+        minute = int(get_setting('drip_minute', '0') or 0)
+    except ValueError:
+        hour, minute = 3, 0
+    run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if run_at <= now:
+        run_at += timedelta(days=1)
+    weekday, run_date = run_at.weekday(), run_at.date().isoformat()
+
+    items, idle = [], 0
+    with closing(get_db()) as conn:
+        rows = [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()]
+    for show in rows:
+        if show.get('paused'):
+            idle += 1
+            continue
+        days = parse_release_days(show.get('release_days') or show.get('release_day'))
+        if weekday not in days or show.get('last_run_date') == run_date:
+            idle += 1
+            continue
+        try:
+            pv = preview_show_drip(show)
+        except Exception as e:
+            pv = {'action': 'error', 'detail': str(e)}
+        items.append({'id': show['id'], 'name': show['show_name'], 'action': pv['action'],
+                      'detail': pv['detail'], 'files': pv.get('files', [])})
+    return {'run_at': run_at.strftime('%a %d %b %H:%M'), 'items': items, 'idle': idle,
+            'dry_run': get_setting('dry_run', '0') == '1'}
+
+
+@app.route('/api/next-run', methods=['GET'])
+def api_next_run():
+    return jsonify(build_next_run_plan())
 
 
 @app.route('/system')
@@ -4011,7 +4419,7 @@ def system_page():
     overall = 'error' if any(c['status'] == 'error' for c in checks) else \
               ('warn' if any(c['status'] == 'warn' for c in checks) else 'ok')
     return render_template('system.html', checks=checks, overall=overall, app_version=APP_VERSION,
-                           sonarr=sonarr_health_summary())
+                           sonarr=sonarr_health_summary(), next_run=build_next_run_plan())
 
 
 # gather_system_checks() makes a live Sonarr request (and a TVDB token
@@ -4458,207 +4866,6 @@ def api_test_tvdb():
     return jsonify({"status": "success", "message": "TVDB connection OK - token acquired."})
 
 
-@app.route('/api/sonarr/calendar', methods=['GET'])
-def api_sonarr_calendar():
-    """Upcoming real air dates from the user's whole Sonarr library, for
-    the schedule page's 'Upcoming on Sonarr' panel."""
-    try:
-        days = int(request.args.get('days', 14))
-    except (TypeError, ValueError):
-        days = 14
-    days = max(1, min(days, 60))
-
-    events, err = sonarr_get_calendar(days_ahead=days)
-    if err:
-        # Not configured is an expected, quiet state - not an error the UI
-        # should alarm about, so it still returns 200 with an empty list
-        # plus the message, letting the template decide how to present it.
-        return jsonify({"status": "success", "events": [], "message": err})
-
-    return jsonify({
-        "status": "success",
-        "events": [
-            {**e, 'air_date': e['air_date'].isoformat()} for e in events
-        ],
-        "message": None,
-    })
-
-
-def _loose_title(t):
-    """Lower-case, drop a trailing (year) and all punctuation, so
-    'Doctor Who (2005)' and 'doctor who' compare equal."""
-    t = re.sub(r'\s*\(\d{4}\)\s*$', '', (t or '').strip())
-    return re.sub(r'[^a-z0-9]+', '', t.lower())
-
-
-def sonarr_match_steps(show_name, tvdb_id, path):
-    """The ordered ways to find a show's Sonarr series, most reliable first.
-    Each step is (label, predicate). Used by both the status report and the
-    path sync so they always agree."""
-    def norm(p):
-        return (p or '').rstrip('/')
-    folder = os.path.basename(norm(path)) or show_name
-    steps = [('path', lambda x: norm(x.get('path')) == norm(path))]
-    if tvdb_id:
-        steps.append(('TVDB id', lambda x: x.get('tvdbId') == tvdb_id))
-    steps.append(('title', lambda x: (x.get('title') or '').strip().lower() == show_name.strip().lower()))
-    steps.append(('folder name', lambda x: os.path.basename(norm(x.get('path'))).lower() == folder.lower()))
-    steps.append(('similar title', lambda x: _loose_title(x.get('title')) == _loose_title(show_name)
-                  and _loose_title(show_name) != ''))
-    return steps
-
-
-def sonarr_match_series(all_series, show_name, tvdb_id, path):
-    """Read-only version of the sync's matching. Returns
-    (series|None, how, count_at_the_first_step_that_found_anything)."""
-    for how, fn in sonarr_match_steps(show_name, tvdb_id, path):
-        found = [x for x in all_series if fn(x)]
-        if found:
-            return (found[0] if len(found) == 1 else None), how, len(found)
-    return None, '', 0
-
-
-def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=False):
-    """Live check: Sonarr version plus, per active show, whether Unbinge can
-    find its Sonarr series and whether the folder Sonarr has matches ours.
-    Raises requests.RequestException / ValueError on connection problems."""
-    headers = {'X-Api-Key': api_key}
-    st = requests.get(f'{base}/api/v3/system/status', headers=headers, timeout=15)
-    st.raise_for_status()
-    version = (st.json() or {}).get('version', '?')
-    all_series = sonarr_fetch_series(base, api_key, use_cache=use_cache)
-
-    conn = get_db()
-    try:
-        rows = conn.execute(f"SELECT show_name, {sonarr_target_field(target)} AS track_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
-        shows = []
-        for r in rows:
-            tvdb_id = r['tvdb_id']
-            ours = sonarr_translate_path(r['track_path'], mapping)
-            series, how, n = sonarr_match_series(all_series, r['show_name'], tvdb_id, ours)
-            if series:
-                in_sync = (series.get('path') or '').rstrip('/') == (ours or '').rstrip('/')
-                state = 'ok' if in_sync else 'path-differs'
-                detail = f"matched by {how}" + ("" if in_sync else f" - sonarr has {series.get('path')}")
-            elif n > 1:
-                state, detail = 'ambiguous', f"{n} series match by {how}"
-            else:
-                state, detail = 'none', 'not found in sonarr'
-            shows.append({'name': r['show_name'], 'state': state, 'detail': detail,
-                          'ours': ours, 'theirs': (series or {}).get('path', '')})
-    finally:
-        conn.close()
-    text = get_setting('sonarr_path_map', '') if mapping is None else mapping
-    rules = sum(1 for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip())
-    diag = ''
-    try:
-        lefts = [ln.split('=', 1)[0].strip().rstrip('/') for ln in text.splitlines() if '=' in ln and ln.split('=', 1)[0].strip()]
-        with closing(get_db()) as c2:
-            vrows = c2.execute(f"SELECT {sonarr_target_field(target)} AS vault_path FROM {TABLE_NAME} LIMIT 200").fetchall()
-        unmatched = [v['vault_path'] for v in vrows
-                     if not any(v['vault_path'] == l or v['vault_path'].startswith(l + '/') for l in lefts)]
-        if lefts and unmatched:
-            vp = unmatched[0]
-            best = max(lefts, key=lambda l: len(os.path.commonprefix([l, vp])))
-            n = len(os.path.commonprefix([best, vp]))
-            diag = (f"{len(unmatched)} of {len(vrows)} vault paths are not covered by any rule. "
-                    f"rule {best!r} vs path {vp!r}: they stop matching at character {n + 1} "
-                    f"(rule has {best[n:n + 8]!r}, path has {vp[n:n + 8]!r}).")
-    except Exception as e:
-        log.warning("Sonarr mapping diagnosis failed: %s", e)
-    return {'version': version, 'series_count': len(all_series), 'shows': shows,
-            'mapping_rules': rules, 'mapping_diag': diag}
-
-
-def sonarr_repoint_plan(base, api_key, mapping=None, target=None):
-    """Shows whose Sonarr series is found but points somewhere other than the
-    show's vault folder. Returns a list of {name, series_id, from, to}."""
-    all_series = sonarr_fetch_series(base, api_key, use_cache=False)
-    plan = []
-    with closing(get_db()) as conn:
-        rows = conn.execute(f"SELECT id, show_name, {sonarr_target_field(target)} AS track_path, tvdb_id FROM {TABLE_NAME} ORDER BY show_name COLLATE NOCASE").fetchall()
-    for r in rows:
-        want = sonarr_translate_path(r['track_path'], mapping)
-        series, how, _n = sonarr_match_series(all_series, r['show_name'], r['tvdb_id'], want)
-        if not series:
-            continue
-        have = (series.get('path') or '')
-        if have.rstrip('/') != want.rstrip('/'):
-            plan.append({'show_id': r['id'], 'name': r['show_name'], 'series_id': series['id'],
-                         'from': have, 'to': want})
-    return plan
-
-
-@app.route('/api/sonarr/repoint', methods=['POST'])
-def api_sonarr_repoint():
-    """Points Sonarr's series path at each show's vault folder (no files are
-    moved - moveFiles=false). Without confirm=1 it only returns what WOULD
-    change, so the page can ask first."""
-    base = request.form.get('sonarr_url', '').strip().rstrip('/')
-    api_key = request.form.get('sonarr_api_key', '').strip()
-    if not base or not api_key:
-        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
-    try:
-        plan = sonarr_repoint_plan(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
-    except requests.RequestException as e:
-        return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
-    except ValueError:
-        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
-    if request.form.get('confirm') != '1':
-        return jsonify({"status": "success", "plan": plan})
-
-    headers = {'X-Api-Key': api_key}
-    done, failed = 0, []
-    for item in plan:
-        try:
-            full = requests.get(f"{base}/api/v3/series/{item['series_id']}", headers=headers, timeout=30)
-            full.raise_for_status()
-            body = full.json()
-            body['path'] = item['to']
-            put = requests.put(f"{base}/api/v3/series/{item['series_id']}", params={'moveFiles': 'false'},
-                               headers=headers, json=body, timeout=60)
-            put.raise_for_status()
-            with closing(get_db()) as conn:
-                log_history(conn, item['show_id'], item['name'], 'sonarr',
-                            f"Sonarr series path {item['from']} -> {item['to']} (repointed to {'Plex folder' if sonarr_target_field()=='plex_path' else 'vault'}, no files moved)")
-                conn.commit()
-            done += 1
-        except (requests.RequestException, ValueError) as e:
-            log.error("Sonarr repoint of '%s' failed: %s", item['name'], e)
-            failed.append(item['name'])
-    _SONARR_SERIES_CACHE['data'] = None
-    msg = f"Repointed {done} show{'s' if done != 1 else ''} in Sonarr."
-    if failed:
-        return jsonify({"status": "error", "message": msg + " Failed: " + ", ".join(failed[:5])}), 502
-    return jsonify({"status": "success", "message": msg, "done": done})
-
-
-@app.route('/api/test-sonarr', methods=['POST'])
-def api_test_sonarr():
-    """Settings page 'Test Connection' button for the optional Sonarr link.
-    Uses the current form values; on success also returns a per-show report
-    so you can see whether path sync will find each show."""
-    base = request.form.get('sonarr_url', '').strip().rstrip('/')
-    api_key = request.form.get('sonarr_api_key', '').strip()
-    log.info("Testing Sonarr connection (url provided: %s, key provided: %s)...", bool(base), bool(api_key))
-    if not base or not api_key:
-        return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
-    try:
-        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
-    except requests.RequestException as e:
-        log.warning("Sonarr test connection failed: %s", e)
-        return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
-    except ValueError:
-        return jsonify({"status": "error", "message": "Sonarr returned an unexpected response."}), 502
-    problems = sum(1 for x in report['shows'] if x['state'] != 'ok')
-    log.info("Sonarr test connection succeeded (v%s).", report['version'])
-    return jsonify({
-        "status": "success",
-        "message": f"Sonarr v{report['version']} OK - {report['series_count']} series.",
-        "report": report, "problems": problems,
-    })
-
-
 @app.route('/api/inspect', methods=['GET'])
 def api_inspect():
     """Called when a show is selected in the promote modal, before
@@ -4681,10 +4888,10 @@ def api_inspect():
     seasons = sorted({e['season'] for e in episodes})
     distinct_eps = len({(e['season'], e['episode']) for e in episodes})
 
-    # U29 - promoting a 200GB show previously gave no indication of what was
+    # Promoting a 200GB show previously gave no indication of what was
     # about to move. Deduplicated by abs_path since scan_episode_files can
     # return multiple entries for one file (a combo episode covers several
-    # tags - see C7); counting it once per tag would double the real size.
+    # tags); counting it once per tag would double the real size.
     unique_paths = {e['abs_path'] for e in episodes}
     total_bytes = 0
     for p in unique_paths:
@@ -4697,7 +4904,7 @@ def api_inspect():
     if distinct_eps == 0:
         warning = "No files matching an SxxExx pattern were found - the drip job wouldn't have anything to move."
 
-    # Disk space check on the destination. U29 showed the size of what's
+    # Disk space check on the destination. The promote dialog shows the size of what's
     # about to move but never checked whether there was room for it -
     # a large show promoted onto a nearly-full vault drive would previously
     # fail partway through the move with a confusing error, rather than a
@@ -4730,7 +4937,7 @@ def api_inspect():
 def promote_show_internal(show_name, release_days_str, episodes_per_drop, target_end_date=None, plan_mode=None):
     """The actual promote logic, shared by the /promote HTTP route and the
     show-queue auto-promotion. Extracted so the two can't drift apart the
-    way process_show_drip and preview_show_drip once did (H1) - a queued
+    way process_show_drip and preview_show_drip once did - a queued
     show being promoted automatically must behave identically to one
     promoted by hand.
 
@@ -4858,7 +5065,7 @@ def toggle_pause(show_id):
             flash_kind, ok = "success", True
     sync_discord_schedule_message_async()
 
-    # U13 - the dashboard's pause button now calls this via fetch() and
+    # The dashboard's pause button now calls this via fetch() and
     # swaps the row in place, rather than a full page reload that loses
     # scroll position and the filter box's contents. The plain <form> POST
     # fallback (no-JS, or the old behaviour) still works via the redirect.
@@ -4880,13 +5087,19 @@ def history_page():
     action_filter = request.args.get('action', '').strip() or None
     text_filter = request.args.get('q', '').strip() or None
     try:
+        days_filter = int(request.args.get('days', 0)) or None
+        if days_filter is not None and not 1 <= days_filter <= 3650:
+            days_filter = None
+    except (TypeError, ValueError):
+        days_filter = None
+    try:
         page = max(1, int(request.args.get('page', 1)))
     except (TypeError, ValueError):
         page = 1
 
     events, total = load_history(
         limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE,
-        show_name=show_filter, action=action_filter, text=text_filter,
+        show_name=show_filter, action=action_filter, text=text_filter, days=days_filter,
     )
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
@@ -4901,7 +5114,7 @@ def history_page():
 
     return render_template(
         'history.html', events=events, total=total, page=page, total_pages=total_pages,
-        show_filter=show_filter or '', action_filter=action_filter or '', text_filter=text_filter or '',
+        show_filter=show_filter or '', action_filter=action_filter or '', text_filter=text_filter or '', days_filter=days_filter or 0,
         all_actions=all_actions,
     )
 
@@ -5046,7 +5259,7 @@ def schedule_page():
         grouped.setdefault(ev['date'].isoformat(), []).append(ev)
     ordered_dates = sorted(grouped.keys())
 
-    # U23 - "2026-09-11" as a heading reads like a bug report. Rendered here
+    # "2026-09-11" as a heading reads like a bug report. Rendered here
     # rather than in the template because strftime's weekday/month names
     # depend on locale, which is a server-side concern.
     day_labels = {d: date.fromisoformat(d).strftime('%A %-d %B') for d in ordered_dates}
@@ -5118,6 +5331,53 @@ def api_bulk_pause():
 
     verb = 'paused' if new_paused else 'resumed'
     return jsonify({"status": "success", "message": f"{updated} show(s) {verb}."})
+
+
+@app.route('/api/bulk/edit', methods=['POST'])
+def api_bulk_edit():
+    """Bulk change of release day and/or episodes per drop. Either field may
+    be omitted to leave it alone. A release day replaces the show's days with
+    that single weekday (0=Monday ... 6=Sunday)."""
+    data = request.get_json(silent=True) or {}
+    show_ids = data.get('show_ids', [])
+    if not show_ids:
+        return jsonify({"status": "error", "message": "No shows selected"}), 400
+    sets, params, parts = [], [], []
+    if data.get('release_day') not in (None, ''):
+        try:
+            day = int(data['release_day'])
+            if not 0 <= day <= 6:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Release day must be 0 (Mon) to 6 (Sun)."}), 400
+        sets += ["release_day = ?", "release_days = ?"]
+        params += [day, str(day)]
+        parts.append(f"release day {WEEKDAY_NAMES[day]}")
+    if data.get('episodes_per_drop') not in (None, ''):
+        try:
+            per = int(data['episodes_per_drop'])
+            if not 1 <= per <= 50:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Episodes per drop must be 1 to 50."}), 400
+        sets.append("episodes_per_drop = ?")
+        params.append(per)
+        parts.append(f"{per} per drop")
+    if not sets:
+        return jsonify({"status": "error", "message": "Pick a release day or an episodes-per-drop value."}), 400
+
+    updated = 0
+    with closing(get_db()) as conn:
+        for show_id in show_ids:
+            row = conn.execute(f"SELECT show_name FROM {TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
+            if not row:
+                continue
+            conn.execute(f"UPDATE {TABLE_NAME} SET {', '.join(sets)} WHERE id = ?", params + [show_id])
+            log_history(conn, show_id, row['show_name'], 'edited', 'bulk action: ' + ', '.join(parts))
+            updated += 1
+        conn.commit()
+    sync_discord_schedule_message_async()
+    return jsonify({"status": "success", "message": f"{updated} show(s) updated ({', '.join(parts)})."})
 
 
 @app.route('/api/bulk/delete', methods=['POST'])
@@ -5816,7 +6076,7 @@ def delete_show(show_id):
                 check_and_advance_queue(trigger_show_id=show_id)
                 if not problems:
                     sync_sonarr_path_async(show_id, show['show_name'], show.get('tvdb_id'), sonarr_track_path(show), dest)
-                # U9 - names the show and gives a real count, instead of a
+                # Names the show and gives a real count, instead of a
                 # silent redirect that looked identical whether it worked or
                 # not.
                 total_files = vault_files + plex_files

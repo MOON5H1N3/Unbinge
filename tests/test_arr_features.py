@@ -286,12 +286,16 @@ def test_settings_page_persists_notification_toggles(harness, client):
 # ---------------------------------------------------------------------------
 
 def test_after_show_queue_fires_on_graduation(harness, drip):
+    unbinge.set_setting('cooldown_grace_days', '0')  # no waiting period for this test
     show_a = harness.vault / 'Show A'
     harness.make_episode(show_a, 'Show A', 1, 1, subdir='Season 01')
     show_a_id = harness.add_show('Show A', release_days='0,1,2,3,4,5,6')
 
     os.makedirs(str(harness.pool / 'Show B' / 'Season 01'), exist_ok=True)
     (harness.pool / 'Show B' / 'Season 01' / 'Show B - S01E01.mkv').write_text('x')
+    # Two episodes: promotion releases the first straight away, so the vault
+    # still has something left to assert on.
+    (harness.pool / 'Show B' / 'Season 01' / 'Show B - S01E02.mkv').write_text('x')
 
     with closing(unbinge.get_db()) as conn:
         conn.execute(f"""INSERT INTO {unbinge.QUEUE_TABLE}

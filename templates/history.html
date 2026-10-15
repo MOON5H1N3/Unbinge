@@ -7,7 +7,14 @@
     <h1 class="mast">history{% if total %} <span class="page-sub">({{ total }} total)</span>{% endif %}</h1>
 </div>
 
+<div class="history-chips">
+    <a href="/history?action=dripped&days=7" class="count-chip {{ 'active' if action_filter == 'dripped' and days_filter == 7 }}">released this week</a>
+    <a href="/history?action=failed" class="count-chip {{ 'active' if action_filter == 'failed' }}">failures</a>
+    <a href="/history?action=sonarr" class="count-chip {{ 'active' if action_filter == 'sonarr' }}">sonarr changes</a>
+</div>
+
 <form method="GET" class="history-toolbar">
+    {% if days_filter %}<input type="hidden" name="days" value="{{ days_filter }}">{% endif %}
     <input type="text" name="show" value="{{ show_filter }}" placeholder="filter by show...">
     <input type="text" name="q" value="{{ text_filter }}" placeholder="search details...">
     <select name="action" onchange="this.form.submit()">
@@ -17,7 +24,7 @@
         {% endfor %}
     </select>
     <button type="submit" class="btn btn-sm">filter</button>
-    {% if show_filter or action_filter or text_filter %}
+    {% if show_filter or action_filter or text_filter or days_filter %}
     <a href="/history" class="btn btn-sm">clear</a>
     {% endif %}
 </form>
@@ -43,14 +50,14 @@
 
 {% if total_pages > 1 %}
 <div class="pagination">
-    <a href="/history?page={{ page - 1 }}&show={{ show_filter|urlencode }}&action={{ action_filter }}&q={{ text_filter|urlencode }}" class="{{ 'disabled' if page <= 1 else '' }}">← prev</a>
+    <a href="/history?page={{ page - 1 }}&show={{ show_filter|urlencode }}&action={{ action_filter }}&q={{ text_filter|urlencode }}&days={{ days_filter }}" class="{{ 'disabled' if page <= 1 else '' }}">← prev</a>
     <span>page {{ page }} of {{ total_pages }}</span>
-    <a href="/history?page={{ page + 1 }}&show={{ show_filter|urlencode }}&action={{ action_filter }}&q={{ text_filter|urlencode }}" class="{{ 'disabled' if page >= total_pages else '' }}">next →</a>
+    <a href="/history?page={{ page + 1 }}&show={{ show_filter|urlencode }}&action={{ action_filter }}&q={{ text_filter|urlencode }}&days={{ days_filter }}" class="{{ 'disabled' if page >= total_pages else '' }}">next →</a>
 </div>
 {% endif %}
 {% else %}
 <p class="empty-note">
-    {% if show_filter or action_filter or text_filter %}no events match that filter.
+    {% if show_filter or action_filter or text_filter or days_filter %}no events match that filter.
     {% else %}nothing has happened yet - once a drip runs, it'll show up here.
     {% endif %}
 </p>

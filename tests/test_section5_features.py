@@ -370,9 +370,12 @@ def test_sonarr_not_configured_fails_cleanly(harness, client):
 
 
 def test_sonarr_test_connection_mocked_success(harness, client):
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status = lambda: None
-    with patch.object(unbinge.requests, 'get', return_value=mock_resp):
+    def fake_get(url, **kw):
+        r = MagicMock()
+        r.raise_for_status = lambda: None
+        r.json = (lambda: {'version': '4.0.0'}) if url.endswith('/system/status') else (lambda: [])
+        return r
+    with patch.object(unbinge.requests, 'get', side_effect=fake_get):
         resp = client.post('/api/test-sonarr', data={
             'sonarr_url': 'http://fake-sonarr:8989', 'sonarr_api_key': 'fake-key',
         })
@@ -612,3 +615,143 @@ def test_schedule_page_renders_poster(harness, client):
     resp = client.get('/schedule?weeks=2')
     assert resp.status_code == 200
     assert b'/posters/77.jpg' in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Next-run preview
+# ---------------------------------------------------------------------------
+
+def test_next_run_plan_lists_due_shows_without_moving_files(harness, client):
+    show_dir = harness.vault / 'Plan Show'
+    harness.make_episode(show_dir, 'Plan Show', 1, 1, subdir='Season 01')
+    harness.add_show('Plan Show', release_days='0,1,2,3,4,5,6')
+    harness.add_show('Paused Show', release_days='0,1,2,3,4,5,6', paused=1)
+    before = harness.files_under(harness.vault)
+    plan = unbinge.build_next_run_plan()
+    assert [i['name'] for i in plan['items']] == ['Plan Show']
+    assert plan['items'][0]['action'] == 'drip'
+    assert plan['idle'] == 1
+    assert harness.files_under(harness.vault) == before
+    assert client.get('/api/next-run').get_json()['items'][0]['name'] == 'Plan Show'
+    assert client.get('/system').status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Sonarr: stop monitoring waiting episodes, undo last path change
+# ---------------------------------------------------------------------------
+
+class _FakeSonarr:
+    """Just enough of Sonarr's v3 API: series list/get/put, episode list, monitor."""
+    def __init__(self, path):
+        self.series = {7: {'id': 7, 'title': 'Slow Show', 'tvdbId': 99, 'path': path}}
+        self.episodes = [
+            {'id': 1, 'seasonNumber': 1, 'episodeNumber': 1, 'monitored': True},
+            {'id': 2, 'seasonNumber': 1, 'episodeNumber': 2, 'monitored': True},
+            {'id': 3, 'seasonNumber': 1, 'episodeNumber': 3, 'monitored': False},
+        ]
+        self.monitor_calls = []
+
+    def _resp(self, data):
+        r = MagicMock(); r.raise_for_status = lambda: None; r.json = lambda: data; return r
+
+    def get(self, url, **kw):
+        if url.endswith('/api/v3/series'): return self._resp(list(self.series.values()))
+        if '/api/v3/series/' in url: return self._resp(dict(self.series[int(url.rsplit('/', 1)[1])]))
+        if url.endswith('/api/v3/episode'): return self._resp(self.episodes)
+        raise AssertionError(url)
+
+    def put(self, url, json=None, **kw):
+        if url.endswith('/api/v3/episode/monitor'):
+            self.monitor_calls.append(json)
+            for ep in self.episodes:
+                if ep['id'] in json['episodeIds']: ep['monitored'] = json['monitored']
+        else:
+            self.series[int(url.rsplit('/', 1)[1])]['path'] = json['path']
+        return self._resp({})
+
+
+def _sonarr_form(confirm=False):
+    d = {'sonarr_url': 'http://fake:8989', 'sonarr_api_key': 'k', 'sonarr_target': 'vault'}
+    if confirm: d['confirm'] = '1'
+    return d
+
+
+def test_sonarr_unmonitor_only_touches_waiting_monitored_episodes(harness, client):
+    show_dir = harness.vault / 'Slow Show'
+    harness.make_episode(show_dir, 'Slow Show', 1, 2, subdir='Season 01')   # waiting
+    harness.make_episode(show_dir, 'Slow Show', 1, 3, subdir='Season 01')   # waiting, already unmonitored
+    harness.add_show('Slow Show')
+    fake = _FakeSonarr(str(show_dir))
+    with patch.object(unbinge.requests, 'get', side_effect=fake.get), \
+         patch.object(unbinge.requests, 'put', side_effect=fake.put):
+        preview = client.post('/api/sonarr/unmonitor', data=_sonarr_form()).get_json()
+        assert preview['plan'] == [{'name': 'Slow Show', 'show_id': 1, 'series_id': 7, 'count': 1}]
+        assert fake.monitor_calls == []                       # preview changes nothing
+        done = client.post('/api/sonarr/unmonitor', data=_sonarr_form(True)).get_json()
+    assert done['done'] == 1
+    assert fake.monitor_calls == [{'episodeIds': [2], 'monitored': False}]
+    assert [e['monitored'] for e in fake.episodes] == [True, False, False]   # ep 1 (not waiting) untouched
+    assert 'sonarr' in harness.history_actions()
+
+
+def test_sonarr_undo_path_restores_previous_path_once(harness, client):
+    sid = harness.add_show('Slow Show')
+    with closing(unbinge.get_db()) as conn:
+        unbinge.log_history(conn, sid, 'Slow Show', 'sonarr',
+                            "Sonarr series path /tv/pool/Slow Show -> /tv/plex/Slow Show (matched by path, no files moved)")
+        conn.commit()
+    fake = _FakeSonarr('/tv/plex/Slow Show')
+    with patch.object(unbinge.requests, 'get', side_effect=fake.get), \
+         patch.object(unbinge.requests, 'put', side_effect=fake.put):
+        plan = client.post('/api/sonarr/undo-path', data=_sonarr_form()).get_json()['plan']
+        assert plan[0]['from'] == '/tv/pool/Slow Show'
+        assert client.post('/api/sonarr/undo-path', data=_sonarr_form(True)).get_json()['status'] == 'success'
+        assert fake.series[7]['path'] == '/tv/pool/Slow Show'
+        # the undo is recorded, so a second press has nothing left to undo
+        assert client.post('/api/sonarr/undo-path', data=_sonarr_form()).get_json()['plan'] == []
+
+
+# ---------------------------------------------------------------------------
+# Bulk edit and history filters
+# ---------------------------------------------------------------------------
+
+def test_bulk_edit_changes_day_and_per_drop_and_logs_it(harness, client):
+    a = harness.add_show('Show A', release_days='0')
+    b = harness.add_show('Show B', release_days='1,2', episodes_per_drop=1)
+    r = client.post('/api/bulk/edit', json={'show_ids': [a, b], 'release_day': '4', 'episodes_per_drop': '3'})
+    assert r.get_json()['status'] == 'success'
+    for sid in (a, b):
+        row = harness.get_show(sid)
+        assert row['release_days'] == '4' and row['episodes_per_drop'] == 3
+    assert harness.history_actions().count('edited') == 2
+
+
+def test_bulk_edit_validates_and_leaves_unspecified_fields_alone(harness, client):
+    a = harness.add_show('Show A', release_days='2', episodes_per_drop=2)
+    assert client.post('/api/bulk/edit', json={'show_ids': [a], 'release_day': '9'}).status_code == 400
+    assert client.post('/api/bulk/edit', json={'show_ids': [a]}).status_code == 400
+    assert client.post('/api/bulk/edit', json={'show_ids': [a], 'episodes_per_drop': '0'}).status_code == 400
+    client.post('/api/bulk/edit', json={'show_ids': [a], 'episodes_per_drop': '5'})
+    row = harness.get_show(a)
+    assert row['release_days'] == '2' and row['episodes_per_drop'] == 5
+
+
+def test_history_days_and_text_filters(harness, client):
+    with closing(unbinge.get_db()) as conn:
+        old = (unbinge.now_local() - timedelta(days=30)).isoformat()
+        conn.execute(f"INSERT INTO {unbinge.HISTORY_TABLE} (show_id, show_name, action, detail, occurred_at) VALUES (1,'Old Show','dripped','old thing',?)", (old,))
+        unbinge.log_history(conn, 2, 'New Show', 'dripped', 'fresh thing')
+        conn.commit()
+    body = client.get('/history?action=dripped&days=7').get_data(as_text=True)
+    assert 'New Show' in body and 'Old Show' not in body
+    body = client.get('/history?q=old+thing').get_data(as_text=True)
+    assert 'Old Show' in body and 'New Show' not in body
+
+
+def test_static_files_are_fingerprinted_and_cacheable(harness, client):
+    html = client.get('/').get_data(as_text=True)
+    import re as _re
+    m = _re.search(r'/static/style\.css\?v=(\d+)', html)
+    assert m, "stylesheet link should carry a modification-time fingerprint"
+    r = client.get(f'/static/style.css?v={m.group(1)}')
+    assert r.status_code == 200 and 'max-age=31536000' in r.headers.get('Cache-Control', '')

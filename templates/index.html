@@ -47,6 +47,14 @@
     <button type="button" class="banner-action" onclick="bulkAction('pause')">pause</button>
     <button type="button" class="banner-action" onclick="bulkAction('resume')">resume</button>
     <button type="button" class="banner-action" onclick="bulkAction('drip')">drip now</button>
+    <span class="bulk-edit">
+        <select id="bulkDay" aria-label="release day">
+            <option value="">day…</option>
+            {% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ loop.index0 }}">{{ d }}</option>{% endfor %}
+        </select>
+        <input type="number" id="bulkPer" min="1" max="50" placeholder="per drop" aria-label="episodes per drop">
+        <button type="button" class="banner-action" onclick="bulkEdit()">apply</button>
+    </span>
     <button type="button" class="banner-action" style="color:var(--danger);" onclick="bulkAction('delete')">delete</button>
     <button type="button" class="banner-action" onclick="clearSelection()">clear</button>
 </div>
@@ -400,6 +408,25 @@ async function bulkAction(action) {
         const data = await res.json();
         unbingeToast(data.message, res.ok && data.status !== 'error' ? 'success' : 'error');
         setTimeout(() => window.location.reload(), 700);
+    } catch (err) {
+        unbingeToast('network error during bulk action.', 'error');
+    }
+}
+
+async function bulkEdit() {
+    const ids = getSelectedIds();
+    const day = document.getElementById('bulkDay').value;
+    const per = document.getElementById('bulkPer').value;
+    if (!ids.length) return;
+    if (day === '' && per === '') { unbingeToast('pick a day and/or a number per drop first.', 'error'); return; }
+    const ok = await unbingeConfirm({ title: `change ${ids.length} show(s)?`, body: 'this updates their release day and/or episodes per drop.', confirmLabel: 'apply' });
+    if (!ok) return;
+    try {
+        const res = await fetch('/api/bulk/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ show_ids: ids, release_day: day, episodes_per_drop: per }) });
+        const data = await res.json();
+        unbingeToast(data.message, res.ok && data.status !== 'error' ? 'success' : 'error');
+        if (res.ok) setTimeout(() => window.location.reload(), 700);
     } catch (err) {
         unbingeToast('network error during bulk action.', 'error');
     }

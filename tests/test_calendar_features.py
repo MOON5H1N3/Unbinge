@@ -79,7 +79,7 @@ def test_feed_includes_drip_events_for_a_real_show(harness):
     assert ics.count('BEGIN:VEVENT') >= 1
 
 
-def test_feed_ends_with_crlf():
+def test_feed_ends_with_crlf(harness):
     assert unbinge.build_ical_feed().endswith('\r\n')
 
 

@@ -142,6 +142,10 @@ def harness(tmp_path, monkeypatch):
                         lambda *a, **k: {'status': 'skipped', 'detail': 'test'})
     monkeypatch.setattr(unbinge, 'sync_discord_schedule_message_async', lambda *a, **k: None)
 
+    # Sonarr's series list is cached for 60s per (url, key); don't let one
+    # test's mocked list leak into the next.
+    unbinge._SONARR_SERIES_CACHE.update(key=None, at=0, data=None)
+
     unbinge.init_db()
     return h
 

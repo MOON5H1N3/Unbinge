@@ -146,7 +146,12 @@
                 <p class="hint" style="margin-top:4px;">one per line: unbinge's folder = the same folder as sonarr sees it.</p>
             </div>
         </div>
-        <button type="button" class="btn btn-sm" id="test-sonarr-btn" style="margin-top:0.9rem;">test connection</button>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:0.9rem;">
+            <button type="button" class="btn btn-sm" id="test-sonarr-btn">test connection</button>
+            <button type="button" class="btn btn-sm" data-sonarr-tool="unmonitor">stop monitoring waiting episodes…</button>
+            <button type="button" class="btn btn-sm" data-sonarr-tool="undo">undo last path change…</button>
+        </div>
+        <div id="sonarrTools" class="sonarr-fix"></div>
         <div id="sonarrReport" class="sonarr-report" hidden></div>
     </div>
 
@@ -289,37 +294,38 @@ document.getElementById('test-tvdb-btn').addEventListener('click', (e) => {
     unbingeRunAction(e.target, '/api/test-tvdb', 'tvdb connection ok.', body);
 });
 
-async function sonarrRepoint(btn, holder, creds) {
+async function sonarrPlanAction(btn, holder, creds, url, describe) {
     btn.disabled = true;
-    const post = (extra) => { const f = new FormData(); creds.forEach((v, k) => f.append(k, v)); if (extra) f.append('confirm', '1'); return fetch('/api/sonarr/repoint', { method: 'POST', body: f }).then(r => r.json().then(d => ({ ok: r.ok, d }))); };
+    const post = (extra) => { const f = new FormData(); creds.forEach((v, k) => f.append(k, v)); if (extra) f.append('confirm', '1'); return fetch(url, { method: 'POST', body: f }).then(r => r.json().then(d => ({ ok: r.ok, d }))); };
     try {
         const { ok, d } = await post(false);
         if (!ok || d.status === 'error') { unbingeToast(d.message || 'that failed.', 'error'); btn.disabled = false; return; }
         if (!d.plan.length) { unbingeToast('nothing to change.', 'success'); btn.disabled = false; return; }
+        const info = describe(d.plan);
         holder.replaceChildren();
         const intro = document.createElement('div');
         intro.className = 'sonarr-fix-intro';
-        intro.textContent = 'this changes where sonarr looks for ' + d.plan.length + ' show' + (d.plan.length === 1 ? '' : 's') + '. no files are moved. sonarr will look in the folder shown after to:.';
+        intro.textContent = info.intro;
         holder.append(intro);
-        d.plan.forEach(p => {
+        info.rows.forEach(lines => {
             const row = document.createElement('div');
             row.className = 'sonarr-fix-row';
-            const n = document.createElement('strong'); n.textContent = p.name;
-            const a = document.createElement('div'); a.textContent = 'now: ' + p.from;
-            const c = document.createElement('div'); c.textContent = 'to:  ' + p.to;
-            row.append(n, a, c);
+            const n = document.createElement('strong'); n.textContent = lines[0];
+            row.append(n);
+            lines.slice(1).forEach(t => { const x = document.createElement('div'); x.textContent = t; row.append(x); });
             holder.append(row);
         });
         const go = document.createElement('button');
-        go.type = 'button'; go.className = 'btn btn-sm btn-primary'; go.textContent = 'confirm and change sonarr';
+        go.type = 'button'; go.className = 'btn btn-sm btn-primary'; go.textContent = info.confirm;
         const no = document.createElement('button');
         no.type = 'button'; no.className = 'btn btn-sm'; no.textContent = 'cancel'; no.style.marginLeft = '8px';
-        no.addEventListener('click', () => holder.replaceChildren());
+        no.addEventListener('click', () => { holder.replaceChildren(); btn.disabled = false; });
         go.addEventListener('click', async () => {
             go.disabled = true; no.disabled = true; go.textContent = 'working…';
             const r = await post(true);
             unbingeToast(r.d.message || 'done.', r.ok ? 'success' : 'error');
             holder.replaceChildren();
+            btn.disabled = false;
         });
         holder.append(go, no);
     } catch (e) {
@@ -327,6 +333,45 @@ async function sonarrRepoint(btn, holder, creds) {
         btn.disabled = false;
     }
 }
+
+function sonarrRepoint(btn, holder, creds) {
+    return sonarrPlanAction(btn, holder, creds, '/api/sonarr/repoint', plan => ({
+        intro: 'this changes where sonarr looks for ' + plan.length + ' show' + (plan.length === 1 ? '' : 's') + '. no files are moved. sonarr will look in the folder shown after to:.',
+        rows: plan.map(p => [p.name, 'now: ' + p.from, 'to:  ' + p.to]),
+        confirm: 'confirm and change sonarr',
+    }));
+}
+
+function sonarrUnmonitor(btn, holder, creds) {
+    return sonarrPlanAction(btn, holder, creds, '/api/sonarr/unmonitor', plan => ({
+        intro: 'sonarr is still monitoring episodes that unbinge is holding back, so it would go looking for them. this stops monitoring those episodes only. nothing is deleted or downloaded.',
+        rows: plan.map(p => [p.name, p.count + ' waiting episode' + (p.count === 1 ? '' : 's') + ' to stop monitoring']),
+        confirm: 'confirm and stop monitoring',
+    }));
+}
+
+function sonarrUndoPath(btn, holder, creds) {
+    return sonarrPlanAction(btn, holder, creds, '/api/sonarr/undo-path', plan => ({
+        intro: 'this puts the last path unbinge changed in sonarr back the way it was. no files are moved.',
+        rows: plan.map(p => [p.show_name, 'sonarr has: ' + p.to, 'put back to: ' + p.from]),
+        confirm: 'confirm and undo',
+    }));
+}
+
+function sonarrCreds() {
+    const body = new FormData();
+    body.append('sonarr_url', document.getElementById('sonarr_url').value);
+    body.append('sonarr_api_key', document.getElementById('sonarr_api_key').value);
+    body.append('sonarr_path_map', document.getElementById('sonarr_path_map').value);
+    body.append('sonarr_target', document.getElementById('sonarr_target').value);
+    return body;
+}
+document.querySelectorAll('[data-sonarr-tool]').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const fns = { unmonitor: sonarrUnmonitor, undo: sonarrUndoPath };
+        fns[btn.dataset.sonarrTool](btn, document.getElementById('sonarrTools'), sonarrCreds());
+    });
+});
 
 document.getElementById('test-sonarr-btn').addEventListener('click', async (e) => {
     const btn = e.currentTarget, original = btn.innerHTML, box = document.getElementById('sonarrReport');

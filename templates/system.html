@@ -34,6 +34,18 @@
     {% endfor %}
 </div>
 
+<div class="panel" style="margin-top:14px;">
+    <h2>{{ icon('clock', 14) }}next run · {{ next_run.run_at }}{% if next_run.dry_run %} <span class="cell-faint" style="font-weight:400;">(dry-run mode: nothing will move)</span>{% endif %}</h2>
+    {% for it in next_run['items'] %}
+    <div class="check-row">
+        <div class="check-label"><span class="check-dot check-{{ 'ok' if it.action == 'drip' else ('error' if it.action == 'error' else 'warn') }}"></span><a href="/show/{{ it.id }}" style="color:var(--text); text-decoration:none;">{{ it.name }}</a></div>
+        <div class="check-detail">{{ it.detail }}</div>
+    </div>
+    {% else %}
+    <p class="cell-faint" style="font-size:12.5px; margin:4px;">nothing is due on that run{% if next_run.idle %} - {{ next_run.idle }} show{{ 's' if next_run.idle != 1 }} wait for another day{% endif %}.</p>
+    {% endfor %}
+</div>
+
 {% if sonarr %}
 <div class="panel" style="margin-top:14px;">
     <h2>{{ icon("server", 14) }}sonarr</h2>
