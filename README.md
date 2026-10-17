@@ -99,6 +99,7 @@ All configuration is through environment variables. Integration settings can als
 | `PLEX_TOKEN` | Yes | – | Plex auth token |
 | `PLEX_LIBRARY_ID` | Yes | – | Section ID of the library to rescan after a drip |
 | `POOL_DIR` | Yes | `/media/A/TV100` | Full show collection |
+| `ANIMATION_POOL_DIR` | No | `/media/A/animation` | Second pool for animated shows. Animated shows return here when finished or removed; live action returns to `POOL_DIR` |
 | `VAULT_DIR` | Yes | `/media/vault` | Holding area for unreleased episodes |
 | `PLEX_BASE_DIR` | Yes | `/media/private_tv` | Folder the Plex library watches |
 | `DB_PATH` | No | `/config/drip_schedule.db` | SQLite database location (posters are stored beside it) |

@@ -1061,3 +1061,77 @@ def test_balance_endpoint_previews_then_applies(harness, monkeypatch, client):
     assert len(set(days)) == 4
     logged = [e['detail'] for n in ('Show A', 'Show B', 'Show C', 'Show D') for e in harness.history_for(n)]
     assert sum('balanced the week' in d for d in logged) == applied['applied']
+
+
+# ---------------------------------------------------------------------------
+# Animation pool: animated shows go back to the animation folder
+# ---------------------------------------------------------------------------
+
+def _with_animation_pool(harness, monkeypatch):
+    anim = harness.media / 'A' / 'animation'
+    anim.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(unbinge, 'ANIMATION_POOL_DIR', str(anim))
+    return anim
+
+
+def _make_in(base, name, eps=2):
+    for e in range(1, eps + 1):
+        d = base / name / 'Season 01'
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name} - S01E{e:02d}.mkv").write_text('x')
+
+
+def test_each_show_returns_to_the_pool_it_came_from(harness, monkeypatch, drip):
+    anim = _with_animation_pool(harness, monkeypatch)
+    monkeypatch.setattr(unbinge, 'series_known_ended', lambda show: (True, 'Sonarr'))
+    _make_in(anim, 'Cartoon Show', 1)
+    _make_in(harness.pool, 'Live Show', 1)
+    ok1, _m, cid, _c = unbinge.promote_show_internal('Cartoon Show', '0,1,2,3,4,5,6', 1)
+    ok2, _m, lid, _c = unbinge.promote_show_internal('Live Show', '0,1,2,3,4,5,6', 1)
+    assert ok1 and ok2
+    assert not (anim / 'Cartoon Show').exists() and not (harness.pool / 'Live Show').exists()
+    for sid in (cid, lid):
+        drip(sid)          # releases the only episode
+        drip(sid)          # vault empty + series ended -> straight back
+    assert (anim / 'Cartoon Show').exists() and not (harness.pool / 'Cartoon Show').exists()
+    assert (harness.pool / 'Live Show').exists() and not (anim / 'Live Show').exists()
+
+
+def test_older_shows_without_a_stored_pool_use_the_genre_rule(harness, monkeypatch):
+    anim = _with_animation_pool(harness, monkeypatch)
+    monkeypatch.setattr(unbinge, 'get_genre_data_for_tvdb_id',
+                        lambda conn, tid: {'genres': ['animation'] if tid == 7 else ['drama'], 'poster_url': ''})
+    cartoon = {'show_name': 'C', 'tvdb_id': 7, 'tags': '', 'pool_dir': None}
+    live = {'show_name': 'L', 'tvdb_id': 8, 'tags': '', 'pool_dir': None}
+    tagged = {'show_name': 'T', 'tvdb_id': None, 'tags': 'anime, kids', 'pool_dir': None}
+    assert unbinge.return_pool_dir(cartoon) == str(anim)
+    assert unbinge.return_pool_dir(live) == unbinge.POOL_DIR
+    assert unbinge.return_pool_dir(tagged) == str(anim)
+
+
+def test_without_an_animation_pool_everything_uses_pool_dir(harness, monkeypatch):
+    monkeypatch.setattr(unbinge, 'ANIMATION_POOL_DIR', '')
+    assert unbinge.pool_dirs() == [unbinge.POOL_DIR]
+    assert unbinge.return_pool_dir({'show_name': 'C', 'tags': 'anime', 'pool_dir': None}) == unbinge.POOL_DIR
+
+
+def test_pool_page_and_search_list_both_folders(harness, monkeypatch, client):
+    anim = _with_animation_pool(harness, monkeypatch)
+    _make_in(anim, 'Cartoon Show')
+    _make_in(harness.pool, 'Live Show')
+    body = client.get('/pool').get_data(as_text=True)
+    assert 'Cartoon Show' in body and 'Live Show' in body and 'animation' in body
+    names = client.get('/api/pool').get_json()
+    flat = names if isinstance(names, list) else names.get('shows', names)
+    assert 'Cartoon Show' in str(flat) and 'Live Show' in str(flat)
+
+
+def test_upgrading_a_v15_database_adds_the_pool_dir_column(harness):
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"ALTER TABLE {unbinge.TABLE_NAME} DROP COLUMN pool_dir")
+        conn.execute(f"UPDATE {unbinge.SETTINGS_TABLE} SET value = '15' WHERE key = 'schema_version'")
+        conn.commit()
+    unbinge.init_db()
+    with closing(unbinge.get_db()) as conn:
+        cols = {r['name'] for r in conn.execute(f"PRAGMA table_info({unbinge.TABLE_NAME})")}
+    assert 'pool_dir' in cols

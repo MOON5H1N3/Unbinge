@@ -203,6 +203,9 @@ app.secret_key = _get_or_create_secret_key()
 POOL_DIR = os.environ.get('POOL_DIR', '/media/A/TV100')
 VAULT_DIR = os.environ.get('VAULT_DIR', '/media/vault')
 PLEX_BASE_DIR = os.environ.get('PLEX_BASE_DIR', '/media/private_tv')
+# Optional second pool for animated shows. Animated shows are promoted from it
+# and returned to it; everything else uses POOL_DIR. Leave unset to use one pool.
+ANIMATION_POOL_DIR = os.environ.get('ANIMATION_POOL_DIR', '').strip()
 
 PLEX_URL = os.environ.get('PLEX_URL')
 PLEX_TOKEN = os.environ.get('PLEX_TOKEN')
@@ -228,7 +231,7 @@ TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 # graduates back to the pool, so nothing is lost - they just don't get a slot.
 SPECIALS_SEASON = 0
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEDULER_JOB_ID = 'daily_drip_check'
 DIGEST_JOB_ID = 'daily_digest'
@@ -1391,6 +1394,68 @@ def _genre_is_cached(conn, tvdb_id):
     return bool(row) and _genre_cache_is_fresh(row['cached_at'])
 
 
+def pool_dirs():
+    """The configured pool folders: POOL_DIR first, then the animation pool if
+    one is set and differs."""
+    dirs = [POOL_DIR]
+    if ANIMATION_POOL_DIR and os.path.normpath(ANIMATION_POOL_DIR) != os.path.normpath(POOL_DIR):
+        dirs.append(ANIMATION_POOL_DIR)
+    return dirs
+
+
+def list_pool_folders():
+    """[(folder_name, pool_dir)] across every pool, sorted by name. If the same
+    name is in both pools the first (POOL_DIR) wins."""
+    seen, out = set(), []
+    for pool in pool_dirs():
+        if not os.path.isdir(pool):
+            continue
+        try:
+            names = [d for d in os.listdir(pool) if os.path.isdir(os.path.join(pool, d))]
+        except OSError as e:
+            log.error("Could not read pool directory %s: %s", pool, e)
+            continue
+        for n in names:
+            if n.lower() not in seen:
+                seen.add(n.lower())
+                out.append((n, pool))
+    return sorted(out, key=lambda x: x[0].lower())
+
+
+def find_pool_for(show_name):
+    """The pool folder that contains a directory called show_name, or None."""
+    for pool in pool_dirs():
+        if os.path.isdir(os.path.join(pool, show_name)):
+            return pool
+    return None
+
+
+def show_is_animated(show):
+    """Animated by TVDB genre ('animation'/'anime') or by your own tag."""
+    tags = {t.lower() for t in parse_tags(show.get('tags') or '')}
+    if tags & {'animation', 'animated', 'anime'}:
+        return True
+    if show.get('tvdb_id'):
+        try:
+            with closing(get_db()) as conn:
+                genres = set(get_genre_data_for_tvdb_id(conn, show['tvdb_id']).get('genres', []))
+            return bool(genres & {'animation', 'anime'})
+        except Exception as e:
+            log.warning("Could not check genres for '%s': %s", show.get('show_name'), e)
+    return False
+
+
+def return_pool_dir(show):
+    """Where a finished or removed show's folder goes back to: the pool it was
+    promoted from, else the animation pool for animated shows, else POOL_DIR."""
+    stored = show.get('pool_dir')
+    if stored and stored in pool_dirs():
+        return stored
+    if ANIMATION_POOL_DIR and show_is_animated(show):
+        return pool_dirs()[-1]
+    return POOL_DIR
+
+
 def get_recommendations_for_show(show_id, today=None):
     """The recommendation logic behind /api/recommendations/<id>: genre-
     overlap matches for show_id, drawn only from POOL_DIR (shows you
@@ -1428,14 +1493,7 @@ def get_recommendations_for_show(show_id, today=None):
                 'message': "TVDB doesn't list any genres for this show, so nothing to match against yet.",
             }
 
-        pool_shows = []
-        if os.path.exists(POOL_DIR):
-            try:
-                pool_shows = sorted(
-                    d for d in os.listdir(POOL_DIR) if os.path.isdir(os.path.join(POOL_DIR, d))
-                )
-            except OSError as e:
-                log.error("Could not read pool directory for recommendations: %s", e)
+        pool_shows = [n for n, _pool in list_pool_folders()]
 
         queued = {r['show_name'].lower() for r in conn.execute(
             f"SELECT show_name FROM {QUEUE_TABLE} WHERE triggered_at IS NULL").fetchall()}
@@ -2303,6 +2361,9 @@ def run_migrations(conn):
     if current < 15:
         _migrate_v15_target_end_date(conn)
 
+    if current < 16:
+        _migrate_v16_pool_dir(conn)
+
     conn.execute(
         f"INSERT INTO {SETTINGS_TABLE} (key, value) VALUES ('schema_version', ?) "
         f"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2499,6 +2560,16 @@ def _migrate_v15_target_end_date(conn):
     if 'plan_mode' not in existing_cols:
         conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN plan_mode TEXT;")
         log.info("Added plan_mode column.")
+
+
+def _migrate_v16_pool_dir(conn):
+    """Which pool folder a show was promoted from, so it goes back to the same
+    one (TV100 vs the animation folder). NULL on shows added earlier, which
+    fall back to the genre rule in return_pool_dir()."""
+    existing_cols = {r['name'] for r in conn.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall()}
+    if 'pool_dir' not in existing_cols:
+        conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN pool_dir TEXT;")
+        log.info("Added pool_dir column.")
 
 
 def _migrate_v9_tags_column(conn):
@@ -3127,9 +3198,9 @@ def preview_show_drip(show):
         if ready and ready > today_local():
             ended, source = series_known_ended(show)
             if ended:
-                return {'action': 'graduate', 'detail': f"{source} says the series has ended - would return to {POOL_DIR} without waiting"}
+                return {'action': 'graduate', 'detail': f"{source} says the series has ended - would return to {return_pool_dir(show)} without waiting"}
             return {'action': 'cooldown', 'detail': f"Still cooling down until {ready.isoformat()} - would not graduate yet"}
-        return {'action': 'graduate', 'detail': f"Would move the completed folder back to {POOL_DIR}"}
+        return {'action': 'graduate', 'detail': f"Would move the completed folder back to {return_pool_dir(show)}"}
 
     target_eps, batch = compute_next_batch(
         show['vault_path'], dripped, show['episodes_per_drop'], excluded
@@ -3379,7 +3450,7 @@ def _graduate_show(conn, show):
     show_name = show['show_name']
     cursor = conn.cursor()
     log.info("'%s' finished its cooldown - graduating back to the pool.", show_name)
-    dest = os.path.join(POOL_DIR, show_name)
+    dest = os.path.join(return_pool_dir(show), show_name)
     # Specials ride along here: they were never dripped, but
     # merge_directory sweeps the whole vault folder, so they rejoin
     # the show in the pool rather than being stranded.
@@ -4900,16 +4971,9 @@ def pool_page():
     poster_by_show = {s['show_name']: s.get('poster_url') for s in shows}
 
     entries = []
-    pool_exists = os.path.exists(POOL_DIR)
+    pool_exists = any(os.path.exists(d) for d in pool_dirs())
     if pool_exists:
-        try:
-            names = sorted(
-                (d for d in os.listdir(POOL_DIR) if os.path.isdir(os.path.join(POOL_DIR, d))),
-                key=str.lower,
-            )
-        except Exception as e:
-            log.error("Could not read pool directory: %s", e)
-            names = []
+        names = list_pool_folders()
 
         # Already-added shows already have a poster cached on the show
         # record - free. A not-yet-added folder needs a TVDB lookup, which
@@ -4918,7 +4982,7 @@ def pool_page():
         # capped per request rather than run against the whole pool at once.
         scanned = 0
         with closing(get_db()) as conn:
-            for name in names:
+            for name, pool in names:
                 if query_lower and query_lower not in name.lower():
                     continue
                 already_added = name in active_names
@@ -4931,14 +4995,15 @@ def pool_page():
                     poster_url = ''
                 entries.append({
                     'name': name,
-                    'episode_count': count_video_files(os.path.join(POOL_DIR, name)),
+                    'episode_count': count_video_files(os.path.join(pool, name)),
                     'already_added': already_added,
                     'poster_url': poster_url,
+                    'pool': 'animation' if (ANIMATION_POOL_DIR and pool == pool_dirs()[-1] and len(pool_dirs()) > 1) else '',
                 })
 
     return render_template(
         'pool.html', entries=entries, query=query,
-        pool_exists=pool_exists, pool_dir=POOL_DIR,
+        pool_exists=pool_exists, pool_dir=' + '.join(pool_dirs()),
     )
 
 
@@ -5038,12 +5103,7 @@ def stats_page():
 def get_pool():
     query = request.args.get('q', '').lower()
 
-    pool_shows = []
-    if os.path.exists(POOL_DIR):
-        try:
-            pool_shows = [d for d in os.listdir(POOL_DIR) if os.path.isdir(os.path.join(POOL_DIR, d))]
-        except Exception as e:
-            log.error("Could not read pool directory: %s", e)
+    pool_shows = [n for n, _pool in list_pool_folders()]
 
     if query:
         filtered = [s for s in pool_shows if query in s.lower()]
@@ -5105,7 +5165,7 @@ def api_plan_options():
     else:
         folder = request.args.get('show', '').strip()
         try:
-            source_dir = safe_show_path(POOL_DIR, folder)
+            source_dir = safe_show_path(find_pool_for(folder) or POOL_DIR, folder)
         except ValueError:
             return jsonify({'status': 'error', 'message': 'unknown show.'}), 400
         remaining_files = remaining_episode_files(source_dir, set(), frozenset())
@@ -5274,7 +5334,7 @@ def api_inspect():
         return jsonify({"status": "error", "message": "show is required"}), 400
 
     try:
-        source_dir = safe_show_path(POOL_DIR, show_name)
+        source_dir = safe_show_path(find_pool_for(show_name) or POOL_DIR, show_name)
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
@@ -5345,7 +5405,8 @@ def promote_show_internal(show_name, release_days_str, episodes_per_drop, target
     as a 400 client error instead of a 500, since its message happened not
     to contain that substring."""
     try:
-        source_dir = safe_show_path(POOL_DIR, show_name)
+        source_pool = find_pool_for(show_name) or POOL_DIR
+        source_dir = safe_show_path(source_pool, show_name)
         vault_path = safe_show_path(VAULT_DIR, show_name)
         plex_path = safe_show_path(PLEX_BASE_DIR, show_name)
     except ValueError as e:
@@ -5387,10 +5448,10 @@ def promote_show_internal(show_name, release_days_str, episodes_per_drop, target
         cursor.execute(f"""
             INSERT INTO {TABLE_NAME}
                 (show_name, vault_path, plex_path, release_day, release_days, current_season,
-                 current_episode, episodes_per_drop, last_run_date, target_end_date, plan_mode)
-            VALUES (?, ?, ?, ?, ?, 1, 0, ?, NULL, ?, ?)
+                 current_episode, episodes_per_drop, last_run_date, target_end_date, plan_mode, pool_dir)
+            VALUES (?, ?, ?, ?, ?, 1, 0, ?, NULL, ?, ?, ?)
         """, (show_name, vault_path, plex_path, release_day_ints[0], release_days_str, episodes_per_drop,
-              target_iso, plan_mode))
+              target_iso, plan_mode, source_pool))
         new_id = cursor.lastrowid
 
         try:
@@ -5797,7 +5858,7 @@ def api_bulk_delete():
                 continue
             show = dict(row)
             try:
-                dest = safe_show_path(POOL_DIR, show['show_name'])
+                dest = safe_show_path(return_pool_dir(show), show['show_name'])
             except ValueError:
                 failed += 1
                 continue
@@ -6192,7 +6253,7 @@ def api_add_to_queue(show_id):
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
-    if not os.path.isdir(os.path.join(POOL_DIR, show_name)):
+    if not find_pool_for(show_name):
         return jsonify({"status": "error", "message": f"'{show_name}' was not found in the pool directory"}), 404
 
     with closing(get_db()) as conn:
@@ -6451,7 +6512,7 @@ def delete_show(show_id):
                 delete_cached_poster(show.get('poster_url'))
 
                 try:
-                    dest = safe_show_path(POOL_DIR, show['show_name'])
+                    dest = safe_show_path(return_pool_dir(show), show['show_name'])
                 except ValueError:
                     log.error(
                         "Refusing to delete show %d: stored show_name '%s' does "

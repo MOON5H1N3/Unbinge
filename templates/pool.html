@@ -30,7 +30,7 @@
         {% endif %}
         <div class="pool-card-body">
             <div class="pool-card-title">{{ entry.name }}</div>
-            <div class="pool-card-meta">{{ entry.episode_count }} episode{{ 's' if entry.episode_count != 1 }}</div>
+            <div class="pool-card-meta">{{ entry.episode_count }} episode{{ 's' if entry.episode_count != 1 }}{% if entry.pool %} · {{ entry.pool }}{% endif %}</div>
         </div>
         {% if entry.already_added %}
         <span class="pill pill-complete">already dripping</span>
