@@ -12,9 +12,16 @@
 {% block content %}
 <div class="page-header">
     <h1 class="mast">series</h1>
-    <button type="button" class="btn btn-primary" onclick="openPoolModal()">{{ icon('plus', 14) }}add series</button>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        {% if shows|length > 1 %}<button type="button" class="btn" id="balanceWeekBtn" onclick="balanceWeek()">{{ icon('calendar', 14) }}balance the week</button>{% endif %}
+        <button type="button" class="btn btn-primary" onclick="openPoolModal()">{{ icon('plus', 14) }}add series</button>
+    </div>
 </div>
 
+{% if ending_notice %}
+<div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>nothing is queued to follow
+    {% for e in ending_notice[:3] %}<a href="/show/{{ e.id }}" style="color:inherit; font-weight:600;">{{ e.name }}</a>{% if e.state == 'finished' %} (finished){% elif e.ends %} (ends {{ e.ends }}){% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if ending_notice|length > 3 %} and {{ ending_notice|length - 3 }} more{% endif %}.</span></div>
+{% endif %}
 {% if missed_run_notice %}
 <div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>{{ missed_run_notice }}</span></div>
 {% endif %}
@@ -410,6 +417,76 @@ async function bulkAction(action) {
         setTimeout(() => window.location.reload(), 700);
     } catch (err) {
         unbingeToast('network error during bulk action.', 'error');
+    }
+}
+
+async function balanceWeek() {
+    const btn = document.getElementById('balanceWeekBtn');
+    btn.disabled = true;
+    try {
+        const res = await fetch('/api/balance-week', { method: 'POST' });
+        const plan = await res.json();
+        if (!res.ok) { unbingeToast(plan.message || 'that failed.', 'error'); return; }
+        if (!plan.moves.length) { unbingeToast('your week is already well balanced - nothing to move.', 'success'); return; }
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay open';
+        const box = document.createElement('div');
+        box.className = 'modal-box';
+        box.style.maxWidth = '560px';
+        const h = document.createElement('h3');
+        h.textContent = 'balance the week: ' + plan.moves.length + ' show' + (plan.moves.length === 1 ? '' : 's') + ' would move';
+        const intro = document.createElement('p');
+        intro.textContent = 'this spreads shows across the week and keeps similar ones apart. only release days change; no files move. each show is listed with why.';
+        const load = document.createElement('div');
+        load.className = 'balance-load';
+        plan.days.forEach((d, i) => {
+            const cell = document.createElement('div');
+            const name = document.createElement('span'); name.textContent = d;
+            const nums = document.createElement('strong'); nums.textContent = plan.before[i] + ' → ' + plan.after[i];
+            cell.append(name, nums);
+            load.append(cell);
+        });
+        const list = document.createElement('div');
+        list.className = 'balance-moves';
+        plan.moves.forEach(m => {
+            const row = document.createElement('div');
+            row.className = 'balance-move';
+            const top = document.createElement('div');
+            const n = document.createElement('strong'); n.textContent = m.name;
+            const d = document.createElement('span'); d.textContent = ' ' + plan.days[m.from] + ' → ' + plan.days[m.to];
+            top.append(n, d);
+            const why = document.createElement('div');
+            why.className = 'cell-faint'; why.textContent = m.why;
+            row.append(top, why);
+            list.append(row);
+        });
+        const actions = document.createElement('div');
+        actions.className = 'modal-actions';
+        const cancel = document.createElement('button');
+        cancel.type = 'button'; cancel.className = 'btn-secondary'; cancel.textContent = 'cancel';
+        const go = document.createElement('button');
+        go.type = 'button'; go.className = 'btn-primary'; go.textContent = 'apply ' + plan.moves.length + ' move' + (plan.moves.length === 1 ? '' : 's');
+        actions.append(cancel, go);
+        box.append(h, intro, load, list, actions);
+        overlay.append(box);
+        document.body.append(overlay);
+        const close = () => overlay.remove();
+        cancel.addEventListener('click', close);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+        go.addEventListener('click', async () => {
+            go.disabled = true; cancel.disabled = true; go.textContent = 'working…';
+            const f = new FormData(); f.append('confirm', '1');
+            const r = await fetch('/api/balance-week', { method: 'POST', body: f });
+            const data = await r.json().catch(() => ({}));
+            unbingeToast(data.message || (r.ok ? 'done.' : 'that failed.'), r.ok ? 'success' : 'error');
+            close();
+            if (r.ok) setTimeout(() => window.location.reload(), 700);
+        });
+    } catch (err) {
+        unbingeToast('network error.', 'error');
+    } finally {
+        btn.disabled = false;
     }
 }
 

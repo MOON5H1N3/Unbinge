@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -993,6 +994,24 @@ def tvdb_get_series_genres(tvdb_id):
     return _extract_tvdb_genres(series), poster_url, None
 
 
+def tvdb_get_series_status(tvdb_id):
+    """TVDB's airing status for a series, lower-cased ('ended', 'continuing',
+    'upcoming'), or '' when unknown. Returns (status, error|None)."""
+    token, err = tvdb_get_token()
+    if not token:
+        return '', err
+    try:
+        resp = requests.get(f'{TVDB_BASE_URL}/series/{tvdb_id}/extended',
+                            headers={'Authorization': f'Bearer {token}'}, timeout=15)
+        resp.raise_for_status()
+        status = (resp.json().get('data') or {}).get('status') or {}
+        name = status.get('name') if isinstance(status, dict) else status
+        return str(name or '').strip().lower(), None
+    except (requests.RequestException, ValueError) as e:
+        log.error("TVDB status fetch failed for id %s: %s", tvdb_id, e)
+        return '', f"TVDB status fetch failed: {e}"
+
+
 # Recommendations are matched purely against your own pool - shows already
 # sitting on disk, never promoted - never against TVDB's wider catalog, so
 # nothing gets suggested that you don't already have. See
@@ -1090,6 +1109,166 @@ def get_pool_folder_poster(conn, folder_name):
 WEEKDAY_NAMES = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
 
 
+# How strongly two similar shows dislike being near each other in the week,
+# by circular distance in days (same day, next day, two days apart).
+BALANCE_NEARNESS_PENALTY = {0: 6.0, 1: 3.0, 2: 1.0}
+BALANCE_MOVE_COST = 0.5   # each show moved must buy at least this much improvement
+
+
+def _circ_dist(a, b):
+    d = abs(a - b) % 7
+    return min(d, 7 - d)
+
+
+def plan_week_balance(shows=None):
+    """Proposes release-day moves that (1) spread shows evenly over the week
+    so no day piles up, and (2) keep genre-similar shows off the same and
+    neighbouring days. Only shows with a single release day move; daily or
+    multi-day shows stay put but still count towards each day's load, and
+    paused or finished shows are ignored. Each move must earn at least
+    BALANCE_MOVE_COST, so a week that is already fine is left alone.
+
+    Returns {'moves': [{'id','name','from','to','why'}], 'before': [7 counts],
+    'after': [7 counts], 'movable': n}. Nothing is changed."""
+    shows = load_shows() if shows is None else shows
+    active = [sh for sh in shows if not sh['paused'] and not sh['completed_at']]
+    days_of = {sh['id']: sorted(set(parse_release_days(sh['release_days']))) for sh in active}
+    movable = [sh for sh in active if len(days_of[sh['id']]) == 1]
+
+    genres = {}
+    with closing(get_db()) as conn:
+        for sh in active:
+            g = set()
+            if sh.get('tvdb_id'):
+                try:
+                    g = set(get_genre_data_for_tvdb_id(conn, sh['tvdb_id']).get('genres', []))
+                except Exception as e:
+                    log.warning("Genres unavailable for '%s' while balancing: %s", sh['show_name'], e)
+            genres[sh['id']] = g
+    # Genres on most shows (drama, comedy) say nothing about similarity.
+    counts = {}
+    for g in genres.values():
+        for x in g:
+            counts[x] = counts.get(x, 0) + 1
+    common = {x for x, n in counts.items() if active and n / len(active) > 0.5}
+    distinct = {i: g - common for i, g in genres.items()}
+
+    def sim(i, j):
+        a, b = distinct[i], distinct[j]
+        return len(a & b) / len(a | b) if a and b else 0.0
+
+    ids = [sh['id'] for sh in active]
+    name = {sh['id']: sh['show_name'] for sh in active}
+    orig = {i: days_of[i][0] for i in days_of if len(days_of[i]) == 1}
+    pos = {i: list(days_of[i]) for i in ids}          # days each show currently occupies
+    start_pos = {i: list(days_of[i]) for i in ids}    # where everything started, for the explanations
+    sims = {(i, j): sim(i, j) for i in ids for j in ids if i != j}
+
+    W = BALANCE_NEARNESS_PENALTY
+
+    def near_pen(d, j):
+        """Penalty for sitting on day d next to show j wherever j drops."""
+        return max(W.get(_circ_dist(d, dj), 0.0) for dj in pos[j])
+
+    load = [0] * 7
+    for i in ids:
+        for d in pos[i]:
+            load[d] += 1
+    before = list(load)
+    mov_ids = sorted((sh['id'] for sh in movable), key=lambda i: name[i].lower())
+    similar = {i: [j for j in ids if j != i and sims[(i, j)] > 0] for i in ids}
+    # pen[i][d]: total similarity penalty for show i if it sat on day d.
+    pen = {i: [sum(sims[(i, j)] * near_pen(d, j) for j in similar[i]) for d in range(7)] for i in ids}
+
+    def relocate(m, b):
+        """Move single-day show m to day b, keeping load and pen up to date."""
+        a = pos[m][0]
+        load[a] -= 1
+        load[b] += 1
+        old = [near_pen(d, m) for d in range(7)]
+        pos[m] = [b]
+        new = [near_pen(d, m) for d in range(7)]
+        for i in similar[m]:
+            for d in range(7):
+                pen[i][d] += sims[(i, m)] * (new[d] - old[d])
+
+    for _ in range(400):
+        best, best_delta = None, -1e-9
+        for i in mov_ids:
+            a = pos[i][0]
+            for b in range(7):
+                if b == a:
+                    continue
+                delta = ((load[b] + 1) ** 2 - load[b] ** 2) + ((load[a] - 1) ** 2 - load[a] ** 2)
+                delta += pen[i][b] - pen[i][a]
+                delta += BALANCE_MOVE_COST * ((b != orig[i]) - (a != orig[i]))
+                if delta < best_delta - 1e-9:
+                    best, best_delta = ('move', i, b), delta
+        for x in range(len(mov_ids)):
+            for y in range(x + 1, len(mov_ids)):
+                i, j = mov_ids[x], mov_ids[y]
+                a, b = pos[i][0], pos[j][0]
+                if a == b:
+                    continue
+                sij = sims[(i, j)]
+                delta = (pen[i][b] - pen[i][a] + pen[j][a] - pen[j][b]
+                         + 2 * sij * (W.get(_circ_dist(a, b), 0.0) - W[0]))
+                delta += BALANCE_MOVE_COST * ((b != orig[i]) - (a != orig[i]) + (a != orig[j]) - (b != orig[j]))
+                if delta < best_delta - 1e-9:
+                    best, best_delta = ('swap', i, j), delta
+        if not best:
+            break
+        if best[0] == 'move':
+            relocate(best[1], best[2])
+        else:
+            _, i, j = best
+            a, b = pos[i][0], pos[j][0]
+            relocate(i, b)
+            relocate(j, a)
+
+    moves = []
+    for i in mov_ids:
+        a, b = orig[i], pos[i][0]
+        if a == b:
+            continue
+        reasons = []
+        if before[a] >= before[b] + 2:
+            reasons.append(f"{WEEKDAY_NAMES[a]} had {before[a]} shows, {WEEKDAY_NAMES[b]} had {before[b]}")
+        # strongest similar show it used to sit close to
+        was_near = lambda j: max(W.get(_circ_dist(a, dj), 0.0) for dj in start_pos[j])
+        worst = max((j for j in similar[i] if was_near(j) > 0),
+                    key=lambda j: sims[(i, j)] * was_near(j), default=None)
+        if worst is not None:
+            shared = sorted(distinct[i] & distinct[worst])
+            reasons.append(f"was {'on the same day as' if was_near(worst) >= W[0] else 'near'} {name[worst]} ({', '.join(shared)})")
+        moves.append({'id': i, 'name': name[i], 'from': a, 'to': b,
+                      'why': '; '.join(reasons) or 'evens out the week'})
+    return {'moves': moves, 'before': before, 'after': load, 'movable': len(movable)}
+
+
+@app.route('/api/balance-week', methods=['POST'])
+def api_balance_week():
+    """Preview (default) or apply (confirm=1) the proposed release-day moves."""
+    plan = plan_week_balance()
+    plan['days'] = WEEKDAY_NAMES
+    if request.form.get('confirm') != '1' and not (request.get_json(silent=True) or {}).get('confirm'):
+        return jsonify({"status": "success", **plan})
+    applied = 0
+    with closing(get_db()) as conn:
+        for m in plan['moves']:
+            row = conn.execute(f"SELECT show_name, release_days FROM {TABLE_NAME} WHERE id = ?", (m['id'],)).fetchone()
+            if not row or sorted(set(parse_release_days(row['release_days']))) != [m['from']]:
+                continue   # changed since the preview - leave it alone
+            conn.execute(f"UPDATE {TABLE_NAME} SET release_day = ?, release_days = ? WHERE id = ?",
+                         (m['to'], str(m['to']), m['id']))
+            log_history(conn, m['id'], row['show_name'], 'edited',
+                        f"balanced the week: {WEEKDAY_NAMES[m['from']]} -> {WEEKDAY_NAMES[m['to']]}")
+            applied += 1
+        conn.commit()
+    sync_discord_schedule_message_async()
+    return jsonify({"status": "success", "message": f"Moved {applied} show{'s' if applied != 1 else ''}.", "applied": applied})
+
+
 def suggest_release_day(candidate_genres=None):
     """Picks a weekday for a show being added, instead of the form always
     landing on the same hardcoded default regardless of what's already
@@ -1141,16 +1320,95 @@ def suggest_release_day(candidate_genres=None):
     return best_day, reason
 
 
-def get_recommendations_for_show(show_id):
+# Gentle seasonal nudges for the "up next" suggestions. Each theme is active
+# between two (month, day) dates (the window may wrap past New Year) and
+# favours pool shows that either carry one of its TVDB genres or have a
+# matching word in the folder name. It only adds to a show's score; a strong
+# genre match with the show that's ending can still outrank it.
+SEASONAL_BONUS = 2   # events (Halloween, Christmas, Valentine's)
+SEASON_BONUS = 1     # the broad seasons: only a nudge among shows that already match
+SEASONAL_MAX_SLOTS = 2
+# Events come first and win over the broad season they fall inside. Windows are
+# (month, day) pairs and may wrap past New Year. Seasons are northern-hemisphere.
+SEASONAL_THEMES = [
+    {'label': 'Halloween', 'start': (9, 20), 'end': (11, 1), 'bonus': SEASONAL_BONUS, 'include_unmatched': True,
+     'genres': {'horror', 'thriller', 'mystery', 'supernatural', 'suspense'},
+     'words': ('halloween', 'haunt', 'ghost', 'witch', 'vampire', 'zombie', 'horror', 'scream', 'creep', 'nightmare', 'monster')},
+    {'label': 'Christmas', 'start': (11, 25), 'end': (1, 2), 'bonus': SEASONAL_BONUS, 'include_unmatched': True,
+     'genres': {'family', 'holiday'},
+     'words': ('christmas', 'xmas', 'holiday', 'santa')},
+    {'label': "Valentine's", 'start': (2, 1), 'end': (2, 14), 'bonus': SEASONAL_BONUS, 'include_unmatched': True,
+     'genres': {'romance'},
+     'words': ('love', 'romance', 'valentine')},
+    {'label': 'Spring', 'start': (3, 1), 'end': (5, 31), 'bonus': SEASON_BONUS, 'include_unmatched': False,
+     'genres': {'comedy', 'romance', 'family', 'animation'}, 'words': ()},
+    {'label': 'Summer', 'start': (6, 1), 'end': (8, 31), 'bonus': SEASON_BONUS, 'include_unmatched': False,
+     'genres': {'adventure', 'action', 'comedy', 'travel', 'reality'}, 'words': ()},
+    {'label': 'Autumn', 'start': (9, 1), 'end': (11, 30), 'bonus': SEASON_BONUS, 'include_unmatched': False,
+     'genres': {'drama', 'mystery', 'crime', 'thriller'}, 'words': ()},
+    {'label': 'Winter', 'start': (12, 1), 'end': (2, 29), 'bonus': SEASON_BONUS, 'include_unmatched': False,
+     'genres': {'drama', 'fantasy', 'family', 'science fiction', 'history'}, 'words': ()},
+]
+
+
+def current_seasonal_theme(today=None):
+    """The seasonal theme active on `today` (default: today), or None."""
+    today = today or today_local()
+    md = (today.month, today.day)
+    for theme in SEASONAL_THEMES:
+        start, end = theme['start'], theme['end']
+        if (start <= md <= end) if start <= end else (md >= start or md <= end):
+            return theme
+    return None
+
+
+def _seasonal_hit(theme, folder_name, genres):
+    if not theme:
+        return False
+    if theme['genres'] & set(genres):
+        return True
+    if not theme['words']:
+        return False
+    pattern = r'\b(?:' + '|'.join(re.escape(w) for w in theme['words']) + ')'
+    return re.search(pattern, folder_name, re.IGNORECASE) is not None
+
+
+def _rotation_key(name, today):
+    """A stable-for-the-week pseudo-random number per show, so ties between
+    equally good suggestions reshuffle each week instead of always favouring
+    the start of the alphabet."""
+    iso = today.isocalendar()
+    return int(hashlib.md5(f"{name}|{iso[0]}-{iso[1]}".encode()).hexdigest()[:8], 16)
+
+
+def _pool_folder_is_cached(conn, folder_name):
+    row = conn.execute(f"SELECT cached_at FROM {POOL_TVDB_CACHE_TABLE} WHERE folder_name = ?", (folder_name,)).fetchone()
+    return bool(row) and _genre_cache_is_fresh(row['cached_at'])
+
+
+def _genre_is_cached(conn, tvdb_id):
+    row = conn.execute(f"SELECT cached_at FROM {TVDB_GENRE_CACHE_TABLE} WHERE tvdb_id = ?", (tvdb_id,)).fetchone()
+    return bool(row) and _genre_cache_is_fresh(row['cached_at'])
+
+
+def get_recommendations_for_show(show_id, today=None):
     """The recommendation logic behind /api/recommendations/<id>: genre-
     overlap matches for show_id, drawn only from POOL_DIR (shows you
     actually have, just not promoted yet - never TVDB's wider catalog).
 
-    Returns a dict: {'status': 'ok', 'anchor_genres': [...],
-    'recommendations': [{'name', 'genres', 'matched_genres', 'poster_url'}, ...],
-    'scanned': int, 'pool_total': int} on success, or
-    {'status': 'no_tvdb_link' | 'no_genres', 'message': ...} when there's
-    nothing to match against yet."""
+    Every pool folder already in the cache is considered on every call. Only
+    folders that need a fresh TVDB lookup count against
+    POOL_RECOMMENDATION_SCAN_CAP, so a big pool fills in over a few page
+    loads instead of being stuck on its first 40 folders. Anything already
+    queued is left out. Ranking: 2 points per distinguishing genre shared
+    with this show, 1 per generic one, plus a seasonal bonus; ties are
+    ordered by a weekly-rotating key rather than alphabetically.
+
+    Returns {'status': 'ok', 'anchor_genres', 'recommendations': [{'name',
+    'genres', 'matched_genres', 'poster_url', 'season'}], 'season': label|None,
+    'scanned', 'pool_total', 'unindexed'} or {'status': 'no_tvdb_link' |
+    'no_genres' | 'not_found', 'message'}."""
+    today = today or today_local()
     with closing(get_db()) as conn:
         show = conn.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
         if not show:
@@ -1179,30 +1437,35 @@ def get_recommendations_for_show(show_id):
             except OSError as e:
                 log.error("Could not read pool directory for recommendations: %s", e)
 
+        queued = {r['show_name'].lower() for r in conn.execute(
+            f"SELECT show_name FROM {QUEUE_TABLE} WHERE triggered_at IS NULL").fetchall()}
+
         anchor_set = set(anchor_genres)
-        candidates = []  # every resolved pool folder, whether or not it matched - needed below to tell a common genre from a rare one
-        scanned = 0
+        candidates = []  # every resolved pool folder, matched or not - needed to tell a common genre from a rare one
+        fetches = unindexed = 0
         for folder in pool_shows:
-            if scanned >= POOL_RECOMMENDATION_SCAN_CAP:
-                # Bounds worst-case TVDB call volume on a cold cache for a
-                # big pool. Whatever got resolved this call is cached, so a
-                # second page load picks up where this one left off and a
-                # fully-cached pool never hits this limit at all.
-                break
+            if folder.lower() in queued:
+                continue
+            if not _pool_folder_is_cached(conn, folder):
+                if fetches >= POOL_RECOMMENDATION_SCAN_CAP:
+                    unindexed += 1
+                    continue
+                fetches += 1
             candidate_tvdb_id = resolve_pool_folder_tvdb_id(conn, folder)
-            scanned += 1
             if not candidate_tvdb_id:
                 continue
+            if not _genre_is_cached(conn, candidate_tvdb_id):
+                if fetches >= POOL_RECOMMENDATION_SCAN_CAP:
+                    unindexed += 1
+                    continue
+                fetches += 1
             candidate_data = get_genre_data_for_tvdb_id(conn, candidate_tvdb_id)
             candidates.append({'name': folder, 'genres': candidate_data['genres'], 'poster_url': candidate_data['poster_url']})
 
         # "drama"/"comedy" sit on nearly every show, so matching on them
-        # alone says almost nothing about THIS anchor specifically - without
-        # this, the same genre-rich shows would win regardless of what
-        # you're viewing, which is exactly what was happening before. A
-        # genre counts as "generic" once more than GENERIC_GENRE_THRESHOLD
-        # of your resolved pool carries it; generic matches still count,
-        # just after every candidate's rarer, more distinguishing matches.
+        # alone says little about THIS anchor. A genre counts as "generic"
+        # once more than GENERIC_GENRE_THRESHOLD of your resolved pool
+        # carries it; generic matches still count, but for less.
         pool_size = len(candidates) or 1
         genre_pool_counts = {}
         for c in candidates:
@@ -1210,33 +1473,70 @@ def get_recommendations_for_show(show_id):
                 genre_pool_counts[g] = genre_pool_counts.get(g, 0) + 1
         generic_genres = {g for g, n in genre_pool_counts.items() if (n / pool_size) > GENERIC_GENRE_THRESHOLD}
 
+        theme = current_seasonal_theme(today)
         scored = []
         for c in candidates:
             matched = anchor_set & set(c['genres'])
-            if not matched:
+            seasonal = _seasonal_hit(theme, c['name'], c['genres'])
+            if not matched and not (seasonal and theme['include_unmatched']):
                 continue
             specific_matches = sorted(matched - generic_genres)
             generic_matches = sorted(matched & generic_genres)
+            score = 2 * len(specific_matches) + len(generic_matches) + (theme['bonus'] if seasonal else 0)
             scored.append({
                 'name': c['name'],
                 'genres': sorted(c['genres']),
-                'matched_genres': specific_matches + generic_matches,  # rarer matches listed first
+                'matched_genres': specific_matches + generic_matches,
                 'poster_url': c['poster_url'],
-                '_specific_count': len(specific_matches),
-                '_generic_count': len(generic_matches),
+                'season': theme['label'] if seasonal else None,
+                '_score': score,
             })
 
-        scored.sort(key=lambda r: (-r['_specific_count'], -r['_generic_count'], r['name'].lower()))
+        scored.sort(key=lambda r: (-r['_score'], _rotation_key(r['name'], today)))
         for r in scored:
-            del r['_specific_count'], r['_generic_count']
+            del r['_score']
+        # Keep the nudge gentle: at most SEASONAL_MAX_SLOTS of the five go to
+        # in-season picks while other good matches exist; leftovers backfill.
+        picked, overflow, seasonal_used = [], [], 0
+        for r in scored:
+            if r['season'] and seasonal_used >= SEASONAL_MAX_SLOTS:
+                overflow.append(r)
+                continue
+            seasonal_used += 1 if r['season'] else 0
+            picked.append(r)
+        scored = picked + overflow
 
         return {
             'status': 'ok',
             'anchor_genres': sorted(anchor_genres),
             'recommendations': scored[:5],
-            'scanned': scanned,
+            'season': theme['label'] if theme else None,
+            'scanned': len(candidates),
             'pool_total': len(pool_shows),
+            'unindexed': unindexed,
         }
+
+
+def shows_ending_without_successor(days=21):
+    """Active shows that have finished, or will within `days`, with nothing
+    queued to follow them. Returns [{'id', 'name', 'state', 'ends'}] where
+    state is 'finished' (in cooldown) or 'finishing' and ends is an ISO date
+    or None."""
+    horizon = today_local() + timedelta(days=days)
+    with closing(get_db()) as conn:
+        covered = {r['trigger_show_id'] for r in conn.execute(
+            f"SELECT trigger_show_id FROM {QUEUE_TABLE} WHERE trigger_type = 'after_show' "
+            f"AND triggered_at IS NULL AND trigger_show_id IS NOT NULL").fetchall()}
+    out = []
+    for sh in load_shows():
+        if sh['paused'] or sh['id'] in covered:
+            continue
+        end = sh.get('estimated_end')
+        if sh['completed_at']:
+            out.append({'id': sh['id'], 'name': sh['show_name'], 'state': 'finished', 'ends': None})
+        elif end and end <= horizon:
+            out.append({'id': sh['id'], 'name': sh['show_name'], 'state': 'finishing', 'ends': end.isoformat()})
+    return sorted(out, key=lambda x: (x['state'] != 'finished', x['ends'] or '', x['name'].lower()))
 
 
 def parse_discord_webhook(url):
@@ -2825,6 +3125,9 @@ def preview_show_drip(show):
             return {'action': 'resume', 'detail': f"Cooldown would be cancelled - {len(recheck_remaining)} file(s) found waiting in the vault"}
         ready = cooldown_graduation_date(show['completed_at'])
         if ready and ready > today_local():
+            ended, source = series_known_ended(show)
+            if ended:
+                return {'action': 'graduate', 'detail': f"{source} says the series has ended - would return to {POOL_DIR} without waiting"}
             return {'action': 'cooldown', 'detail': f"Still cooling down until {ready.isoformat()} - would not graduate yet"}
         return {'action': 'graduate', 'detail': f"Would move the completed folder back to {POOL_DIR}"}
 
@@ -3040,10 +3343,83 @@ def get_queue_for_show(show_id):
     return [dict(r) for r in rows]
 
 
-def process_show_drip(conn, show):
+def series_known_ended(show):
+    """Whether we KNOW this series has finished airing, so there is no point
+    waiting out a cooldown for new episodes. Sonarr is asked first (it's the
+    thing that would download new episodes), then TVDB. Returns
+    (ended: bool, source: str|None); (False, None) means 'can't tell', which
+    keeps the normal cooldown."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    key = get_setting('sonarr_api_key', '').strip()
+    if base and key:
+        try:
+            series, _how, _n = sonarr_match_series(
+                sonarr_fetch_series(base, key), show['show_name'], show.get('tvdb_id'),
+                sonarr_translate_path(sonarr_track_path(show)))
+            status = ((series or {}).get('status') or '').lower()
+            if status == 'ended':
+                return True, 'Sonarr'
+            if status in ('continuing', 'upcoming'):
+                return False, 'Sonarr'
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Could not ask Sonarr whether '%s' has ended: %s", show['show_name'], e)
+    if show.get('tvdb_id') and get_setting('tvdb_api_key', '').strip():
+        status, _err = tvdb_get_series_status(show['tvdb_id'])
+        if status == 'ended':
+            return True, 'TVDB'
+        if status:
+            return False, 'TVDB'
+    return False, None
+
+
+def _graduate_show(conn, show):
+    """Sends a finished show's folders back to the pool and removes it from
+    the active list. Returns the result message. On a file lock the row is
+    kept so the next cycle retries."""
+    show_name = show['show_name']
+    cursor = conn.cursor()
+    log.info("'%s' finished its cooldown - graduating back to the pool.", show_name)
+    dest = os.path.join(POOL_DIR, show_name)
+    # Specials ride along here: they were never dripped, but
+    # merge_directory sweeps the whole vault folder, so they rejoin
+    # the show in the pool rather than being stranded.
+    r1 = merge_directory(show['plex_path'], dest)
+    r2 = merge_directory(show['vault_path'], dest)
+    problems = r1['failures'] + r2['failures']
+    conflicts = r1['conflicts'] + r2['conflicts']
+
+    if problems:
+        # Don't delete the row - the show still has files in the old
+        # locations and needs to be retried, not forgotten.
+        msg = (f"'{show_name}' could not fully graduate - "
+               f"{len(problems)} file(s) locked. Will retry next cycle.")
+        log.error(msg)
+        log_history(conn, show['id'], show_name, 'failed', msg)
+        return msg
+
+    detail = f"Returned to {dest}"
+    if conflicts:
+        detail += f" ({len(conflicts)} filename conflict(s) parked in {CONFLICTS_DIRNAME})"
+    clear_dripped(conn, show['id'])
+    cursor.execute(f"DELETE FROM {TABLE_NAME} WHERE id = ?", (show['id'],))
+    log_history(conn, show['id'], show_name, 'graduated', detail)
+    trigger_plex_refresh()
+    msg = f"'{show_name}' graduated back to {dest}"
+    send_notification('graduated', f"🎉 '{show_name}' finished its full run and is back in your main library.", poster_url=show.get('poster_url'))
+    conn.commit()
+    sync_sonarr_path_async(show['id'], show_name, show.get('tvdb_id'), sonarr_track_path(show), dest)
+    check_and_advance_queue(trigger_show_id=show['id'])
+    return msg
+
+
+def process_show_drip(conn, show, skip_cooldown=False):
     """Runs one show's weekly step: either drip the next batch of episodes
     from vault -> plex, mark it complete when the vault runs dry, or (one
-    cycle later) graduate the finished show back to the main pool."""
+    cycle later) graduate the finished show back to the main pool.
+
+    skip_cooldown=True sends a finished show straight back without waiting
+    out the cooldown (used when the series is known to have ended, or when
+    you press 'return to pool now')."""
     show_name = show['show_name']
     cursor = conn.cursor()
 
@@ -3064,47 +3440,16 @@ def process_show_drip(conn, show):
             show = dict(show)
             show['completed_at'] = None
             log_history(conn, show['id'], show_name, 'resumed', 'Episodes reappeared in vault - cooldown cancelled')
-        elif (cooldown_graduation_date(show['completed_at']) or today_local()) > today_local():
+        elif not skip_cooldown and (cooldown_graduation_date(show['completed_at']) or today_local()) > today_local():
             # Still inside the cooldown grace window - a show that's airing on
             # its own schedule may yet gain episodes (the nightly cooldown
             # check will resume it if so).
             ready = cooldown_graduation_date(show['completed_at'])
             return f"'{show_name}' is cooling down until {ready.isoformat()} before returning to the pool"
         else:
-            # Cooldown grace period is over - this scheduled run sends the
+            # Cooldown grace period is over (or skipped) - this run sends the
             # whole show back to the pool.
-            log.info("'%s' finished its cooldown - graduating back to the pool.", show_name)
-            dest = os.path.join(POOL_DIR, show_name)
-            # Specials ride along here: they were never dripped, but
-            # merge_directory sweeps the whole vault folder, so they rejoin
-            # the show in the pool rather than being stranded.
-            r1 = merge_directory(show['plex_path'], dest)
-            r2 = merge_directory(show['vault_path'], dest)
-            problems = r1['failures'] + r2['failures']
-            conflicts = r1['conflicts'] + r2['conflicts']
-
-            if problems:
-                # Don't delete the row - the show still has files in the old
-                # locations and needs to be retried, not forgotten.
-                msg = (f"'{show_name}' could not fully graduate - "
-                       f"{len(problems)} file(s) locked. Will retry next cycle.")
-                log.error(msg)
-                log_history(conn, show['id'], show_name, 'failed', msg)
-                return msg
-
-            detail = f"Returned to {dest}"
-            if conflicts:
-                detail += f" ({len(conflicts)} filename conflict(s) parked in {CONFLICTS_DIRNAME})"
-            clear_dripped(conn, show['id'])
-            cursor.execute(f"DELETE FROM {TABLE_NAME} WHERE id = ?", (show['id'],))
-            log_history(conn, show['id'], show_name, 'graduated', detail)
-            trigger_plex_refresh()
-            msg = f"'{show_name}' graduated back to {dest}"
-            send_notification('graduated', f"🎉 '{show_name}' finished its full run and is back in your main library.", poster_url=show.get('poster_url'))
-            conn.commit()
-            sync_sonarr_path_async(show['id'], show_name, show.get('tvdb_id'), sonarr_track_path(show), dest)
-            check_and_advance_queue(trigger_show_id=show['id'])
-            return msg
+            return _graduate_show(conn, show)
 
     target_eps, batch = compute_next_batch(
         show['vault_path'], dripped, show['episodes_per_drop'], excluded
@@ -3116,6 +3461,21 @@ def process_show_drip(conn, show):
             f"UPDATE {TABLE_NAME} SET completed_at = ?, last_run_date = ? WHERE id = ?",
             (now_local().isoformat(), today_local().isoformat(), show['id'])
         )
+        ended, source = series_known_ended(show)
+        if ended:
+            # The wait exists to catch a weekly show gaining episodes. This
+            # series has finished airing, so there is nothing to wait for.
+            log_history(conn, show['id'], show_name, 'cooldown',
+                        f"No episodes left in the vault - {source} says the series has ended, so skipping the cooldown wait")
+            conn.commit()
+            show = dict(show)
+            show['completed_at'] = now_local().isoformat()
+            msg = _graduate_show(conn, show)
+            if 'could not fully graduate' in msg:
+                # Files were locked: backdate the cooldown so the next run retries straight away.
+                cursor.execute(f"UPDATE {TABLE_NAME} SET completed_at = ? WHERE id = ?",
+                               ((now_local() - timedelta(days=get_cooldown_grace_days() + 1)).isoformat(), show['id']))
+            return msg
         log_history(conn, show['id'], show_name, 'cooldown', 'No episodes left in the vault')
         send_notification('cooldown', f"⏳ '{show_name}' has no more episodes queued - it'll return to your library next cycle.", poster_url=show.get('poster_url'))
         return f"'{show_name}' has no episodes left - cooldown started"
@@ -3292,7 +3652,31 @@ def resume_cooled_down_shows(conn, dry_run=False):
     return resumed
 
 
-def run_drip_job(force_show_id=None):
+def graduate_ended_cooldown_shows(conn, dry_run=False):
+    """Nightly: a show cooling down whose series is known to have ended has
+    nothing left to wait for, so it goes back to the pool now rather than on
+    its next release day. Returns the names graduated."""
+    done = []
+    rows = conn.execute(
+        f"SELECT * FROM {TABLE_NAME} WHERE completed_at IS NOT NULL AND paused = 0"
+    ).fetchall()
+    for row in rows:
+        show = dict(row)
+        ended, source = series_known_ended(show)
+        if not ended:
+            continue
+        if dry_run:
+            log.info("[DRY RUN] '%s': %s says the series has ended - would return to the pool now", show['show_name'], source)
+            continue
+        log_history(conn, show['id'], show['show_name'], 'cooldown', f"{source} says the series has ended - skipping the rest of the cooldown")
+        conn.commit()
+        log.info(process_show_drip(conn, show, skip_cooldown=True))
+        conn.commit()
+        done.append(show['show_name'])
+    return done
+
+
+def run_drip_job(force_show_id=None, skip_cooldown=False):
     """Scheduled entry point. Processes every show whose release_days
     includes today and that hasn't already been processed today - unless
     force_show_id is given, in which case that one show is processed
@@ -3348,6 +3732,10 @@ def run_drip_job(force_show_id=None):
             except Exception as e:
                 log.error("Cooldown wake-up check failed: %s", e)
             try:
+                graduate_ended_cooldown_shows(conn, dry_run=dry_run)
+            except Exception as e:
+                log.error("Ended-series check failed: %s", e)
+            try:
                 replan_target_shows(conn, dry_run=dry_run)
             except Exception as e:
                 log.error("Target-date re-plan failed: %s", e)
@@ -3383,7 +3771,7 @@ def run_drip_job(force_show_id=None):
                 continue
 
             try:
-                result = process_show_drip(conn, show)
+                result = process_show_drip(conn, show, skip_cooldown=skip_cooldown)
                 conn.commit()
                 log.info(result)
                 outcome['ran'].append((show['id'], name, result))
@@ -4232,7 +4620,7 @@ def index():
     return render_template(
         'index.html', shows=shows, current_sort=sort,
         next_up_map=next_up_map, counts=counts, next_run_iso=next_run_iso,
-        last_run=last_run, undoable=undoable, missed_run_notice=missed_run_notice,
+        last_run=last_run, undoable=undoable, missed_run_notice=missed_run_notice, ending_notice=shows_ending_without_successor(),
         all_tags=all_tags,
     )
 
@@ -4367,6 +4755,15 @@ def gather_system_checks():
     missed = detect_missed_run()
     if missed:
         checks.append({'label': 'Run schedule', 'status': 'warn', 'detail': missed})
+
+    try:
+        ending = shows_ending_without_successor()
+    except Exception as e:
+        log.warning("Could not check for shows ending without a successor: %s", e)
+        ending = []
+    if ending:
+        names = ', '.join(x['name'] for x in ending[:3]) + (f" +{len(ending) - 3} more" if len(ending) > 3 else '')
+        checks.append({'label': 'Up next', 'status': 'warn', 'detail': f"nothing queued after: {names}"})
 
     return checks
 
@@ -5655,6 +6052,27 @@ def api_drip_now(show_id):
     # Reached only if force_show_id matched a row but that row was somehow
     # excluded from both ran/errors, which force mode should never do.
     return jsonify({"status": "error", "message": "Drip did not run for an unknown reason"}), 500
+
+
+@app.route('/api/return-to-pool/<int:show_id>', methods=['POST'])
+def api_return_to_pool(show_id):
+    """Sends a show that has finished (is cooling down) straight back to the
+    pool without waiting out the cooldown. Still checks that no new episodes
+    have appeared in the vault; if some have, the show resumes instead."""
+    with closing(get_db()) as conn:
+        row = conn.execute(f"SELECT completed_at FROM {TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
+    if not row:
+        return jsonify({"status": "error", "message": f"No show with id {show_id}"}), 404
+    if not row['completed_at']:
+        return jsonify({"status": "error", "message": "That show hasn't finished yet - it's still dripping."}), 400
+    try:
+        outcome = run_drip_job(force_show_id=show_id, skip_cooldown=True)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    if outcome['errors']:
+        return jsonify({"status": "error", "message": f"Failed: {outcome['errors'][0][2]}"}), 500
+    msg = outcome['ran'][0][2] if outcome['ran'] else 'Done.'
+    return jsonify({"status": "success", "message": msg, "graduated": 'graduated back' in msg})
 
 
 def build_episode_grid(show_id, show):

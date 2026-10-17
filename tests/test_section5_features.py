@@ -755,3 +755,309 @@ def test_static_files_are_fingerprinted_and_cacheable(harness, client):
     assert m, "stylesheet link should carry a modification-time fingerprint"
     r = client.get(f'/static/style.css?v={m.group(1)}')
     assert r.status_code == 200 and 'max-age=31536000' in r.headers.get('Cache-Control', '')
+
+
+# ---------------------------------------------------------------------------
+# "Up next" recommendations
+# ---------------------------------------------------------------------------
+
+def _fake_tvdb(monkeypatch, genres_by_name):
+    """Pool folder 'X' -> TVDB id from its position; genres from genres_by_name
+    (default drama). Counts network lookups so cache behaviour is visible."""
+    ids = {}
+    calls = {'search': 0, 'genres': 0}
+
+    def search(query):
+        calls['search'] += 1
+        ids.setdefault(query, 1000 + len(ids))
+        return [{'tvdb_id': ids[query], 'name': query, 'year': '', 'image_url': '', 'overview': ''}], None
+
+    def genres(tvdb_id):
+        calls['genres'] += 1
+        name = next(n for n, i in ids.items() if i == tvdb_id) if tvdb_id in ids.values() else 'ANCHOR'
+        return genres_by_name.get(name, ['drama']), '', None
+
+    monkeypatch.setattr(unbinge, 'tvdb_search_series', search)
+    monkeypatch.setattr(unbinge, 'tvdb_get_series_genres', genres)
+    return calls
+
+
+def _anchor_show(harness, genres_by_name, tvdb_id=1):
+    genres_by_name  # anchor genres come from the id lookup in _fake_tvdb ('ANCHOR')
+    sid = harness.add_show('Anchor Show')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = ? WHERE id = ?", (tvdb_id, sid))
+        conn.commit()
+    return sid
+
+
+def test_recommendations_reach_past_the_first_40_pool_folders(harness, monkeypatch):
+    names = [f"Pool Show {i:02d}" for i in range(60)]
+    for n in names:
+        harness.make_show_in_pool(n, [(1, 1)])
+    genres = {'ANCHOR': ['crime', 'drama'], 'Pool Show 59': ['crime', 'drama']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    found = []
+    for _ in range(4):  # the cap limits fresh lookups per request, so it fills in over a few loads
+        rec = unbinge.get_recommendations_for_show(sid)
+        found = [r['name'] for r in rec['recommendations']]
+        if 'Pool Show 59' in found:
+            break
+    assert 'Pool Show 59' in found, "a match late in the alphabet must still be found"
+    assert rec['unindexed'] == 0
+
+
+def test_cached_pool_folders_cost_no_further_lookups(harness, monkeypatch):
+    for n in ('Alpha', 'Beta'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    calls = _fake_tvdb(monkeypatch, {'ANCHOR': ['crime']})
+    sid = _anchor_show(harness, {})
+    unbinge.get_recommendations_for_show(sid)
+    before = dict(calls)
+    unbinge.get_recommendations_for_show(sid)
+    assert calls == before
+
+
+def test_halloween_nudge_applies_only_in_season(harness, monkeypatch):
+    harness.make_show_in_pool('Spooky Hollow', [(1, 1)])
+    harness.make_show_in_pool('Sunny Days', [(1, 1)])
+    genres = {'ANCHOR': ['comedy'], 'Spooky Hollow': ['horror'], 'Sunny Days': ['comedy']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    from datetime import date
+    october = unbinge.get_recommendations_for_show(sid, today=date(2026, 10, 18))
+    names = [r['name'] for r in october['recommendations']]
+    assert october['season'] == 'Halloween' and 'Spooky Hollow' in names
+    assert next(r for r in october['recommendations'] if r['name'] == 'Spooky Hollow')['season'] == 'Halloween'
+    june = unbinge.get_recommendations_for_show(sid, today=date(2026, 6, 1))
+    assert june['season'] == 'Summer'                       # a broad season, not the Halloween event
+    assert [r['name'] for r in june['recommendations']] == ['Sunny Days']   # the horror show isn't pulled in
+
+
+def test_strong_genre_match_can_still_beat_the_seasonal_bonus(harness, monkeypatch):
+    harness.make_show_in_pool('Spooky Hollow', [(1, 1)])
+    harness.make_show_in_pool('Crime Saga', [(1, 1)])
+    harness.make_show_in_pool('Filler One', [(1, 1)])
+    genres = {'ANCHOR': ['crime', 'mystery', 'noir'], 'Spooky Hollow': ['horror'],
+              'Crime Saga': ['crime', 'mystery', 'noir'], 'Filler One': ['sports']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    from datetime import date
+    rec = unbinge.get_recommendations_for_show(sid, today=date(2026, 10, 18))
+    assert [r['name'] for r in rec['recommendations']][0] == 'Crime Saga'
+
+
+def test_ties_reshuffle_week_to_week_not_alphabetically(harness, monkeypatch):
+    names = [f"Tie {c}" for c in 'ABCDEFGH']
+    for n in names:
+        harness.make_show_in_pool(n, [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime'], **{n: ['crime'] for n in names}})
+    sid = _anchor_show(harness, {})
+    from datetime import date
+    wk1 = [r['name'] for r in unbinge.get_recommendations_for_show(sid, today=date(2026, 3, 2))['recommendations']]
+    same_week = [r['name'] for r in unbinge.get_recommendations_for_show(sid, today=date(2026, 3, 4))['recommendations']]
+    wk2 = [r['name'] for r in unbinge.get_recommendations_for_show(sid, today=date(2026, 3, 9))['recommendations']]
+    assert wk1 == same_week          # stable within a week
+    assert wk1 != wk2                # changes the next week
+    assert wk1 != sorted(wk1)        # not just the alphabet
+
+
+def test_already_queued_shows_are_not_suggested(harness, monkeypatch):
+    for n in ('Alpha', 'Beta'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime'], 'Alpha': ['crime'], 'Beta': ['crime']})
+    sid = _anchor_show(harness, {})
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"""INSERT INTO {unbinge.QUEUE_TABLE}
+            (show_name, trigger_type, trigger_show_id, release_days, episodes_per_drop, created_at)
+            VALUES ('Alpha', 'after_show', ?, '0', 1, ?)""", (sid, unbinge.now_local().isoformat()))
+        conn.commit()
+    names = [r['name'] for r in unbinge.get_recommendations_for_show(sid)['recommendations']]
+    assert names == ['Beta']
+
+
+def test_warns_about_shows_ending_with_nothing_queued(harness, client):
+    show_dir = harness.vault / 'Ending Show'
+    harness.make_episode(show_dir, 'Ending Show', 1, 1, subdir='Season 01')
+    sid = harness.add_show('Ending Show', release_days='0,1,2,3,4,5,6')
+    assert [x['name'] for x in unbinge.shows_ending_without_successor()] == ['Ending Show']
+    assert 'nothing is queued to follow' in client.get('/').get_data(as_text=True)
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"""INSERT INTO {unbinge.QUEUE_TABLE}
+            (show_name, trigger_type, trigger_show_id, release_days, episodes_per_drop, created_at)
+            VALUES ('Next One', 'after_show', ?, '0', 1, ?)""", (sid, unbinge.now_local().isoformat()))
+        conn.commit()
+    assert unbinge.shows_ending_without_successor() == []
+    assert 'nothing is queued to follow' not in client.get('/').get_data(as_text=True)
+
+
+def test_seasonal_picks_take_at_most_two_of_five_slots(harness, monkeypatch):
+    for i in range(6):
+        harness.make_show_in_pool(f"Haunted {i}", [(1, 1)])
+    for i in range(4):
+        harness.make_show_in_pool(f"Plain Crime {i}", [(1, 1)])
+    genres = {'ANCHOR': ['crime'], **{f"Haunted {i}": ['horror'] for i in range(6)},
+              **{f"Plain Crime {i}": ['crime'] for i in range(4)}}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    from datetime import date
+    recs = unbinge.get_recommendations_for_show(sid, today=date(2026, 10, 18))['recommendations']
+    assert len(recs) == 5
+    assert sum(1 for r in recs if r['season']) == 2
+
+
+# ---------------------------------------------------------------------------
+# Ended series skip the cooldown
+# ---------------------------------------------------------------------------
+
+def _finish_show(harness, drip, name='Done Show'):
+    show_dir = harness.vault / name
+    harness.make_episode(show_dir, name, 1, 1, subdir='Season 01')
+    sid = harness.add_show(name, release_days='0,1,2,3,4,5,6')
+    drip(sid)  # releases the only episode
+    return sid
+
+
+def test_ended_series_graduates_straight_away_instead_of_cooling_down(harness, drip, monkeypatch):
+    monkeypatch.setattr(unbinge, 'series_known_ended', lambda show: (True, 'Sonarr'))
+    sid = _finish_show(harness, drip)
+    result = drip(sid)                       # vault empty -> would normally start a 7-day cooldown
+    assert 'graduated back' in result
+    assert harness.get_show(sid) is None
+    assert (harness.pool / 'Done Show').exists()
+    assert 'graduated' in harness.history_actions()
+
+
+def test_continuing_series_still_cools_down(harness, drip, monkeypatch):
+    monkeypatch.setattr(unbinge, 'series_known_ended', lambda show: (False, 'Sonarr'))
+    sid = _finish_show(harness, drip)
+    assert 'cooldown started' in drip(sid)
+    assert harness.get_show(sid)['completed_at']
+
+
+def test_nightly_sweep_returns_already_cooling_ended_shows(harness, drip, monkeypatch):
+    sid = _finish_show(harness, drip)
+    monkeypatch.setattr(unbinge, 'series_known_ended', lambda show: (False, None))
+    drip(sid)                                # now cooling down
+    assert harness.get_show(sid)['completed_at']
+    monkeypatch.setattr(unbinge, 'series_known_ended', lambda show: (True, 'TVDB'))
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.graduate_ended_cooldown_shows(conn) == ['Done Show']
+    assert harness.get_show(sid) is None
+
+
+def test_return_to_pool_now_button_endpoint(harness, drip, client, monkeypatch):
+    monkeypatch.setattr(unbinge, 'series_known_ended', lambda show: (False, None))
+    sid = _finish_show(harness, drip)
+    assert client.post(f'/api/return-to-pool/{sid}').status_code == 400   # still dripping -> refused
+    drip(sid)                                                              # cooldown starts
+    r = client.post(f'/api/return-to-pool/{sid}').get_json()
+    assert r['status'] == 'success' and r['graduated'] is True
+    assert (harness.pool / 'Done Show').exists()
+
+
+def test_sonarr_ended_status_detected(harness, monkeypatch):
+    unbinge.set_setting('sonarr_url', 'http://fake:8989')
+    unbinge.set_setting('sonarr_api_key', 'k')
+    series = [{'id': 1, 'title': 'Done Show', 'tvdbId': 0, 'path': '/x', 'status': 'ended'}]
+    monkeypatch.setattr(unbinge, 'sonarr_fetch_series', lambda *a, **k: series)
+    show = {'show_name': 'Done Show', 'tvdb_id': None, 'vault_path': '/v/Done Show', 'plex_path': '/p/Done Show'}
+    assert unbinge.series_known_ended(show) == (True, 'Sonarr')
+    series[0]['status'] = 'continuing'
+    assert unbinge.series_known_ended(show) == (False, 'Sonarr')
+
+
+def test_broad_seasons_only_nudge_shows_that_already_match(harness, monkeypatch):
+    for n in ('Beach Capers', 'Dark Docket', 'Unrelated Cooking'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    genres = {'ANCHOR': ['crime', 'drama'], 'Beach Capers': ['comedy', 'crime'],
+              'Dark Docket': ['crime', 'drama'], 'Unrelated Cooking': ['comedy']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    from datetime import date
+    summer = unbinge.get_recommendations_for_show(sid, today=date(2026, 7, 10))
+    names = [r['name'] for r in summer['recommendations']]
+    assert summer['season'] == 'Summer'
+    assert 'Unrelated Cooking' not in names            # no genre overlap: a season alone doesn't add it
+    assert next(r for r in summer['recommendations'] if r['name'] == 'Beach Capers')['season'] == 'Summer'
+
+
+def test_season_windows(harness):
+    from datetime import date
+    label = lambda m, d: (unbinge.current_seasonal_theme(date(2026, m, d)) or {}).get('label')
+    assert label(10, 25) == 'Halloween' and label(9, 5) == 'Autumn' and label(11, 10) == 'Autumn'
+    assert label(12, 25) == 'Christmas' and label(1, 1) == 'Christmas' and label(1, 20) == 'Winter'
+    assert label(2, 10) == "Valentine's" and label(2, 20) == 'Winter'
+    assert label(4, 15) == 'Spring' and label(7, 4) == 'Summer'
+
+
+# ---------------------------------------------------------------------------
+# Balance the week
+# ---------------------------------------------------------------------------
+
+def _balance_setup(harness, monkeypatch, spec):
+    """spec: [(name, day, genres)] -> shows on those days with those genres."""
+    genres_by_id = {}
+    for n, (name, day, genres) in enumerate(spec, start=100):
+        sid = harness.add_show(name, release_days=str(day))
+        with closing(unbinge.get_db()) as conn:
+            conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = ? WHERE id = ?", (n, sid))
+            conn.commit()
+        genres_by_id[n] = genres
+    monkeypatch.setattr(unbinge, 'get_genre_data_for_tvdb_id',
+                        lambda conn, tid: {'genres': genres_by_id.get(tid, []), 'poster_url': ''})
+
+
+def test_balance_spreads_a_pile_up(harness, monkeypatch):
+    _balance_setup(harness, monkeypatch, [(f"Show {c}", 0, []) for c in 'ABCDEF'])
+    plan = unbinge.plan_week_balance()
+    assert plan['before'][0] == 6
+    assert max(plan['after']) == 1 and sum(plan['after']) == 6
+    assert len(plan['moves']) == 5            # one show can stay put
+    assert all('Mon had 6' in m['why'] or m['why'] for m in plan['moves'])
+
+
+def test_balance_leaves_an_even_week_alone(harness, monkeypatch):
+    _balance_setup(harness, monkeypatch, [(f"Show {d}", d, []) for d in range(7)])
+    assert unbinge.plan_week_balance()['moves'] == []
+
+
+def test_balance_separates_similar_shows(harness, monkeypatch):
+    spec = [("Crime A", 0, ['crime', 'noir']), ("Crime B", 1, ['crime', 'noir']),
+            ("Cooking", 2, ['food']), ("Sport", 3, ['sports']), ("Space", 4, ['scifi']),
+            ("Kids", 5, ['animation']), ("News", 6, ['news'])]
+    _balance_setup(harness, monkeypatch, spec)
+    plan = unbinge.plan_week_balance()
+    assert plan['moves'], "two near-identical shows on adjacent days should be pulled apart"
+    final = {m['name']: m['to'] for m in plan['moves']}
+    day = {'Crime A': 0, 'Crime B': 1, **final}
+    gap = abs(day['Crime A'] - day['Crime B'])
+    assert min(gap, 7 - gap) >= 2
+    assert all(sum(plan['after']) == 7 and x == 1 for x in plan['after'])   # still one a day
+    assert any('crime' in m['why'] for m in plan['moves'])
+
+
+def test_balance_ignores_paused_and_keeps_multiday_shows_fixed(harness, monkeypatch):
+    _balance_setup(harness, monkeypatch, [("Mon One", 0, []), ("Mon Two", 0, []), ("Paused", 0, [])])
+    harness.add_show('Daily Show', release_days='0,1,2,3,4,5,6')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET paused = 1 WHERE show_name = 'Paused'")
+        conn.commit()
+    plan = unbinge.plan_week_balance()
+    assert plan['movable'] == 2
+    assert 'Daily Show' not in [m['name'] for m in plan['moves']]
+    assert 'Paused' not in [m['name'] for m in plan['moves']]
+    assert plan['before'][0] == 3             # Mon One + Mon Two + the daily show; paused doesn't count
+
+
+def test_balance_endpoint_previews_then_applies(harness, monkeypatch, client):
+    _balance_setup(harness, monkeypatch, [(f"Show {c}", 0, []) for c in 'ABCD'])
+    preview = client.post('/api/balance-week').get_json()
+    assert preview['moves'] and harness.get_show(1)['release_days'] == '0'   # preview changes nothing
+    applied = client.post('/api/balance-week', data={'confirm': '1'}).get_json()
+    assert applied['applied'] == len(preview['moves'])
+    days = sorted(harness.get_show(i)['release_days'] for i in range(1, 5))
+    assert len(set(days)) == 4
+    logged = [e['detail'] for n in ('Show A', 'Show B', 'Show C', 'Show D') for e in harness.history_for(n)]
+    assert sum('balanced the week' in d for d in logged) == applied['applied']

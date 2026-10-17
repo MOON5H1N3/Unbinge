@@ -48,6 +48,7 @@
         </div>
     </div>
     <div class="show-hero-actions">
+        {% if status == 'cooldown' %}<button type="button" class="btn" id="heroReturnBtn">{{ icon('refresh', 14) }}return to pool now</button>{% endif %}
         <button type="button" class="btn" id="heroDripBtn">{{ icon('droplet', 14) }}drip now</button>
         <button type="button" class="btn" id="heroPauseBtn">{{ icon('pause', 14) }}{{ 'resume' if show.paused else 'pause' }}</button>
     </div>
@@ -433,11 +434,14 @@ async function matchFile(relPath, location, season, episode) {
     }
 }
 
+let recAttempts = 0;
 async function loadRecommendations() {
     const box = document.getElementById('recommendationsBox');
     const hint = document.getElementById('recommendationsHint');
-    box.style.display = 'none';
-    hint.style.display = 'none';
+    if (recAttempts === 0) {
+        box.style.display = 'none';
+        hint.style.display = 'none';
+    }
 
     try {
         const res = await fetch(`/api/recommendations/${SHOW_ID}`);
@@ -450,8 +454,12 @@ async function loadRecommendations() {
             hint.style.display = 'block';
             return;
         }
+        const indexing = data.unindexed > 0 && recAttempts++ < 25;
+        if (indexing) setTimeout(loadRecommendations, 400);
         if (!data.recommendations || data.recommendations.length === 0) {
-            hint.textContent = "nothing in your pool shares a genre with this show yet.";
+            hint.textContent = indexing
+                ? 'looking through your pool on tvdb (' + data.unindexed + ' folders to go)…'
+                : "nothing in your pool shares a genre with this show yet.";
             hint.style.display = 'block';
             return;
         }
@@ -485,6 +493,12 @@ async function loadRecommendations() {
             const meta = document.createElement('div');
             meta.className = 'poster-card-meta';
             meta.textContent = rec.matched_genres.join(', ');
+            if (rec.season) {
+                const tag = document.createElement('span');
+                tag.className = 'rec-season';
+                tag.textContent = (rec.matched_genres.length ? ' · ' : '') + rec.season.toLowerCase() + ' pick';
+                meta.appendChild(tag);
+            }
             const actions = document.createElement('div');
             actions.className = 'poster-card-actions';
             const btn = document.createElement('button');
@@ -504,6 +518,13 @@ async function loadRecommendations() {
             card.appendChild(body);
             list.appendChild(card);
         });
+        if (indexing) {
+            hint.textContent = 'still looking up ' + data.unindexed + ' more pool folder' + (data.unindexed === 1 ? '' : 's') + ' on tvdb - suggestions will fill in…';
+            hint.style.display = 'block';
+            // each request indexes a batch and caches it; the retry above keeps going until the pool is covered
+        } else {
+            hint.style.display = 'none';
+        }
         box.style.display = 'block';
     } catch (err) {
         // Quiet failure - recommendations are a convenience, not core to the
@@ -515,6 +536,24 @@ async function loadRecommendations() {
 loadUnmatchedFiles();
 loadQueue();
 loadRecommendations();
+
+const heroReturnBtn = document.getElementById('heroReturnBtn');
+if (heroReturnBtn) heroReturnBtn.addEventListener('click', async (e) => {
+    const ok = await unbingeConfirm({ title: 'return to the pool now?', body: 'this show has finished. its files go back to the pool straight away instead of waiting out the cooldown. if new episodes have turned up, it resumes instead.', confirmLabel: 'return to pool' });
+    if (!ok) return;
+    const button = e.currentTarget;
+    button.disabled = true;
+    try {
+        const res = await fetch(`/api/return-to-pool/${SHOW_ID}`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        unbingeToast(data.message || (res.ok ? 'done.' : 'that failed.'), res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => { window.location.href = data.graduated ? '/' : window.location.href; }, 700);
+        else button.disabled = false;
+    } catch (err) {
+        unbingeToast('network error.', 'error');
+        button.disabled = false;
+    }
+});
 
 document.getElementById('heroDripBtn').addEventListener('click', async (e) => {
     const button = e.currentTarget;
