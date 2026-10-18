@@ -112,7 +112,6 @@ All configuration is through environment variables. Integration settings can als
 | `DISCORD_SCHEDULE_WEBHOOK_URL` | No | – | Discord webhook for the live schedule message |
 | `TVDB_API_KEY` / `TVDB_PIN` | No | – | TVDB credentials for posters and metadata |
 | `SONARR_URL` / `SONARR_API_KEY` | No | – | Sonarr connection for real air dates |
-| `HOME_SHOWING_URL` / `HOME_SHOWING_PASSWORD` | No | – | [Home Showing](https://github.com/MOON5H1N3/home-showing) (your weekly film). Suggestions then steer around the film you're watching. Also settable under settings → integrations. Home Showing reads your TV line-up back from `/api/lineup` (set its `UNBINGE_URL`, and `UNBINGE_PASSWORD` if you use a password here) |
 
 The daily drip time defaults to **03:00** and can be changed in Settings.
 

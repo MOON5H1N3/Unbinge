@@ -138,21 +138,6 @@
     </section>
     <section class="set-section" data-section="integrations">
     <div class="panel">
-        <h2>{{ icon('clock', 14) }}home showing <span class="cell-faint" style="font-weight:400;">(optional)</span></h2>
-        <p class="panel-hint">reads your weekly film from home showing, so tv suggestions avoid the same vibe as the film you are watching. your tv line-up is shared back at <code>/api/lineup</code> for it to do the same.</p>
-        <div class="field-row">
-            <div class="field">
-                <label for="home_showing_url">home showing url</label>
-                <input type="text" id="home_showing_url" name="home_showing_url" value="{{ settings.home_showing_url }}" placeholder="http://192.168.1.x:8097">
-            </div>
-            <div class="field">
-                <label for="home_showing_password">password (if it has one)</label>
-                <input type="text" id="home_showing_password" name="home_showing_password" value="{{ settings.home_showing_password }}" placeholder="its dashboard password">
-            </div>
-        </div>
-        <button type="button" class="btn btn-sm" id="test-home-showing-btn" style="margin-top:0.7rem;">test connection</button>
-    </div>
-    <div class="panel">
         <h2>{{ icon('server', 14) }}sonarr <span class="cell-faint" style="font-weight:400;">(optional)</span></h2>
         <p class="panel-hint">cross-checks season/episode counts against your sonarr library, and powers the calendar's upcoming-episodes panel.</p>
         <div class="field-row">
@@ -421,22 +406,6 @@ document.getElementById('weeklyDigestBtn').addEventListener('click', async (e) =
     } finally { btn.disabled = false; }
 });
 
-document.getElementById('test-home-showing-btn').addEventListener('click', async (e) => {
-    const btn = e.currentTarget, original = btn.innerHTML;
-    const body = new FormData();
-    body.append('home_showing_url', document.getElementById('home_showing_url').value);
-    body.append('home_showing_password', document.getElementById('home_showing_password').value);
-    btn.disabled = true; btn.textContent = 'checking…';
-    try {
-        const res = await fetch('/api/test-home-showing', { method: 'POST', body });
-        const data = await res.json().catch(() => ({}));
-        unbingeToast(data.message || 'that failed - check the logs.', res.ok && data.status !== 'error' ? 'success' : 'error');
-    } catch (err) {
-        unbingeToast('could not reach unbinge.', 'error');
-    } finally {
-        btn.disabled = false; btn.innerHTML = original;
-    }
-});
 
 document.getElementById('test-sonarr-btn').addEventListener('click', async (e) => {
     const btn = e.currentTarget, original = btn.innerHTML, box = document.getElementById('sonarrReport');

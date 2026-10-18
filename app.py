@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import logging
@@ -110,17 +109,6 @@ AUTH_PASSWORD = os.environ.get('UNBINGE_PASSWORD', '') or os.environ.get('DRIPAR
 AUTH_EXEMPT_PATHS = ('/login', '/logout', '/calendar.ics', '/health', '/static/', '/posters/')
 
 
-def _basic_password_ok():
-    header = request.headers.get('Authorization', '')
-    if not header.startswith('Basic '):
-        return False
-    try:
-        _user, _, password = base64.b64decode(header[6:]).decode().partition(':')
-    except Exception:
-        return False
-    return secrets.compare_digest(password, AUTH_PASSWORD)
-
-
 def auth_enabled():
     return bool(AUTH_PASSWORD)
 
@@ -142,11 +130,6 @@ def _ensure_csrf_token():
 @app.before_request
 def _enforce_auth_and_csrf():
     if not auth_enabled() or is_exempt_path(request.path):
-        return None
-
-    # Home Showing reads the TV line-up without a browser session, so this one
-    # read-only endpoint also accepts the app password as HTTP Basic auth.
-    if request.path == '/api/lineup' and request.method == 'GET' and _basic_password_ok():
         return None
 
     if not session.get('authenticated'):
@@ -538,8 +521,6 @@ def init_db():
         'tvdb_pin': os.environ.get('TVDB_PIN', ''),
         'tvdb_token': '',
         'tvdb_token_expires': '',
-        'home_showing_url': os.environ.get('HOME_SHOWING_URL', ''),
-        'home_showing_password': os.environ.get('HOME_SHOWING_PASSWORD', ''),
         'sonarr_url': os.environ.get('SONARR_URL', ''),
         'sonarr_api_key': os.environ.get('SONARR_API_KEY', ''),
         'notify_on_drip': '1',
@@ -1717,62 +1698,6 @@ def return_pool_dir(show):
     return POOL_DIR
 
 
-# ---------------------------------------------------------------------------
-# Home Showing (films) - the sister app that plans a film a week. Unbinge
-# reads its schedule so suggestions for TV avoid the same vibe as this
-# week's film, and offers its own line-up back at /api/lineup.
-# ---------------------------------------------------------------------------
-HOME_SHOWING_CACHE_SECONDS = 600
-_home_showing_cache = {'key': None, 'at': 0.0, 'films': []}
-
-# TMDB (films) and TVDB (series) mostly share genre names; these are the ones that differ.
-_GENRE_ALIASES = {'sci-fi': 'science fiction', 'sci-fi & fantasy': 'science fiction', 'action & adventure': 'action',
-                  'war & politics': 'war', 'tv movie': ''}
-
-
-def _norm_genre(name):
-    g = str(name or '').strip().lower()
-    return _GENRE_ALIASES.get(g, g)
-
-
-def home_showing_fetch(base, password, timeout=6):
-    """Raw schedule from Home Showing's /api/schedule. Raises requests
-    exceptions or ValueError on trouble."""
-    resp = requests.get(base.rstrip('/') + '/api/schedule', auth=('', password) if password else None, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def home_showing_films(force=False):
-    """The film this week and the next one, from Home Showing, as
-    [{'title', 'genres': [lowercase], 'week', 'status', 'current'}].
-    Cached for ten minutes; returns [] when it is not set up or unreachable
-    (a missing sister app must never break suggestions)."""
-    base = get_setting('home_showing_url', '').strip()
-    if not base:
-        return []
-    password = get_setting('home_showing_password', '').strip()
-    key = (base, password)
-    now = time.time()
-    if not force and _home_showing_cache['key'] == key and now - _home_showing_cache['at'] < HOME_SHOWING_CACHE_SECONDS:
-        return _home_showing_cache['films']
-    try:
-        data = home_showing_fetch(base, password)
-        films = []
-        for w in (data.get('weeks') or [])[:2]:
-            f = w.get('film')
-            if not f:
-                continue
-            genres = sorted({g for g in (_norm_genre(x) for x in (f.get('genres') or [])) if g})
-            films.append({'title': f.get('title') or '', 'genres': genres, 'week': w.get('week'),
-                          'status': w.get('status'), 'current': bool(w.get('current'))})
-    except (requests.RequestException, ValueError, AttributeError) as e:
-        log.warning("Home Showing unreachable (%s) - suggestions carry on without films.", e)
-        films = []
-    _home_showing_cache.update(key=key, at=now, films=films)
-    return films
-
-
 def _taste_affinity(shows_genres, generic):
     """Per-genre sentiment in [-1, 1] from how you actually use the app.
     shows_genres: [(genre_set, weight)] - weight is positive for shows you
@@ -1843,16 +1768,6 @@ def _build_suggestion_context(conn, today, leaving_ids):
         if g - generic:
             lineup.append(g - generic)
 
-    # The film you are watching this week and next (from Home Showing) counts
-    # as part of the same week, so a TV pick doesn't repeat its vibe.
-    movies = home_showing_films()
-    for m in movies:
-        mg = frozenset(m['genres'])
-        if mg - generic:
-            lineup.append(mg - generic)
-        if m['status'] == 'watched' and mg:
-            taste_inputs.append((mg, 1.0))
-
     # Shows you already watched to the end: they go back to the pool when
     # they finish, so without this they would be suggested straight away.
     watched = {}
@@ -1894,7 +1809,7 @@ def _build_suggestion_context(conn, today, leaving_ids):
     return {
         'candidates': eligible, 'generic': generic, 'lineup': lineup, 'hidden': len(hidden),
         'unindexed': unindexed, 'pool_total': len(pool_shows), 'resolved': len(candidates),
-        'movies': [m['title'] for m in movies if m['title']], 'pace': _weekly_pace(shows), 'theme': current_seasonal_theme(today), 'today': today,
+        'pace': _weekly_pace(shows), 'theme': current_seasonal_theme(today), 'today': today,
         'this_week': f"{today.isocalendar()[0]}-{today.isocalendar()[1]:02d}",
         'feedback': feedback, 'enrich': {}, 'profile_fetches': 0, 'refining': set(),
     }
@@ -2150,7 +2065,6 @@ def get_recommendations_for_show(show_id, today=None):
             'pool_total': ctx['pool_total'],
             'unindexed': ctx['unindexed'],
             'refining': len(ctx['refining']),
-            'movies': ctx['movies'],
         }
 
 
@@ -6310,44 +6224,6 @@ def api_suggestions_dismissed():
     return jsonify({"dismissed": [{"name": r['show_name'], "until": r['dismissed_until']} for r in rows]})
 
 
-@app.route('/api/test-home-showing', methods=['POST'])
-def api_test_home_showing():
-    base = request.form.get('home_showing_url', '').strip()
-    password = request.form.get('home_showing_password', '').strip()
-    if not base:
-        return jsonify({"status": "error", "message": "Home Showing URL is required."}), 400
-    try:
-        data = home_showing_fetch(base, password)
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else '?'
-        msg = "Home Showing wants its password." if code == 401 else f"Home Showing answered {code}."
-        return jsonify({"status": "error", "message": msg}), 502
-    except (requests.RequestException, ValueError) as e:
-        return jsonify({"status": "error", "message": f"Could not reach Home Showing: {e}"}), 502
-    weeks = [w for w in (data.get('weeks') or []) if w.get('film')]
-    this = weeks[0]['film']['title'] if weeks else None
-    return jsonify({"status": "success",
-                    "message": "Home Showing OK" + (f" - this week: {this}." if this else " - nothing planned yet.")})
-
-
-@app.route('/api/lineup', methods=['GET'])
-def api_lineup():
-    """What is on the TV schedule, for Home Showing to avoid duplicating:
-    each active show with its (cached) TVDB genres. Read-only, no secrets."""
-    out = []
-    with closing(get_db()) as conn:
-        for sh in load_shows():
-            if sh['paused'] or sh['completed_at'] or not sh.get('tvdb_id'):
-                continue
-            if not _genre_is_cached(conn, sh['tvdb_id']):
-                continue
-            genres = get_genre_data_for_tvdb_id(conn, sh['tvdb_id'])['genres']
-            if genres:
-                out.append({'name': sh['show_name'], 'genres': sorted(_norm_genre(g) for g in genres if _norm_genre(g)),
-                            'release_days': sh['release_days']})
-    return jsonify({"shows": out})
-
-
 def safe_show_path(root_dir, show_name):
     """Resolves show_name against root_dir and guarantees the result stays
     inside it, or raises ValueError.
@@ -6733,8 +6609,6 @@ def settings_page():
             set_setting('tvdb_token_expires', '')
         set_setting('tvdb_api_key', new_tvdb_key)
         set_setting('tvdb_pin', request.form.get('tvdb_pin', '').strip())
-        set_setting('home_showing_url', request.form.get('home_showing_url', '').strip())
-        set_setting('home_showing_password', request.form.get('home_showing_password', '').strip())
         set_setting('sonarr_url', request.form.get('sonarr_url', '').strip())
         set_setting('sonarr_api_key', request.form.get('sonarr_api_key', '').strip())
         set_setting('sonarr_sync_paths', '1' if request.form.get('sonarr_sync_paths') == 'on' else '0')
@@ -6814,8 +6688,6 @@ def settings_page():
         'dry_run': get_setting('dry_run', '0') == '1',
         'tvdb_api_key': get_setting('tvdb_api_key', ''),
         'tvdb_pin': get_setting('tvdb_pin', ''),
-        'home_showing_url': get_setting('home_showing_url', ''),
-        'home_showing_password': get_setting('home_showing_password', ''),
         'sonarr_url': get_setting('sonarr_url', ''),
         'sonarr_api_key': get_setting('sonarr_api_key', ''),
         'auto_queue_enabled': get_setting('auto_queue_enabled', '0') == '1',
