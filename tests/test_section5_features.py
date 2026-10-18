@@ -1358,3 +1358,549 @@ def test_a_big_pool_with_several_ending_shows_stays_quick(harness, monkeypatch):
     start = time.time()
     unbinge.get_recommendations_for_show(ids[1])
     assert time.time() - start < 3.0
+
+
+# ---------------------------------------------------------------------------
+# Home Showing (films) integration
+# ---------------------------------------------------------------------------
+
+_HS_SCHEDULE = {'weeks': [
+    {'week': '2026-10-16', 'current': True, 'status': 'planned',
+     'film': {'title': 'Night Chase', 'genres': ['Crime', 'Thriller']}},
+    {'week': '2026-10-23', 'current': False, 'status': 'planned',
+     'film': {'title': 'Sci-Fi Thing', 'genres': ['Sci-Fi', 'Adventure']}},
+    {'week': '2026-10-30', 'current': False, 'status': 'planned', 'film': {'title': 'Too Far Ahead', 'genres': ['Horror']}},
+]}
+
+
+def _home_showing_on(monkeypatch, schedule=_HS_SCHEDULE, fail=False):
+    unbinge._home_showing_cache.update(key=None, at=0.0, films=[])
+    unbinge.set_setting('home_showing_url', 'http://hs.test:8097')
+    calls = []
+
+    def fetch(base, password, timeout=6):
+        calls.append(base)
+        if fail:
+            raise unbinge.requests.ConnectionError('down')
+        return schedule
+
+    monkeypatch.setattr(unbinge, 'home_showing_fetch', fetch)
+    return calls
+
+
+def test_home_showing_films_are_read_normalised_and_cached(harness, monkeypatch):
+    calls = _home_showing_on(monkeypatch)
+    films = unbinge.home_showing_films()
+    assert [f['title'] for f in films] == ['Night Chase', 'Sci-Fi Thing']          # this week and next only
+    assert films[0]['genres'] == ['crime', 'thriller'] and 'science fiction' in films[1]['genres']
+    unbinge.home_showing_films()
+    assert len(calls) == 1                                                           # cached
+
+
+def test_an_unreachable_home_showing_just_means_no_films(harness, monkeypatch):
+    _home_showing_on(monkeypatch, fail=True)
+    assert unbinge.home_showing_films() == []
+
+
+def test_tv_picks_avoid_the_vibe_of_this_weeks_film(harness, monkeypatch):
+    for n in ('Another Thriller', 'Warm Comedy'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    # equal on genre match to the anchor so only the film decides between them
+    genres = {'ANCHOR': ['drama', 'western'], 'Another Thriller': ['western', 'crime', 'thriller'],
+              'Warm Comedy': ['western', 'comedy', 'family']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    from datetime import date
+    d = date(2026, 3, 2)
+    without = _names(unbinge.get_recommendations_for_show(sid, today=d))
+    _home_showing_on(monkeypatch)
+    with_film = unbinge.get_recommendations_for_show(sid, today=d)
+    assert with_film['movies'] == ['Night Chase', 'Sci-Fi Thing']
+    assert _names(with_film)[0] == 'Warm Comedy'
+    assert without  # still works with no sister app
+
+
+def test_lineup_endpoint_shares_active_shows_and_their_genres(harness, client, monkeypatch):
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['Crime', 'Drama']})
+    sid = _anchor_show(harness, {})
+    harness.add_show('No Link Show')
+    with closing(unbinge.get_db()) as conn:
+        unbinge.get_genre_data_for_tvdb_id(conn, 1)        # fills the genre cache
+    data = client.get('/api/lineup').get_json()
+    assert [s['name'] for s in data['shows']] == ['Anchor Show']
+    assert data['shows'][0]['genres'] == ['crime', 'drama']
+
+
+def test_home_showing_test_button_reports_a_password_problem(harness, client, monkeypatch):
+    def fetch(base, password, timeout=6):
+        resp = unbinge.requests.Response()
+        resp.status_code = 401
+        raise unbinge.requests.HTTPError(response=resp)
+    monkeypatch.setattr(unbinge, 'home_showing_fetch', fetch)
+    r = client.post('/api/test-home-showing', data={'home_showing_url': 'http://hs.test:8097'})
+    assert r.status_code == 502 and 'password' in r.get_json()['message']
+    ok = _home_showing_on(monkeypatch)
+    r = client.post('/api/test-home-showing', data={'home_showing_url': 'http://hs.test:8097'})
+    assert 'Night Chase' in r.get_json()['message']
+
+
+def test_lineup_accepts_the_app_password_as_basic_auth_for_home_showing(harness, client, monkeypatch):
+    import base64
+    monkeypatch.setattr(unbinge, 'AUTH_PASSWORD', 'secret')
+    assert client.get('/api/lineup').status_code == 401
+    good = {'Authorization': 'Basic ' + base64.b64encode(b'home-showing:secret').decode()}
+    bad = {'Authorization': 'Basic ' + base64.b64encode(b'home-showing:nope').decode()}
+    assert client.get('/api/lineup', headers=good).status_code == 200
+    assert client.get('/api/lineup', headers=bad).status_code == 401
+    assert client.get('/api/suggestions/dismissed', headers=good).status_code == 401    # the exception is for the line-up only
+
+
+# ---------------------------------------------------------------------------
+# Plex watch progress
+# ---------------------------------------------------------------------------
+from datetime import datetime as _dt, timedelta as _td
+
+
+class _PlexEp:
+    def __init__(self, season, ep, watched_on=None):
+        self.parentIndex, self.index = season, ep
+        self.viewCount = 1 if watched_on else 0
+        self.lastViewedAt = watched_on
+
+
+class _PlexShow:
+    def __init__(self, title, folder, eps, tvdb=None):
+        self.title, self.locations, self._eps = title, [folder], eps
+        self.guids = [type('G', (), {'id': f'tvdb://{tvdb}'})()] if tvdb else []
+
+    def episodes(self):
+        return self._eps
+
+
+class _PlexServerStub:
+    def __init__(self, shows):
+        sec = type('Sec', (), {'all': lambda _s: shows, 'type': 'show'})()
+        self.library = type('Lib', (), {'sectionByID': lambda _s, i: sec, 'sections': lambda _s: [sec]})()
+
+
+def _drip(sid, season, episode, days_ago):
+    stamp = (unbinge.now_local() - _td(days=days_ago)).isoformat()
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"INSERT OR REPLACE INTO {unbinge.DRIPPED_TABLE} (show_id, season, episode, dripped_at) VALUES (?, ?, ?, ?)",
+                     (sid, season, episode, stamp))
+        conn.commit()
+
+
+def _with_plex(monkeypatch, shows):
+    monkeypatch.setattr(unbinge, 'PLEX_URL', 'http://plex.test:32400')
+    monkeypatch.setattr(unbinge, 'PLEX_TOKEN', 'tok')
+    monkeypatch.setattr(unbinge, '_plex_server_for_watch', lambda: _PlexServerStub(shows))
+
+
+def test_watch_sync_records_when_episodes_were_watched(harness, monkeypatch):
+    sid = harness.add_show('Slow Burn')
+    for e, ago in ((1, 10), (2, 8), (3, 6), (4, 5)):
+        _drip(sid, 1, e, ago)
+    seen1 = unbinge.now_local() - _td(days=8)       # episode 1: dripped 10 days ago, watched 8 days ago (lag 2)
+    seen2 = unbinge.now_local() - _td(days=3)       # episode 2: dripped 8 days ago, watched 3 days ago (lag 5)
+    _with_plex(monkeypatch, [_PlexShow('Slow Burn', '/tv/Slow Burn', [_PlexEp(1, 1, seen1), _PlexEp(1, 2, seen2), _PlexEp(1, 3), _PlexEp(1, 4)])])
+    status = unbinge.sync_watch_state()
+    assert status['ok'] and status['matched'] == 1 and status['watched'] == 2
+    with closing(unbinge.get_db()) as conn:
+        st = unbinge.watch_stats(conn, sid)[sid]
+    assert (st['dripped'], st['watched'], st['behind'], st['avg_lag']) == (4, 2, 2, 3.5)
+
+
+def test_an_episode_dripped_today_is_not_behind(harness, monkeypatch):
+    sid = harness.add_show('Fresh')
+    _drip(sid, 1, 1, 0)
+    _with_plex(monkeypatch, [_PlexShow('Fresh', 'C:\\TV\\Fresh', [_PlexEp(1, 1)])])
+    unbinge.sync_watch_state()
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.watch_stats(conn, sid)[sid]['behind'] == 0
+
+
+def test_a_watch_before_the_drip_counts_as_no_lag_and_unwatching_clears_it(harness, monkeypatch):
+    sid = harness.add_show('Rewatch')
+    _drip(sid, 1, 1, 2)
+    early = unbinge.now_local() - _td(days=30)
+    _with_plex(monkeypatch, [_PlexShow('Rewatch', '/tv/Rewatch', [_PlexEp(1, 1, early)])])
+    unbinge.sync_watch_state()
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.watch_stats(conn, sid)[sid]['avg_lag'] == 0
+    _with_plex(monkeypatch, [_PlexShow('Rewatch', '/tv/Rewatch', [_PlexEp(1, 1)])])   # marked unwatched in Plex
+    unbinge.sync_watch_state()
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.watch_stats(conn, sid)[sid]['watched'] == 0
+
+
+def test_shows_are_matched_by_folder_then_title_then_tvdb(harness, monkeypatch):
+    a, b, c = harness.add_show('By Folder'), harness.add_show('By Title'), harness.add_show('By Tvdb')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 555 WHERE id = ?", (c,))
+        conn.commit()
+    for sid in (a, b, c):
+        _drip(sid, 1, 1, 3)
+    now = unbinge.now_local()
+    _with_plex(monkeypatch, [_PlexShow('Different', '/x/By Folder', [_PlexEp(1, 1, now)]),
+                             _PlexShow('by title', '/x/other', [_PlexEp(1, 1, now)]),
+                             _PlexShow('Whatever', '/y/z', [_PlexEp(1, 1, now)], tvdb=555)])
+    status = unbinge.sync_watch_state()
+    assert status['matched'] == 3 and status['unmatched'] == []
+
+
+def test_unmatched_and_unconfigured_are_reported_not_fatal(harness, monkeypatch):
+    sid = harness.add_show('Ghost')
+    _drip(sid, 1, 1, 3)
+    _with_plex(monkeypatch, [])
+    status = unbinge.sync_watch_state()
+    assert status['ok'] and status['unmatched'] == ['Ghost']
+    monkeypatch.setattr(unbinge, 'PLEX_TOKEN', '')
+    monkeypatch.setattr(unbinge, '_plex_server_for_watch', lambda: None)
+    assert unbinge.sync_watch_state()['error']
+
+
+def test_behind_badge_and_episode_dates_show_up(harness, client, monkeypatch):
+    sid = harness.add_show('Falling Behind')
+    for e in range(1, 5):
+        _drip(sid, 1, e, 10 - e)
+    _with_plex(monkeypatch, [_PlexShow('Falling Behind', '/tv/Falling Behind',
+                                       [_PlexEp(1, 1, unbinge.now_local() - _td(days=7)), _PlexEp(1, 2), _PlexEp(1, 3), _PlexEp(1, 4)])])
+    unbinge.sync_watch_state()
+    html = client.get('/').get_data(as_text=True)
+    assert '3 behind' in html
+    page = client.get(f'/show/{sid}').get_data(as_text=True)
+    assert 'watched <strong>1</strong> of 4 dripped' in page and 'not watched yet' in page and '3 behind' in page
+    assert client.post('/api/watch-sync').status_code == 200
+    assert 'watching progress' in client.get('/system').get_data(as_text=True)
+
+
+def test_threshold_is_configurable(harness, monkeypatch):
+    sid = harness.add_show('Slightly Behind')
+    for e in range(1, 3):
+        _drip(sid, 1, e, 5)
+    unbinge.set_setting('behind_threshold', '5')
+    assert not next(s for s in unbinge.load_shows() if s['id'] == sid)['behind_flag']
+    unbinge.set_setting('behind_threshold', '2')
+    assert next(s for s in unbinge.load_shows() if s['id'] == sid)['behind_flag']
+
+
+# ---------------------------------------------------------------------------
+# Weekly digest
+# ---------------------------------------------------------------------------
+
+def test_weekly_digest_summarises_the_week(harness, monkeypatch):
+    sid = harness.add_show('Busy Show')
+    for e in range(1, 6):
+        _drip(sid, 1, e, 2)
+    _with_plex(monkeypatch, [_PlexShow('Busy Show', '/tv/Busy Show', [_PlexEp(1, 1, unbinge.now_local() - _td(days=1)), _PlexEp(1, 2), _PlexEp(1, 3), _PlexEp(1, 4), _PlexEp(1, 5)])])
+    unbinge.sync_watch_state()
+    text = unbinge.build_weekly_digest()
+    assert text.startswith('weekly digest')
+    assert 'dripped: 5 episode(s) — Busy Show ×5' in text and 'watched: 1 episode(s) — Busy Show ×1' in text
+    assert 'falling behind: Busy Show (4 unwatched)' in text and 'usually watch' in text
+
+
+def test_weekly_digest_names_ending_shows_and_what_could_follow(harness, monkeypatch):
+    harness.make_show_in_pool('Next Up', [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Next Up': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = harness.add_show('Wrapping Up')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 1, completed_at = ? WHERE id = ?", (unbinge.now_local().isoformat(), sid))
+        conn.commit()
+    text = unbinge.build_weekly_digest()
+    assert 'ending soon with nothing queued' in text and 'Wrapping Up' in text and 'try Next Up' in text
+
+
+def test_a_quiet_week_sends_nothing_and_the_button_explains(harness, client, monkeypatch):
+    assert unbinge.build_weekly_digest() is None
+    assert client.post('/api/weekly-digest/send').get_json()['text'] == ''
+
+
+def test_send_it_now_posts_to_the_webhook_when_there_is_one(harness, client, monkeypatch):
+    sid = harness.add_show('Sent Show')
+    _drip(sid, 1, 1, 1)
+    sent = []
+    monkeypatch.setattr(unbinge, 'send_notification', lambda event, message, **kw: sent.append((event, message)))
+    r = client.post('/api/weekly-digest/send').get_json()
+    assert 'webhook' in r['message'] and not sent                    # no webhook configured: shows the text only
+    unbinge.set_setting('webhook_url', 'http://hook.test/x')
+    client.post('/api/weekly-digest/send')
+    assert sent and sent[0][0] == 'digest' and 'Sent Show' in sent[0][1]
+
+
+# ---------------------------------------------------------------------------
+# One-tap queue and auto-queue
+# ---------------------------------------------------------------------------
+
+def _dripping_on(harness, name, days, per_drop=1):
+    sid = harness.add_show(name)
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET release_days = ?, release_day = ?, episodes_per_drop = ? WHERE id = ?",
+                     (days, int(days.split(',')[0]), per_drop, sid))
+        conn.commit()
+    return sid
+
+
+def test_one_tap_queue_picks_the_lightest_day_and_frees_the_ending_shows_day(harness, client, monkeypatch):
+    harness.make_show_in_pool('Newcomer', [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime'], 'Newcomer': ['crime']})
+    # Mon: Busy A and Busy B. Tue: Ending (about to finish). Wed-Sun: empty.
+    _dripping_on(harness, 'Busy A', '0'); _dripping_on(harness, 'Busy B', '0')
+    ending = _dripping_on(harness, 'Ending', '1')
+    r = client.post(f'/api/queue/{ending}/quick', data={'show_name': 'Newcomer'}).get_json()
+    assert r['status'] == 'success'
+    entries = unbinge.get_queue_for_show(ending)
+    assert len(entries) == 1 and entries[0]['show_name'] == 'Newcomer'
+    # Tuesday is free once Ending finishes and it is the ending show's own day, so it wins the tie
+    assert entries[0]['release_days'] == '1' and entries[0]['auto'] == 0
+    assert 'tue' in r['message']
+
+
+def test_one_tap_queue_keeps_the_number_of_drop_days_and_the_pace(harness, client, monkeypatch):
+    harness.make_show_in_pool('Newcomer', [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime'], 'Newcomer': ['crime']})
+    ending = _dripping_on(harness, 'Twice Weekly', '0,3', per_drop=2)
+    client.post(f'/api/queue/{ending}/quick', data={'show_name': 'Newcomer'})
+    entry = unbinge.get_queue_for_show(ending)[0]
+    assert entry['release_days'] == '0,3' and entry['episodes_per_drop'] == 2
+
+
+def test_two_queued_shows_do_not_land_on_the_same_day(harness, client, monkeypatch):
+    for n in ('First', 'Second'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime']})
+    a, b = _dripping_on(harness, 'End A', '2'), _dripping_on(harness, 'End B', '2')
+    client.post(f'/api/queue/{a}/quick', data={'show_name': 'First'})
+    client.post(f'/api/queue/{b}/quick', data={'show_name': 'Second'})
+    assert unbinge.get_queue_for_show(a)[0]['release_days'] != unbinge.get_queue_for_show(b)[0]['release_days']
+
+
+def test_quick_queue_rejects_unknown_shows(harness, client):
+    sid = _dripping_on(harness, 'Anchor X', '0')
+    assert client.post(f'/api/queue/{sid}/quick', data={'show_name': 'Not In Pool'}).status_code == 404
+    assert client.post(f'/api/queue/{sid}/quick', data={}).status_code == 400
+
+
+def test_auto_queue_is_off_by_default_and_queues_when_enabled(harness, monkeypatch):
+    harness.make_show_in_pool('Great Followup', [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Great Followup': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = harness.add_show('Wrapping Up')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 1, completed_at = ? WHERE id = ?", (unbinge.now_local().isoformat(), sid))
+        conn.commit()
+    sent = []
+    monkeypatch.setattr(unbinge, 'send_notification', lambda event, message, **kw: sent.append((event, message)))
+    assert unbinge.run_auto_queue() == [] and not unbinge.get_queue_for_show(sid)
+    unbinge.set_setting('auto_queue_enabled', '1')
+    done = unbinge.run_auto_queue()
+    assert [(a, b) for a, b, _d in done] == [('Wrapping Up', 'Great Followup')]
+    entry = unbinge.get_queue_for_show(sid)[0]
+    assert entry['auto'] == 1
+    assert sent and sent[0][0] == 'queued' and 'Great Followup' in sent[0][1]
+    assert unbinge.run_auto_queue() == []              # it does not queue a second one
+    with closing(unbinge.get_db()) as conn:
+        assert conn.execute(f"SELECT COUNT(*) n FROM {unbinge.HISTORY_TABLE} WHERE action = 'queued'").fetchone()['n'] == 1
+
+
+def test_auto_queue_only_acts_within_a_week_of_the_end(harness, monkeypatch):
+    harness.make_show_in_pool('Something', [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime'], 'Something': ['crime']})
+    sid = harness.add_show('Far From Done')
+    unbinge.set_setting('auto_queue_enabled', '1')
+    monkeypatch.setattr(unbinge, 'shows_ending_without_successor', lambda days=21: [] if days <= 7 else [{'id': sid, 'name': 'x', 'state': 'finishing', 'ends': '2099-01-01'}])
+    assert unbinge.run_auto_queue() == []
+
+
+# ---------------------------------------------------------------------------
+# Undo any drip from the last week; backups and restore
+# ---------------------------------------------------------------------------
+
+def _two_drips(harness, drip):
+    show = harness.vault / 'Test Show'
+    for e in (1, 2):
+        harness.make_episode(show, 'Test Show', 1, e, subdir='Season 01')
+    sid = harness.add_show('Test Show')
+    drip(sid)
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET last_run_date = NULL WHERE id = ?", (sid,))
+        conn.commit()
+    drip(sid)
+    return sid
+
+
+def test_an_older_drip_can_be_undone_while_a_newer_one_stands(harness, client, drip):
+    sid = _two_drips(harness, drip)
+    drips = unbinge.get_undoable_drips()
+    assert len(drips) == 2
+    oldest = drips[-1]
+    r = client.post(f"/api/undo-drip/{oldest['id']}")
+    assert r.status_code == 200
+    assert len(unbinge.get_undoable_drips()) == 1
+    assert len(harness.episode_tags(harness.plex / 'Test Show')) == 1
+
+
+def test_drips_older_than_a_week_cannot_be_undone(harness, client, drip):
+    sid = _two_drips(harness, drip)
+    old = unbinge.get_undoable_drips()[-1]
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.HISTORY_TABLE} SET occurred_at = ? WHERE id = ?",
+                     ((unbinge.now_local() - _td(days=9)).isoformat(), old['id']))
+        conn.commit()
+    assert old['id'] not in {d['id'] for d in unbinge.get_undoable_drips()}
+    assert client.post(f"/api/undo-drip/{old['id']}").status_code == 400
+
+
+def test_history_page_offers_undo_on_recent_drips(harness, client, drip):
+    _two_drips(harness, drip)
+    html = client.get('/history').get_data(as_text=True)
+    assert html.count('undoDrip(') >= 2
+
+
+def test_restore_from_a_listed_backup_brings_data_back_and_keeps_a_safety_copy(harness, client):
+    harness.add_show('Keep Me')
+    path = unbinge.create_db_backup()
+    harness.add_show('Added After')
+    r = client.post('/api/restore-backup', data={'filename': os.path.basename(path)}).get_json()
+    assert r['status'] == 'success' and 'saved as' in r['message']
+    names = {s['show_name'] for s in unbinge.load_shows()}
+    assert names == {'Keep Me'}
+    assert len(os.listdir(unbinge.BACKUPS_DIR)) >= 2           # the original plus the safety copy
+
+
+def test_restore_from_an_uploaded_file(harness, client, tmp_path):
+    import io
+    harness.add_show('Uploaded Era')
+    path = unbinge.create_db_backup(destination_dir=str(tmp_path))
+    harness.add_show('Later')
+    with open(path, 'rb') as f:
+        data = {'file': (io.BytesIO(f.read()), 'mine.db')}
+    r = client.post('/api/restore-backup', data=data, content_type='multipart/form-data')
+    assert r.status_code == 200
+    assert {s['show_name'] for s in unbinge.load_shows()} == {'Uploaded Era'}
+
+
+def test_restore_refuses_junk_and_path_tricks(harness, client):
+    import io
+    harness.add_show('Safe')
+    bad = client.post('/api/restore-backup', data={'file': (io.BytesIO(b'not a database at all'), 'x.db')},
+                      content_type='multipart/form-data')
+    assert bad.status_code == 400
+    assert client.post('/api/restore-backup', data={'filename': '../../etc/passwd'}).status_code == 400
+    assert client.post('/api/restore-backup', data={'filename': 'unbinge-backup-nothere.db'}).status_code == 404
+    assert client.post('/api/restore-backup', data={}).status_code == 400
+    assert {s['show_name'] for s in unbinge.load_shows()} == {'Safe'}
+
+
+def test_automatic_backups_are_on_by_default_and_migration_enables_unused_ones(harness):
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.SETTINGS_TABLE} SET value = '0' WHERE key = 'auto_backup_enabled'")
+        conn.execute(f"UPDATE {unbinge.SETTINGS_TABLE} SET value = '20' WHERE key = 'schema_version'")
+        conn.commit()
+    unbinge.init_db()
+    assert unbinge.get_setting('auto_backup_enabled') == '1'
+    unbinge.set_setting('auto_backup_enabled', '0')
+    unbinge.set_setting('last_auto_backup', unbinge.now_local().isoformat())
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.SETTINGS_TABLE} SET value = '20' WHERE key = 'schema_version'")
+        conn.commit()
+    unbinge.init_db()
+    assert unbinge.get_setting('auto_backup_enabled') == '0'      # someone who used them and turned them off keeps that
+
+
+# ---------------------------------------------------------------------------
+# Catch-up mode after downtime
+# ---------------------------------------------------------------------------
+
+def test_catch_up_owes_missed_release_days(harness, client):
+    from datetime import timedelta
+    for e in range(1, 9):
+        harness.make_episode(harness.vault / 'Daily Show', 'Daily Show', 1, e, subdir='Season 01')
+    show_id = harness.add_show('Daily Show')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET release_days = '0,1,2,3,4,5,6', release_day = '0' WHERE id = ?", (show_id,))
+        conn.commit()
+    unbinge.set_setting('last_job_run', (unbinge.now_local() - timedelta(days=3)).isoformat())
+
+    plan = client.get('/api/catch-up').get_json()['plan']
+    assert plan and plan['items'][0]['name'] == 'Daily Show'
+    assert plan['items'][0]['owed_drops'] == 3
+
+    unbinge.set_setting('dry_run', '0')
+    client.post('/api/catch-up')
+    with closing(unbinge.get_db()) as conn:
+        n = conn.execute(f"SELECT COUNT(*) c FROM {unbinge.DRIPPED_TABLE} WHERE show_id = ?", (show_id,)).fetchone()['c']
+    assert n == 3
+    assert client.get('/api/catch-up').get_json()['plan'] is None
+
+
+def test_catch_up_none_when_no_gap(harness, client):
+    unbinge.set_setting('last_job_run', unbinge.now_local().isoformat())
+    assert client.get('/api/catch-up').get_json()['plan'] is None
+
+
+# ---------------------------------------------------------------------------
+# Library health check
+# ---------------------------------------------------------------------------
+
+def test_library_health_flags_gaps_duplicates_and_odd_names(harness, client):
+    for e in (1, 2, 5):
+        harness.make_episode(harness.vault / 'Gappy', 'Gappy', 1, e, subdir='Season 01')
+    harness.make_episode(harness.plex / 'Gappy', 'Gappy', 1, 2, subdir='Season 01')
+    harness.add_show('Gappy')
+    (harness.pool / 'Some.Show.2019.S01.1080p.WEBRip.x264-GRP').mkdir()
+
+    issues = client.get('/api/library-health').get_json()['issues']
+    kinds = {i['kind'] for i in issues}
+    assert {'gap', 'duplicate', 'odd_name'} <= kinds
+    gap = next(i for i in issues if i['kind'] == 'gap')
+    assert '3-4' in gap['detail']
+
+
+def test_library_health_clean_library_is_empty(harness, client):
+    for e in (1, 2):
+        harness.make_episode(harness.vault / 'Tidy', 'Tidy', 1, e, subdir='Season 01')
+    harness.add_show('Tidy')
+    assert client.get('/api/library-health').get_json()['count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Pool labels, filters and bulk tools
+# ---------------------------------------------------------------------------
+
+def test_pool_marks_bulk_set_and_clear(harness, client):
+    (harness.pool / 'Alpha').mkdir()
+    (harness.pool / 'Beta').mkdir()
+    r = client.post('/api/pool-marks', json={'names': ['Alpha', 'Beta'], 'mark': 'shortlist', 'value': True})
+    assert r.status_code == 200
+    with closing(unbinge.get_db()) as conn:
+        assert unbinge.get_pool_marks(conn)['alpha']['shortlist']
+    html = client.get('/pool?mark=shortlist').get_data(as_text=True)
+    assert 'Alpha' in html and 'Beta' in html
+    client.post('/api/pool-marks', json={'names': ['Beta'], 'mark': 'shortlist', 'value': False})
+    html = client.get('/pool?mark=shortlist').get_data(as_text=True)
+    assert 'Alpha' in html and 'value="Beta"' not in html
+    assert client.post('/api/pool-marks', json={'names': [], 'mark': 'shortlist'}).status_code == 400
+    assert client.post('/api/pool-marks', json={'names': ['x'], 'mark': 'bogus'}).status_code == 400
+
+
+def test_animation_mark_returns_show_to_animation_pool(harness, monkeypatch):
+    anim = harness.pool.parent / 'animation'
+    anim.mkdir()
+    monkeypatch.setattr(unbinge, 'ANIMATION_POOL_DIR', str(anim))
+    with closing(unbinge.get_db()) as conn:
+        unbinge.set_pool_marks(conn, ['Cartoon'], 'animation', True)
+    assert unbinge.show_is_animated({'show_name': 'Cartoon'})
+    assert not unbinge.show_is_animated({'show_name': 'Drama'})
+    assert unbinge.return_pool_dir({'show_name': 'Cartoon'}) == str(anim)
+
+
+def test_pool_length_filter(harness, client):
+    for e in range(1, 4):
+        harness.make_episode(harness.pool / 'Tiny', 'Tiny', 1, e, subdir='Season 01')
+    for e in range(1, 31):
+        harness.make_episode(harness.pool / 'Medium', 'Medium', 1, e, subdir='Season 01')
+    html = client.get('/pool?length=short').get_data(as_text=True)
+    assert 'value="Tiny"' in html and 'value="Medium"' not in html

@@ -2,6 +2,37 @@
 {% from "icons.html" import icon %}
 {% block title %}System - Unbinge{% endblock %}
 
+{% block extra_scripts %}
+<script>
+document.getElementById('healthBtn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget, out = document.getElementById('healthOut');
+    btn.disabled = true; out.textContent = 'scanning…';
+    try {
+        const data = await (await fetch('/api/library-health')).json();
+        out.textContent = '';
+        if (!data.issues || !data.issues.length) { out.textContent = 'all clear - nothing odd found.'; return; }
+        data.issues.forEach(i => {
+            const row = document.createElement('div'); row.className = 'check-row';
+            const l = document.createElement('div'); l.className = 'check-label';
+            if (i.id) { const a = document.createElement('a'); a.href = '/show/' + i.id; a.textContent = i.show; a.style.color = 'inherit'; l.appendChild(a); } else { l.textContent = i.show; }
+            const d = document.createElement('div'); d.className = 'check-detail'; d.textContent = i.detail;
+            row.appendChild(l); row.appendChild(d); out.appendChild(row);
+        });
+    } catch (err) { out.textContent = 'the scan failed - check the logs.'; }
+    finally { btn.disabled = false; }
+});
+document.getElementById('watchSyncBtn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'checking…';
+    try {
+        const res = await fetch('/api/watch-sync', { method: 'POST', headers: { 'X-CSRFToken': window.UNBINGE_CSRF_TOKEN || '' } });
+        const data = await res.json().catch(() => ({}));
+        unbingeToast(data.message || 'that failed - check the logs.', res.ok ? 'success' : 'error');
+        if (res.ok) setTimeout(() => location.reload(), 900);
+    } finally { btn.disabled = false; btn.textContent = 'check plex now'; }
+});
+</script>
+{% endblock %}
+
 {% block extra_head %}
 <style>
     .check-row {
@@ -45,6 +76,30 @@
     <p class="cell-faint" style="font-size:12.5px; margin:4px;">nothing is due on that run{% if next_run.idle %} - {{ next_run.idle }} show{{ 's' if next_run.idle != 1 }} wait for another day{% endif %}.</p>
     {% endfor %}
 </div>
+
+<div class="panel" style="margin-top:14px;">
+    <h2>{{ icon("search", 14) }}library health <button type="button" class="btn btn-sm" id="healthBtn" style="margin-left:8px;">scan</button></h2>
+    <div id="healthOut" class="check-detail">not scanned yet - it reads your folders, so it only runs when you ask.</div>
+</div>
+
+{% if watch %}
+<div class="panel" style="margin-top:14px;">
+    <h2>{{ icon("bar-chart", 14) }}watching progress <button type="button" class="btn btn-sm" id="watchSyncBtn" style="margin-left:8px;">check plex now</button></h2>
+    {% if watch.status and watch.status.ok %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-ok"></span>Plex</div>
+        <div class="check-detail">{{ watch.status.matched }} show{{ 's' if watch.status.matched != 1 }} matched · {{ watch.status.watched }} watched episodes · {{ watch.status.at[:16].replace('T',' ') }}</div></div>
+    {% if watch.status.unmatched %}<div class="check-row"><div class="check-label"><span class="check-dot check-warn"></span>Not found in Plex</div>
+        <div class="check-detail">{{ watch.status.unmatched[:4]|join(', ') }}{% if watch.status.unmatched|length > 4 %} +{{ watch.status.unmatched|length - 4 }} more{% endif %}</div></div>{% endif %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-ok"></span>Average lag</div>
+        <div class="check-detail">{% if watch.avg_lag is not none %}{{ watch.avg_lag }} days from drip to watched{% else %}nothing watched yet{% endif %}</div></div>
+    <div class="check-row"><div class="check-label"><span class="check-dot check-{{ 'warn' if watch.behind else 'ok' }}"></span>Falling behind</div>
+        <div class="check-detail">{% if watch.behind %}{% for n, c in watch.behind[:4] %}{{ n }} ({{ c }}){{ ', ' if not loop.last }}{% endfor %}{% else %}nothing {{ watch.threshold }}+ episodes behind{% endif %}</div></div>
+    {% else %}
+    <div class="check-row"><div class="check-label"><span class="check-dot check-{{ 'error' if watch.status else 'warn' }}"></span>Plex</div>
+        <div class="check-detail">{{ watch.status.error if watch.status else 'not checked yet - the first check runs within the hour' }}</div></div>
+    {% endif %}
+</div>
+{% endif %}
 
 {% if sonarr %}
 <div class="panel" style="margin-top:14px;">

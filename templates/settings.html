@@ -55,6 +55,17 @@
             <p class="hint" style="margin-top:4px;">after a show runs out of episodes it waits this long before going back to the pool. every night, a show in cooldown that gains new episodes (say, a weekly show still airing) goes back to dripping instead.</p>
         </div>
 
+        <div style="margin-top:0.9rem;">
+            <label class="checkbox-row"><input type="checkbox" id="auto_queue_enabled" name="auto_queue_enabled" {% if settings.auto_queue_enabled %}checked{% endif %}> <span style="font-size:12.5px; font-weight:500;">auto-queue the next show</span></label>
+            <p class="hint" style="margin:4px 0 0 24px; font-size:11.5px; color:var(--text-faint); line-height:1.5;">when a show is within a week of finishing and nothing is queued after it, queue the top suggestion on the best day and send a notification. each one is labelled "auto-queued" on the show's page, where you can remove it.</p>
+        </div>
+
+        <div class="field" style="margin-top:0.9rem;">
+            <label for="behind_threshold">tell me a show is falling behind after (unwatched episodes)</label>
+            <input type="number" id="behind_threshold" name="behind_threshold" min="1" max="50" value="{{ settings.behind_threshold }}">
+            <p class="hint" style="margin-top:4px;">counted from plex, for the account behind your plex token. it only shows a badge and goes in the digest; nothing is paused for you.</p>
+        </div>
+
         <div class="checkbox-row" style="margin-top:0.9rem; padding-top:0.9rem; border-top:1px solid var(--border);">
             <input type="checkbox" id="dry_run" name="dry_run" {% if settings.dry_run %}checked{% endif %}>
             <label for="dry_run" style="font-size:12.5px; color:var(--text); cursor:pointer;">dry-run mode</label>
@@ -103,6 +114,21 @@
         </div>
 
         <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
+            <label class="checkbox-row"><input type="checkbox" id="weekly_digest_enabled" name="weekly_digest_enabled" {% if settings.weekly_digest_enabled %}checked{% endif %}> <span style="font-size:12.5px; font-weight:500;">send a weekly digest on sunday morning</span></label>
+            <p class="hint" style="margin:4px 0 0 24px; font-size:11.5px; color:var(--text-faint); line-height:1.5;">what dripped and what you watched, who is falling behind, what is ending soon and what could follow it. goes to the same webhook as the other notifications.</p>
+            <div class="field-row" style="margin-top:0.7rem;">
+                <div class="field">
+                    <label for="weekly_digest_hour">hour (0-23)</label>
+                    <input type="number" id="weekly_digest_hour" name="weekly_digest_hour" min="0" max="23" value="{{ settings.weekly_digest_hour }}">
+                </div>
+                <div class="field" style="align-self:flex-end;">
+                    <button type="button" class="btn btn-sm" id="weeklyDigestBtn">send it now</button>
+                </div>
+            </div>
+            <pre id="weeklyDigestPreview" class="cell-faint" style="display:none; white-space:pre-wrap; font-size:11.5px; margin-top:8px;"></pre>
+        </div>
+
+        <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.7rem;">
                 <span style="font-size:12.5px; font-weight:500;">discord schedule message</span>
                 <span style="font-size:11.5px;"><span class="dot {{ 'dot-ok' if discord_configured else 'dot-off' }}"></span>{% if discord_message_live %}live{% elif discord_configured %}configured{% else %}not configured{% endif %}</span>
@@ -116,6 +142,21 @@
     </div>
     </section>
     <section class="set-section" data-section="integrations">
+    <div class="panel">
+        <h2>{{ icon('clock', 14) }}home showing <span class="cell-faint" style="font-weight:400;">(optional)</span></h2>
+        <p class="panel-hint">reads your weekly film from home showing, so tv suggestions avoid the same vibe as the film you are watching. your tv line-up is shared back at <code>/api/lineup</code> for it to do the same.</p>
+        <div class="field-row">
+            <div class="field">
+                <label for="home_showing_url">home showing url</label>
+                <input type="text" id="home_showing_url" name="home_showing_url" value="{{ settings.home_showing_url }}" placeholder="http://192.168.1.x:8097">
+            </div>
+            <div class="field">
+                <label for="home_showing_password">password (if it has one)</label>
+                <input type="text" id="home_showing_password" name="home_showing_password" value="{{ settings.home_showing_password }}" placeholder="its dashboard password">
+            </div>
+        </div>
+        <button type="button" class="btn btn-sm" id="test-home-showing-btn" style="margin-top:0.7rem;">test connection</button>
+    </div>
     <div class="panel">
         <h2>{{ icon('server', 14) }}sonarr <span class="cell-faint" style="font-weight:400;">(optional)</span></h2>
         <p class="panel-hint">cross-checks season/episode counts against your sonarr library, and powers the calendar's upcoming-episodes panel.</p>
@@ -216,6 +257,7 @@
         <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:0.7rem;">
             <button type="button" class="btn btn-sm" id="run-backup-now-btn">{{ icon('server', 13) }}back up now</button>
             <a href="/api/backup-db" class="btn btn-sm">{{ icon('download', 13) }}download a one-off copy</a>
+            <label class="btn btn-sm" style="cursor:pointer;">{{ icon('undo', 13) }}restore from a file…<input type="file" id="restore-file-input" accept=".db" hidden></label>
         </div>
 
         <div id="backupsList" style="margin-top:1rem; padding-top:0.8rem; border-top:1px solid var(--border);">
@@ -373,6 +415,34 @@ document.querySelectorAll('[data-sonarr-tool]').forEach(btn => {
     });
 });
 
+document.getElementById('weeklyDigestBtn').addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try {
+        const res = await fetch('/api/weekly-digest/send', { method: 'POST', headers: { 'X-CSRFToken': window.UNBINGE_CSRF_TOKEN || '' } });
+        const data = await res.json().catch(() => ({}));
+        unbingeToast(data.message || 'that failed - check the logs.', res.ok ? 'success' : 'error');
+        const box = document.getElementById('weeklyDigestPreview');
+        box.textContent = data.text || ''; box.style.display = data.text ? 'block' : 'none';
+    } finally { btn.disabled = false; }
+});
+
+document.getElementById('test-home-showing-btn').addEventListener('click', async (e) => {
+    const btn = e.currentTarget, original = btn.innerHTML;
+    const body = new FormData();
+    body.append('home_showing_url', document.getElementById('home_showing_url').value);
+    body.append('home_showing_password', document.getElementById('home_showing_password').value);
+    btn.disabled = true; btn.textContent = 'checking…';
+    try {
+        const res = await fetch('/api/test-home-showing', { method: 'POST', body });
+        const data = await res.json().catch(() => ({}));
+        unbingeToast(data.message || 'that failed - check the logs.', res.ok && data.status !== 'error' ? 'success' : 'error');
+    } catch (err) {
+        unbingeToast('could not reach unbinge.', 'error');
+    } finally {
+        btn.disabled = false; btn.innerHTML = original;
+    }
+});
+
 document.getElementById('test-sonarr-btn').addEventListener('click', async (e) => {
     const btn = e.currentTarget, original = btn.innerHTML, box = document.getElementById('sonarrReport');
     const body = new FormData();
@@ -448,6 +518,26 @@ document.getElementById('run-backup-now-btn').addEventListener('click', async (e
     loadBackupsList();
 });
 
+async function restoreBackup({ filename, file }) {
+    const ok = await unbingeConfirm({
+        title: 'restore this backup?',
+        body: 'this replaces your shows, history and settings with the backup. a copy of what you have now is saved first, so you can come back.',
+        confirmLabel: 'restore', danger: true,
+    });
+    if (!ok) return;
+    const body = new FormData();
+    if (file) body.append('file', file); else body.append('filename', filename);
+    const res = await fetch('/api/restore-backup', { method: 'POST', body, headers: { 'X-CSRFToken': window.UNBINGE_CSRF_TOKEN || '' } });
+    const data = await res.json().catch(() => ({}));
+    unbingeToast(data.message || 'that failed - check the logs.', res.ok ? 'success' : 'error');
+    if (res.ok) setTimeout(() => location.reload(), 1200);
+}
+document.getElementById('restore-file-input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) restoreBackup({ file });
+});
+
 async function loadBackupsList() {
     const container = document.getElementById('backupsList');
     try {
@@ -467,8 +557,17 @@ async function loadBackupsList() {
             const size = document.createElement('span');
             size.className = 'cell-faint';
             size.textContent = b.size_human;
+            const restore = document.createElement('button');
+            restore.type = 'button';
+            restore.className = 'btn btn-sm';
+            restore.textContent = 'restore';
+            restore.onclick = () => restoreBackup({ filename: b.filename });
+            const right = document.createElement('span');
+            right.style.cssText = 'display:flex; gap:10px; align-items:center;';
+            right.appendChild(size);
+            right.appendChild(restore);
             row.appendChild(name);
-            row.appendChild(size);
+            row.appendChild(right);
             container.appendChild(row);
         });
     } catch (err) {

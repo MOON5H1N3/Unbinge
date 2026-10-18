@@ -11,14 +11,29 @@
 <p class="empty-note">pool directory not found ({{ pool_dir }}) - check POOL_DIR in your docker-compose.yaml.</p>
 {% else %}
 
-<div class="toolbar" style="margin-bottom:1rem;">
-    <form method="GET" style="flex:1; max-width:360px;">
-        <input type="text" name="q" value="{{ query }}" placeholder="filter by name..." onchange="this.form.submit()">
+<div class="toolbar" style="margin-bottom:1rem; flex-wrap:wrap; gap:8px;">
+    <form method="GET" style="flex:1; display:flex; flex-wrap:wrap; gap:8px; min-width:260px;">
+        <input type="text" name="q" value="{{ query }}" placeholder="filter by name..." style="flex:1; min-width:160px; max-width:260px;" onchange="this.form.submit()">
+        <select name="genre" onchange="this.form.submit()"><option value="">any genre</option>{% for g in all_genres %}<option value="{{ g }}" {{ 'selected' if filters.genre == g }}>{{ g }}</option>{% endfor %}</select>
+        <select name="status" onchange="this.form.submit()"><option value="">finished or ongoing</option><option value="ended" {{ 'selected' if filters.status == 'ended' }}>finished airing</option><option value="continuing" {{ 'selected' if filters.status == 'continuing' }}>still airing</option></select>
+        <select name="length" onchange="this.form.submit()"><option value="">any length</option><option value="short" {{ 'selected' if filters.length == 'short' }}>short (≤20 eps)</option><option value="medium" {{ 'selected' if filters.length == 'medium' }}>medium (21-60)</option><option value="long" {{ 'selected' if filters.length == 'long' }}>long (60+)</option></select>
+        <select name="mark" onchange="this.form.submit()"><option value="">any label</option><option value="shortlist" {{ 'selected' if filters.mark == 'shortlist' }}>shortlist</option><option value="rewatchable" {{ 'selected' if filters.mark == 'rewatchable' }}>rewatchable</option><option value="animation" {{ 'selected' if filters.mark == 'animation' }}>animation</option></select>
+        <select name="watched" onchange="this.form.submit()"><option value="">watched or not</option><option value="yes" {{ 'selected' if filters.watched == 'yes' }}>finished before</option><option value="no" {{ 'selected' if filters.watched == 'no' }}>never finished</option></select>
     </form>
     <span class="cell-faint" style="font-size:12.5px;">{{ entries|length }} show{{ 's' if entries|length != 1 }} in {{ pool_dir }}</span>
 </div>
 
 {% if entries %}
+<div class="toolbar" id="bulkBar" style="margin-bottom:.75rem; gap:6px; flex-wrap:wrap;">
+    <button type="button" class="btn btn-sm" id="selAll">select all shown</button>
+    <span class="cell-faint" id="selCount" style="font-size:12.5px;">none selected</span>
+    <button type="button" class="btn btn-sm" data-mark="shortlist" data-value="1">add to shortlist</button>
+    <button type="button" class="btn btn-sm" data-mark="shortlist" data-value="0">remove from shortlist</button>
+    <button type="button" class="btn btn-sm" data-mark="animation" data-value="1">tag animation</button>
+    <button type="button" class="btn btn-sm" data-mark="animation" data-value="0">untag animation</button>
+    <button type="button" class="btn btn-sm" data-mark="rewatchable" data-value="1">mark rewatchable</button>
+    <button type="button" class="btn btn-sm" data-mark="rewatchable" data-value="0">unmark rewatchable</button>
+</div>
 <div class="pool-grid">
     {% for entry in entries %}
     <div class="pool-card {{ 'pool-card-active' if entry.already_added }}">
@@ -29,8 +44,8 @@
         <div class="pool-card-avatar">{{ entry.name[:2]|upper }}</div>
         {% endif %}
         <div class="pool-card-body">
-            <div class="pool-card-title">{{ entry.name }}</div>
-            <div class="pool-card-meta">{{ entry.episode_count }} episode{{ 's' if entry.episode_count != 1 }}{% if entry.pool %} · {{ entry.pool }}{% endif %}</div>
+            <div class="pool-card-title"><label style="cursor:pointer;"><input type="checkbox" class="pool-sel" value="{{ entry.name }}"> {{ entry.name }}</label></div>
+            <div class="pool-card-meta">{{ entry.episode_count }} episode{{ 's' if entry.episode_count != 1 }}{% if entry.pool %} · {{ entry.pool }}{% endif %}{% if entry.status == 'ended' %} · finished airing{% elif entry.status == 'continuing' %} · still airing{% endif %}{% if entry.marks.shortlist %} · ★ shortlist{% endif %}{% if entry.marks.rewatchable %} · rewatchable{% endif %}{% if entry.marks.animation %} · animation tag{% endif %}</div>
         </div>
         {% if entry.already_added %}
         <span class="pill pill-complete">already dripping</span>
@@ -47,4 +62,25 @@
 {% endif %}
 
 {% endif %}
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+(() => {
+  const boxes = () => [...document.querySelectorAll('.pool-sel')];
+  const chosen = () => boxes().filter(b => b.checked).map(b => b.value);
+  const count = () => { const n = chosen().length; document.getElementById('selCount').textContent = n ? n + ' selected' : 'none selected'; };
+  document.addEventListener('change', e => { if (e.target.classList && e.target.classList.contains('pool-sel')) count(); });
+  document.getElementById('selAll')?.addEventListener('click', () => { const all = boxes().every(b => b.checked); boxes().forEach(b => b.checked = !all); count(); });
+  document.querySelectorAll('#bulkBar [data-mark]').forEach(btn => btn.addEventListener('click', async () => {
+    const names = chosen();
+    if (!names.length) { unbingeToast('tick at least one show first.', 'error'); return; }
+    const res = await fetch('/api/pool-marks', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names, mark: btn.dataset.mark, value: btn.dataset.value === '1' }) });
+    const data = await res.json().catch(() => ({}));
+    unbingeToast(data.message || 'that failed.', res.ok ? 'success' : 'error');
+    if (res.ok) setTimeout(() => location.reload(), 700);
+  }));
+})();
+</script>
 {% endblock %}

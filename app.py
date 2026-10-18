@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import logging
@@ -83,6 +84,17 @@ AUTH_PASSWORD = os.environ.get('UNBINGE_PASSWORD', '') or os.environ.get('DRIPAR
 AUTH_EXEMPT_PATHS = ('/login', '/logout', '/calendar.ics', '/health', '/static/', '/posters/')
 
 
+def _basic_password_ok():
+    header = request.headers.get('Authorization', '')
+    if not header.startswith('Basic '):
+        return False
+    try:
+        _user, _, password = base64.b64decode(header[6:]).decode().partition(':')
+    except Exception:
+        return False
+    return secrets.compare_digest(password, AUTH_PASSWORD)
+
+
 def auth_enabled():
     return bool(AUTH_PASSWORD)
 
@@ -104,6 +116,11 @@ def _ensure_csrf_token():
 @app.before_request
 def _enforce_auth_and_csrf():
     if not auth_enabled() or is_exempt_path(request.path):
+        return None
+
+    # Home Showing reads the TV line-up without a browser session, so this one
+    # read-only endpoint also accepts the app password as HTTP Basic auth.
+    if request.path == '/api/lineup' and request.method == 'GET' and _basic_password_ok():
         return None
 
     if not session.get('authenticated'):
@@ -220,9 +237,12 @@ DRIP_MOVES_TABLE = 'drip_moves'
 EXCLUDED_TABLE = 'excluded_episodes'
 QUEUE_TABLE = 'show_queue'
 POOL_TVDB_CACHE_TABLE = 'pool_tvdb_cache'
+POOL_MARKS_TABLE = 'pool_marks'
 TVDB_GENRE_CACHE_TABLE = 'tvdb_genre_cache'
 SUGGESTION_FEEDBACK_TABLE = 'suggestion_feedback'
 TVDB_PROFILE_CACHE_TABLE = 'tvdb_profile_cache'
+WATCH_STATE_TABLE = 'watch_state'
+WATCH_JOB_ID = 'plex_watch_sync'
 TVDB_SERIES_CACHE_TABLE = 'tvdb_series_cache'
 TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 
@@ -233,10 +253,11 @@ TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 # graduates back to the pool, so nothing is lost - they just don't get a slot.
 SPECIALS_SEASON = 0
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 22
 
 SCHEDULER_JOB_ID = 'daily_drip_check'
 DIGEST_JOB_ID = 'daily_digest'
+WEEKLY_DIGEST_JOB_ID = 'weekly_digest'
 _scheduler_holder = {'scheduler': None}
 
 APP_VERSION = '0.2.0'
@@ -484,19 +505,26 @@ def init_db():
         'tvdb_pin': os.environ.get('TVDB_PIN', ''),
         'tvdb_token': '',
         'tvdb_token_expires': '',
+        'home_showing_url': os.environ.get('HOME_SHOWING_URL', ''),
+        'home_showing_password': os.environ.get('HOME_SHOWING_PASSWORD', ''),
         'sonarr_url': os.environ.get('SONARR_URL', ''),
         'sonarr_api_key': os.environ.get('SONARR_API_KEY', ''),
         'notify_on_drip': '1',
         'notify_on_failure': '1',
         'notify_on_missed_run': '1',
         'cooldown_grace_days': '7',
+        'behind_threshold': '3',
+        'auto_queue_enabled': '0',
+        'watch_sync_status': '',
         'sonarr_sync_paths': '1',
         'sonarr_target': 'plex',
         'sonarr_path_map': '',
         'digest_enabled': '0',
         'digest_hour': '8',
+        'weekly_digest_enabled': '1',
+        'weekly_digest_hour': '9',
         'digest_minute': '0',
-        'auto_backup_enabled': '0',
+        'auto_backup_enabled': '1',
         'backup_retention_count': '7',
         'last_auto_backup': '',
         'theme_preference': 'auto',
@@ -677,6 +705,78 @@ def run_digest_job():
         log.info("Daily digest sent.")
     except Exception as e:
         log.error("Daily digest failed: %s", e)
+
+
+def build_weekly_digest(today=None):
+    """The Sunday summary: what dripped and what was watched this week, who is
+    falling behind, what is ending and what could follow. Returns None when
+    there is nothing at all to say (a quiet install never gets an empty post)."""
+    today = today or today_local()
+    since = (now_local() - timedelta(days=7)).isoformat()
+    lines = []
+    with closing(get_db()) as conn:
+        names = {r['id']: r['show_name'] for r in conn.execute(f"SELECT id, show_name FROM {TABLE_NAME}").fetchall()}
+        dripped = conn.execute(
+            f"SELECT show_id, COUNT(*) n FROM {DRIPPED_TABLE} WHERE dripped_at >= ? GROUP BY show_id", (since,)).fetchall()
+        watched = conn.execute(
+            f"SELECT show_id, COUNT(*) n FROM {WATCH_STATE_TABLE} WHERE watched_at >= ? GROUP BY show_id", (since,)).fetchall()
+        failures = conn.execute(
+            f"SELECT COUNT(*) n FROM {HISTORY_TABLE} WHERE action = 'failed' AND occurred_at >= ?", (since,)).fetchone()['n']
+        wstats = watch_stats(conn, today=today)
+
+    def per_show(rows):
+        return ', '.join(f"{names[r['show_id']]} ×{r['n']}" for r in sorted(rows, key=lambda r: -r['n']) if r['show_id'] in names)
+
+    if dripped:
+        lines.append(f"📺 dripped: {sum(r['n'] for r in dripped)} episode(s) — {per_show(dripped)}")
+    if watched:
+        lines.append(f"👀 watched: {sum(r['n'] for r in watched)} episode(s) — {per_show(watched)}")
+    lag = wstats[None]['avg_lag']
+    if lag is not None:
+        lines.append(f"⏱ you usually watch {lag} day(s) after an episode drips")
+    threshold = behind_threshold()
+    behind = sorted(((names[i], st['behind']) for i, st in wstats.items() if i in names and st['behind'] >= threshold),
+                    key=lambda x: -x[1])
+    if behind:
+        lines.append("🐢 falling behind: " + ', '.join(f"{n} ({c} unwatched)" for n, c in behind))
+    if failures:
+        lines.append(f"⚠️ {failures} failure(s) this week — check history.")
+
+    ending = shows_ending_without_successor(days=14)
+    if ending:
+        lines.append("")
+        lines.append("ending soon with nothing queued:")
+        for e in ending:
+            when = 'finished, cooling down' if e['state'] == 'finished' else f"ends {e['ends']}"
+            pick = ''
+            try:
+                recs = get_recommendations_for_show(e['id']).get('recommendations') or []
+                if recs:
+                    pick = ' → try ' + ', '.join(r['name'] for r in recs[:2])
+            except Exception as ex:
+                log.warning("Digest suggestions unavailable for '%s': %s", e['name'], ex)
+            lines.append(f"• {e['name']} ({when}){pick}")
+    with closing(get_db()) as conn:
+        queued = conn.execute(f"SELECT show_name FROM {QUEUE_TABLE} WHERE triggered_at IS NULL ORDER BY show_name COLLATE NOCASE").fetchall()
+    if queued:
+        lines.append("")
+        lines.append("queued: " + ', '.join(r['show_name'] for r in queued[:8]) + (f" +{len(queued) - 8} more" if len(queued) > 8 else ''))
+
+    if not lines:
+        return None
+    return f"weekly digest — week to {today.strftime('%a %-d %b')}\n" + "\n".join(lines)
+
+
+def run_weekly_digest_job():
+    try:
+        message = build_weekly_digest()
+        if message is None:
+            log.info("Weekly digest skipped - nothing to report.")
+            return
+        send_notification('digest', message)
+        log.info("Weekly digest sent.")
+    except Exception as e:
+        log.error("Weekly digest failed: %s", e)
 
 
 DISCORD_ACTION_EMOJI = {'drip': '📺', 'cooldown': '⏳', 'graduate': '🎉'}
@@ -1356,7 +1456,7 @@ def api_balance_week():
     return jsonify({"status": "success", "message": f"Moved {applied} show{'s' if applied != 1 else ''}.", "applied": applied})
 
 
-def suggest_release_day(candidate_genres=None):
+def suggest_release_day(candidate_genres=None, exclude_ids=(), prefer_days=(), extra_days=()):
     """Picks a weekday for a show being added, instead of the form always
     landing on the same hardcoded default regardless of what's already
     scheduled. Primarily load-balances: counts how many of your other
@@ -1367,10 +1467,12 @@ def suggest_release_day(candidate_genres=None):
     the day that shares the fewest genres with the new show, so a pile of
     similar shows doesn't all land on the same day just because it was
     the first bucket. Returns (day: int 0-6, reason: str)."""
-    shows = load_shows()
+    shows = [sh for sh in load_shows() if sh['id'] not in set(exclude_ids)]
     day_counts = {d: 0 for d in range(7)}
     day_genres = {d: set() for d in range(7)}
     candidate_genre_set = set(candidate_genres or [])
+    for d in extra_days:      # days already spoken for (queued shows, days picked a moment ago)
+        day_counts[d] += 1
 
     if candidate_genre_set:
         with closing(get_db()) as conn:
@@ -1390,9 +1492,9 @@ def suggest_release_day(candidate_genres=None):
     tied_days = [d for d in range(7) if day_counts[d] == lightest]
 
     if len(tied_days) == 1 or not candidate_genre_set:
-        best_day = tied_days[0]
+        best_day = min(tied_days, key=lambda d: (d not in prefer_days, d))
     else:
-        best_day = min(tied_days, key=lambda d: (len(day_genres[d] & candidate_genre_set), d))
+        best_day = min(tied_days, key=lambda d: (len(day_genres[d] & candidate_genre_set), d not in prefer_days, d))
 
     if lightest == 0:
         reason = f"nothing else drips on {WEEKDAY_NAMES[best_day]} yet."
@@ -1514,11 +1616,55 @@ def find_pool_for(show_name):
     return None
 
 
+POOL_MARK_FIELDS = ('shortlist', 'rewatchable', 'animation')
+SUGGEST_SHORTLIST_BONUS = 2.5
+
+
+def get_pool_marks(conn):
+    """{lowercase folder name: {'shortlist': bool, 'rewatchable': bool, 'animation': bool}}"""
+    return {r['name_key']: {f: bool(r[f]) for f in POOL_MARK_FIELDS}
+            for r in conn.execute(f"SELECT * FROM {POOL_MARKS_TABLE}").fetchall()}
+
+
+def set_pool_marks(conn, names, field, value):
+    """Sets one mark on many pool folders; a row with every mark off is removed."""
+    if field not in POOL_MARK_FIELDS:
+        raise ValueError(f"unknown mark '{field}'")
+    for name in names:
+        key = str(name).strip().lower()
+        if not key:
+            continue
+        conn.execute(f"INSERT OR IGNORE INTO {POOL_MARKS_TABLE} (name_key) VALUES (?)", (key,))
+        conn.execute(f"UPDATE {POOL_MARKS_TABLE} SET {field} = ? WHERE name_key = ?", (1 if value else 0, key))
+    conn.execute(f"DELETE FROM {POOL_MARKS_TABLE} WHERE shortlist = 0 AND rewatchable = 0 AND animation = 0")
+    conn.commit()
+
+
+def pool_folder_cached_facts(conn, folder_name):
+    """Genres and airing status for a pool folder from the caches only - never
+    calls TVDB, so the pool page stays quick. Empty when it is not cached yet."""
+    row = conn.execute(f"SELECT tvdb_id FROM {POOL_TVDB_CACHE_TABLE} WHERE folder_name = ?", (folder_name,)).fetchone()
+    if not row or not row['tvdb_id']:
+        return {'genres': [], 'status': ''}
+    g = conn.execute(f"SELECT genres FROM {TVDB_GENRE_CACHE_TABLE} WHERE tvdb_id = ?", (row['tvdb_id'],)).fetchone()
+    p = conn.execute(f"SELECT status FROM {TVDB_PROFILE_CACHE_TABLE} WHERE tvdb_id = ?", (row['tvdb_id'],)).fetchone()
+    return {'genres': [x for x in (g['genres'].split(',') if g else []) if x],
+            'status': (p['status'] if p and p['status'] else '')}
+
+
 def show_is_animated(show):
     """Animated by TVDB genre ('animation'/'anime') or by your own tag."""
     tags = {t.lower() for t in parse_tags(show.get('tags') or '')}
     if tags & {'animation', 'animated', 'anime'}:
         return True
+    try:
+        with closing(get_db()) as conn:
+            mark = conn.execute(f"SELECT animation FROM {POOL_MARKS_TABLE} WHERE name_key = ?",
+                                (str(show.get('show_name', '')).lower(),)).fetchone()
+        if mark and mark['animation']:
+            return True
+    except sqlite3.Error:
+        pass
     if show.get('tvdb_id'):
         try:
             with closing(get_db()) as conn:
@@ -1538,6 +1684,62 @@ def return_pool_dir(show):
     if ANIMATION_POOL_DIR and show_is_animated(show):
         return pool_dirs()[-1]
     return POOL_DIR
+
+
+# ---------------------------------------------------------------------------
+# Home Showing (films) - the sister app that plans a film a week. Unbinge
+# reads its schedule so suggestions for TV avoid the same vibe as this
+# week's film, and offers its own line-up back at /api/lineup.
+# ---------------------------------------------------------------------------
+HOME_SHOWING_CACHE_SECONDS = 600
+_home_showing_cache = {'key': None, 'at': 0.0, 'films': []}
+
+# TMDB (films) and TVDB (series) mostly share genre names; these are the ones that differ.
+_GENRE_ALIASES = {'sci-fi': 'science fiction', 'sci-fi & fantasy': 'science fiction', 'action & adventure': 'action',
+                  'war & politics': 'war', 'tv movie': ''}
+
+
+def _norm_genre(name):
+    g = str(name or '').strip().lower()
+    return _GENRE_ALIASES.get(g, g)
+
+
+def home_showing_fetch(base, password, timeout=6):
+    """Raw schedule from Home Showing's /api/schedule. Raises requests
+    exceptions or ValueError on trouble."""
+    resp = requests.get(base.rstrip('/') + '/api/schedule', auth=('', password) if password else None, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def home_showing_films(force=False):
+    """The film this week and the next one, from Home Showing, as
+    [{'title', 'genres': [lowercase], 'week', 'status', 'current'}].
+    Cached for ten minutes; returns [] when it is not set up or unreachable
+    (a missing sister app must never break suggestions)."""
+    base = get_setting('home_showing_url', '').strip()
+    if not base:
+        return []
+    password = get_setting('home_showing_password', '').strip()
+    key = (base, password)
+    now = time.time()
+    if not force and _home_showing_cache['key'] == key and now - _home_showing_cache['at'] < HOME_SHOWING_CACHE_SECONDS:
+        return _home_showing_cache['films']
+    try:
+        data = home_showing_fetch(base, password)
+        films = []
+        for w in (data.get('weeks') or [])[:2]:
+            f = w.get('film')
+            if not f:
+                continue
+            genres = sorted({g for g in (_norm_genre(x) for x in (f.get('genres') or [])) if g})
+            films.append({'title': f.get('title') or '', 'genres': genres, 'week': w.get('week'),
+                          'status': w.get('status'), 'current': bool(w.get('current'))})
+    except (requests.RequestException, ValueError, AttributeError) as e:
+        log.warning("Home Showing unreachable (%s) - suggestions carry on without films.", e)
+        films = []
+    _home_showing_cache.update(key=key, at=now, films=films)
+    return films
 
 
 def _taste_affinity(shows_genres, generic):
@@ -1610,6 +1812,16 @@ def _build_suggestion_context(conn, today, leaving_ids):
         if g - generic:
             lineup.append(g - generic)
 
+    # The film you are watching this week and next (from Home Showing) counts
+    # as part of the same week, so a TV pick doesn't repeat its vibe.
+    movies = home_showing_films()
+    for m in movies:
+        mg = frozenset(m['genres'])
+        if mg - generic:
+            lineup.append(mg - generic)
+        if m['status'] == 'watched' and mg:
+            taste_inputs.append((mg, 1.0))
+
     # Shows you already watched to the end: they go back to the pool when
     # they finish, so without this they would be suggested straight away.
     watched = {}
@@ -1631,15 +1843,18 @@ def _build_suggestion_context(conn, today, leaving_ids):
             taste_inputs.append((by_name[k]['genres'], -1.0))
     affinity = _taste_affinity(taste_inputs, generic)
 
+    marks = get_pool_marks(conn)
     eligible = []
     for c in candidates:
         key = c['name'].lower()
         if key in hidden:
             continue
-        if key in watched and watched[key] <= SUGGEST_WATCHED_EXCLUDE_DAYS:
+        mk = marks.get(key, {})
+        if key in watched and watched[key] <= SUGGEST_WATCHED_EXCLUDE_DAYS and not mk.get('rewatchable'):
             continue
+        c['shortlisted'] = bool(mk.get('shortlist'))
         c['taste'] = (sum(affinity.get(g, 0.0) for g in c['distinct']) / len(c['distinct'])) if c['distinct'] else 0.0
-        c['watched_before'] = key in watched and watched[key] <= SUGGEST_WATCHED_MEMORY_DAYS
+        c['watched_before'] = key in watched and watched[key] <= SUGGEST_WATCHED_MEMORY_DAYS and not mk.get('rewatchable')
         fb = feedback.get(key)
         c['shown_weeks'] = fb['shown_weeks'] if fb else 0
         c['last_shown_week'] = fb['last_shown_week'] if fb else None
@@ -1648,7 +1863,7 @@ def _build_suggestion_context(conn, today, leaving_ids):
     return {
         'candidates': eligible, 'generic': generic, 'lineup': lineup, 'hidden': len(hidden),
         'unindexed': unindexed, 'pool_total': len(pool_shows), 'resolved': len(candidates),
-        'pace': _weekly_pace(shows), 'theme': current_seasonal_theme(today), 'today': today,
+        'movies': [m['title'] for m in movies if m['title']], 'pace': _weekly_pace(shows), 'theme': current_seasonal_theme(today), 'today': today,
         'this_week': f"{today.isocalendar()[0]}-{today.isocalendar()[1]:02d}",
         'feedback': feedback, 'enrich': {}, 'profile_fetches': 0, 'refining': set(),
     }
@@ -1765,6 +1980,7 @@ def _plan_suggestions(conn, ctx, anchors):
                          - SUGGEST_CROWD_PENALTY * crowd[c['name']]
                          - SUGGEST_FATIGUE_STEP * min(max(earlier, 0), SUGGEST_FATIGUE_MAX_WEEKS)
                          - (SUGGEST_WATCHED_PENALTY if c['watched_before'] else 0)
+                         + (SUGGEST_SHORTLIST_BONUS if c.get('shortlisted') else 0)
                          + SUGGEST_JITTER * (_rotation_key(c['name'], today) % 1000) / 1000)
                 scored.append({'c': c, 'score': score, 'kind': kind, 'seasonal': bool(seasonal),
                                'matched': matched, 'gap': gap})
@@ -1903,6 +2119,7 @@ def get_recommendations_for_show(show_id, today=None):
             'pool_total': ctx['pool_total'],
             'unindexed': ctx['unindexed'],
             'refining': len(ctx['refining']),
+            'movies': ctx['movies'],
         }
 
 
@@ -2391,6 +2608,8 @@ def _build_show_records(ep_conn, rows):
     """The per-show half of load_shows: turns database rows into display
     records, scanning each show's vault folder once."""
     shows_list = []
+    wstats = watch_stats(ep_conn)
+    threshold = behind_threshold()
     for r in rows:
         release_days_raw = safe_get(r, 'release_days', None) or str(safe_get(r, 'release_day', '0'))
         show_id = safe_get(r, 'id', 0)
@@ -2447,6 +2666,8 @@ def _build_show_records(ep_conn, rows):
             'paused': bool(safe_get(r, 'paused', 0)),
             'target_end_date': safe_get(r, 'target_end_date', None),
             'plan_mode': safe_get(r, 'plan_mode', None),
+            'behind': wstats.get(show_id, {}).get('behind', 0),
+            'behind_flag': wstats.get(show_id, {}).get('behind', 0) >= threshold,
         })
 
     return shows_list
@@ -2701,6 +2922,18 @@ def run_migrations(conn):
     if current < 18:
         _migrate_v18_tvdb_profile_cache(conn)
 
+    if current < 19:
+        _migrate_v19_watch_state(conn)
+
+    if current < 20:
+        _migrate_v20_queue_auto(conn)
+
+    if current < 21:
+        _migrate_v21_backups_on(conn)
+
+    if current < 22:
+        _migrate_v22_pool_marks(conn)
+
     conn.execute(
         f"INSERT INTO {SETTINGS_TABLE} (key, value) VALUES ('schema_version', ?) "
         f"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2897,6 +3130,57 @@ def _migrate_v15_target_end_date(conn):
     if 'plan_mode' not in existing_cols:
         conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN plan_mode TEXT;")
         log.info("Added plan_mode column.")
+
+
+def _migrate_v22_pool_marks(conn):
+    """Your own labels on pool folders: shortlist (suggestions favour it),
+    rewatchable (can be suggested again even if you finished it recently) and
+    animation (counts as animated, so it returns to the animation pool)."""
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {POOL_MARKS_TABLE} (
+            name_key TEXT PRIMARY KEY,
+            shortlist INTEGER NOT NULL DEFAULT 0,
+            rewatchable INTEGER NOT NULL DEFAULT 0,
+            animation INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    log.info("Added pool_marks table.")
+
+
+def _migrate_v21_backups_on(conn):
+    """Nightly backups are now on by default. An install that has never taken
+    an automatic backup (and so never chose either way) gets them switched on;
+    anyone who has used them keeps their own setting."""
+    row = lambda k: conn.execute(f"SELECT value FROM {SETTINGS_TABLE} WHERE key = ?", (k,)).fetchone()
+    flag, last = row('auto_backup_enabled'), row('last_auto_backup')
+    if flag is not None and flag['value'] == '0' and (last is None or not last['value']):
+        conn.execute(f"UPDATE {SETTINGS_TABLE} SET value = '1' WHERE key = 'auto_backup_enabled'")
+        log.info("Turned on automatic nightly backups.")
+
+
+def _migrate_v20_queue_auto(conn):
+    """Marks queue entries that Unbinge added by itself (auto-queue), so they
+    are labelled in the queue and easy to undo."""
+    cols = {r['name'] for r in conn.execute(f"PRAGMA table_info({QUEUE_TABLE})").fetchall()}
+    if 'auto' not in cols:
+        conn.execute(f"ALTER TABLE {QUEUE_TABLE} ADD COLUMN auto INTEGER NOT NULL DEFAULT 0;")
+        log.info("Added auto column to the queue.")
+
+
+def _migrate_v19_watch_state(conn):
+    """When each episode was watched in Plex (by the account behind
+    PLEX_TOKEN), copied here by the hourly watch sync so the dashboard can
+    show how far behind you are and how long you take to watch a drip."""
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {WATCH_STATE_TABLE} (
+            show_id INTEGER NOT NULL,
+            season INTEGER NOT NULL,
+            episode INTEGER NOT NULL,
+            watched_at TEXT NOT NULL,
+            PRIMARY KEY (show_id, season, episode)
+        );
+    """)
+    log.info("Added watch_state table.")
 
 
 def _migrate_v18_tvdb_profile_cache(conn):
@@ -3346,6 +3630,163 @@ def trigger_plex_refresh():
 
 
 # ---------------------------------------------------------------------------
+# Plex watch progress
+#
+# Reads which dripped episodes have been watched in Plex (only the account
+# behind PLEX_TOKEN counts) so Unbinge can show the day an episode dripped
+# next to the day it was watched, how long that usually takes, and when a
+# show is falling behind. Read-only: it never changes anything in Plex.
+# ---------------------------------------------------------------------------
+BEHIND_GRACE_DAYS = 1   # an episode that dripped today or yesterday isn't "behind" yet
+
+
+def _plex_server_for_watch():
+    """A connected PlexServer, or None when Plex isn't configured. A seam for tests."""
+    if not PLEX_URL or not PLEX_TOKEN:
+        return None
+    from plexapi.server import PlexServer
+    return PlexServer(PLEX_URL, PLEX_TOKEN)
+
+
+def _folder_name(path):
+    return os.path.basename(str(path or '').replace('\\', '/').rstrip('/')).lower()
+
+
+def _find_plex_show(plex_shows, show):
+    """The Plex show that is this Unbinge show: same folder name first (the
+    Plex path is the Plex machine's own, so only the last part is comparable),
+    then the same title, then the same TVDB id."""
+    name = show['show_name'].lower()
+    for ps in plex_shows:
+        if any(_folder_name(loc) == name for loc in (getattr(ps, 'locations', None) or [])):
+            return ps
+    for ps in plex_shows:
+        if (getattr(ps, 'title', '') or '').lower() == name:
+            return ps
+    tvdb = show.get('tvdb_id')
+    if tvdb:
+        for ps in plex_shows:
+            if any(str(getattr(g, 'id', '')) == f'tvdb://{tvdb}' for g in (getattr(ps, 'guids', None) or [])):
+                return ps
+    return None
+
+
+def sync_watch_state(only_show_id=None):
+    """Copies watched/unwatched from Plex into watch_state for every show that
+    has dripped episodes. Returns {'ok', 'matched', 'watched', 'unmatched',
+    'error', 'at'} and stores it as the sync status."""
+    status = {'ok': False, 'matched': 0, 'watched': 0, 'unmatched': [], 'error': None, 'at': now_local().isoformat()}
+    try:
+        plex = _plex_server_for_watch()
+    except Exception as e:
+        plex = None
+        status['error'] = f"Plex: {e}"
+    if plex is None and not status['error']:
+        status['error'] = 'Plex is not configured (PLEX_URL / PLEX_TOKEN).'
+    if status['error']:
+        set_setting('watch_sync_status', json.dumps(status))
+        return status
+    try:
+        if PLEX_LIBRARY_ID:
+            sections = [plex.library.sectionByID(int(PLEX_LIBRARY_ID))]
+        else:
+            sections = [sec for sec in plex.library.sections() if getattr(sec, 'type', '') == 'show']
+        plex_shows = [ps for sec in sections for ps in sec.all()]
+        with closing(get_db()) as conn:
+            rows = [dict(r) for r in conn.execute(
+                f"SELECT id, show_name, tvdb_id FROM {TABLE_NAME} WHERE id IN (SELECT DISTINCT show_id FROM {DRIPPED_TABLE})").fetchall()]
+            for sh in rows:
+                if only_show_id and sh['id'] != only_show_id:
+                    continue
+                ps = _find_plex_show(plex_shows, sh)
+                if ps is None:
+                    status['unmatched'].append(sh['show_name'])
+                    continue
+                status['matched'] += 1
+                watched = {}
+                for ep in ps.episodes():
+                    seen = getattr(ep, 'lastViewedAt', None)
+                    if (getattr(ep, 'viewCount', 0) or 0) > 0 and seen is not None and ep.parentIndex is not None and ep.index is not None:
+                        watched[(int(ep.parentIndex), int(ep.index))] = seen.isoformat() if hasattr(seen, 'isoformat') else str(seen)
+                conn.execute(f"DELETE FROM {WATCH_STATE_TABLE} WHERE show_id = ?", (sh['id'],))
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {WATCH_STATE_TABLE} (show_id, season, episode, watched_at) VALUES (?, ?, ?, ?)",
+                    [(sh['id'], s_, e_, at) for (s_, e_), at in watched.items()])
+                status['watched'] += len(watched)
+            conn.commit()
+        status['ok'] = True
+    except Exception as e:
+        log.warning("Plex watch sync failed: %s", e)
+        status['error'] = f"Plex watch sync failed: {e}"
+    set_setting('watch_sync_status', json.dumps(status))
+    return status
+
+
+def _date_of(iso):
+    try:
+        return datetime.fromisoformat(iso).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def watch_stats(conn, show_id=None, today=None):
+    """Watch progress per show: {show_id: {'dripped', 'watched', 'behind',
+    'avg_lag'}} plus an overall average lag under key None. 'behind' counts
+    dripped episodes older than BEHIND_GRACE_DAYS that Plex hasn't seen
+    watched; lag is days from drip to first watch (never negative: something
+    watched before it dripped counts as 0)."""
+    today = today or today_local()
+    where, args = ("WHERE d.show_id = ?", (show_id,)) if show_id else ("", ())
+    rows = conn.execute(
+        f"""SELECT d.show_id, d.season, d.episode, d.dripped_at, w.watched_at
+            FROM {DRIPPED_TABLE} d LEFT JOIN {WATCH_STATE_TABLE} w
+              ON w.show_id = d.show_id AND w.season = d.season AND w.episode = d.episode {where}""", args).fetchall()
+    out, all_lags = {}, []
+    for r in rows:
+        st = out.setdefault(r['show_id'], {'dripped': 0, 'watched': 0, 'behind': 0, 'lags': []})
+        st['dripped'] += 1
+        dripped_on = _date_of(r['dripped_at'])
+        if r['watched_at']:
+            st['watched'] += 1
+            watched_on = _date_of(r['watched_at'])
+            if dripped_on and watched_on:
+                lag = max(0, (watched_on - dripped_on).days)
+                st['lags'].append(lag)
+                all_lags.append(lag)
+        elif dripped_on and (today - dripped_on).days > BEHIND_GRACE_DAYS:
+            st['behind'] += 1
+    for st in out.values():
+        st['avg_lag'] = round(sum(st['lags']) / len(st['lags']), 1) if st['lags'] else None
+        del st['lags']
+    out[None] = {'avg_lag': round(sum(all_lags) / len(all_lags), 1) if all_lags else None}
+    return out
+
+
+def behind_threshold():
+    try:
+        return max(1, int(get_setting('behind_threshold', '3') or 3))
+    except ValueError:
+        return 3
+
+
+def watch_sync_status():
+    raw = get_setting('watch_sync_status', '')
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def run_watch_sync_job():
+    try:
+        status = sync_watch_state()
+        if status['ok']:
+            log.info("Plex watch sync: %d show(s) matched, %d episode(s) watched.", status['matched'], status['watched'])
+    except Exception as e:
+        log.error("Plex watch sync failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Drip logic
 # ---------------------------------------------------------------------------
 def ics_escape(text):
@@ -3605,6 +4046,26 @@ def get_undoable_drip():
     return dict(row) if row else None
 
 
+UNDO_WINDOW_DAYS = 7
+
+
+def get_undoable_drips(days=UNDO_WINDOW_DAYS):
+    """Every drip from the last `days` days that can still be put back:
+    [{'id', 'show_id', 'show_name', 'detail', 'occurred_at'}], newest first.
+    Only shows that are still active qualify (see undo_drip)."""
+    since = (now_local() - timedelta(days=days)).isoformat()
+    with closing(get_db()) as conn:
+        rows = conn.execute(f"""
+            SELECT h.id, h.show_id, h.show_name, h.detail, h.occurred_at
+            FROM {HISTORY_TABLE} h
+            WHERE h.action = 'dripped' AND h.occurred_at >= ?
+              AND EXISTS (SELECT 1 FROM {DRIP_MOVES_TABLE} m WHERE m.history_id = h.id AND m.undone = 0)
+              AND EXISTS (SELECT 1 FROM {TABLE_NAME} t WHERE t.id = h.show_id)
+            ORDER BY h.occurred_at DESC
+        """, (since,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def undo_drip(history_id):
     """Reverses one drip: moves every file it moved back from plex_path to
     its original vault_path location, and un-marks those episodes as
@@ -3782,6 +4243,86 @@ def get_queue_for_show(show_id):
             (show_id,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def queue_successor(anchor_id, show_name, auto=False):
+    """Queues pool show `show_name` to start when show `anchor_id` finishes,
+    on the best days: the lightest of your week (the finishing show's days
+    count as free, other queued shows' days as taken), keeping the same
+    number of drop days and episodes per drop as the show it follows.
+    Returns {'entry_id', 'release_days', 'days_text', 'reason'} or raises
+    ValueError with a message fit to show the user."""
+    try:
+        safe_show_path(POOL_DIR, show_name)
+    except ValueError as e:
+        raise ValueError(str(e))
+    if not find_pool_for(show_name):
+        raise ValueError(f"'{show_name}' was not found in the pool directory")
+    with closing(get_db()) as conn:
+        anchor = conn.execute(f"SELECT release_days, episodes_per_drop FROM {TABLE_NAME} WHERE id = ?", (anchor_id,)).fetchone()
+        if not anchor:
+            raise ValueError("Show not found")
+        genres = []
+        try:
+            tvdb_id = resolve_pool_folder_tvdb_id(conn, show_name)
+            if tvdb_id:
+                genres = get_genre_data_for_tvdb_id(conn, tvdb_id).get('genres', [])
+        except Exception as e:
+            log.warning("Genres unavailable for '%s' while picking a day: %s", show_name, e)
+        taken = []
+        for q in conn.execute(f"SELECT release_days FROM {QUEUE_TABLE} WHERE triggered_at IS NULL").fetchall():
+            taken += parse_release_days(q['release_days'])
+        anchor_days = parse_release_days(anchor['release_days'] or '0') or [0]
+        chosen, reasons = [], []
+        for _ in range(len(anchor_days)):
+            day, reason = suggest_release_day(genres, exclude_ids={anchor_id}, prefer_days=anchor_days, extra_days=taken + chosen)
+            if day in chosen:
+                break
+            chosen.append(day)
+            reasons.append(reason)
+        chosen.sort()
+        release_days = ','.join(str(d) for d in chosen)
+        cur = conn.execute(
+            f"""INSERT INTO {QUEUE_TABLE}
+                (show_name, trigger_type, trigger_show_id, trigger_date, release_days, episodes_per_drop, created_at, auto)
+                VALUES (?, 'after_show', ?, NULL, ?, ?, ?, ?)""",
+            (show_name, anchor_id, release_days, anchor['episodes_per_drop'] or 1, now_local().isoformat(), 1 if auto else 0))
+        name = conn.execute(f"SELECT show_name FROM {TABLE_NAME} WHERE id = ?", (anchor_id,)).fetchone()['show_name']
+        days_text = ' & '.join(WEEKDAY_NAMES[d] for d in chosen)
+        log_history(conn, anchor_id, show_name, 'queued',
+                    f"{'Auto-queued' if auto else 'Queued'} after {name}, dropping {days_text} ({reasons[0]})")
+        conn.commit()
+        return {'entry_id': cur.lastrowid, 'release_days': release_days, 'days_text': days_text, 'reason': reasons[0]}
+
+
+AUTO_QUEUE_DAYS_AHEAD = 7
+
+
+def run_auto_queue():
+    """Opt-in: queues the best suggestion for every show that ends within a
+    week (or has finished) with nothing lined up after it. Returns the list
+    of [(ending show, queued show, days_text)] it queued."""
+    if get_setting('auto_queue_enabled', '0') != '1':
+        return []
+    done = []
+    for e in shows_ending_without_successor(days=AUTO_QUEUE_DAYS_AHEAD):
+        rec = {}
+        for _ in range(12):      # a big pool is indexed in batches; let it finish
+            rec = get_recommendations_for_show(e['id'])
+            if rec.get('status') != 'ok' or not rec.get('unindexed'):
+                break
+        picks = [r for r in (rec.get('recommendations') or []) if r.get('kind') == 'match']
+        if rec.get('status') != 'ok' or not picks:
+            continue
+        try:
+            res = queue_successor(e['id'], picks[0]['name'], auto=True)
+        except ValueError as err:
+            log.warning("Auto-queue skipped '%s': %s", picks[0]['name'], err)
+            continue
+        done.append((e['name'], picks[0]['name'], res['days_text']))
+        send_notification('queued', f"➕ Auto-queued '{picks[0]['name']}' to follow '{e['name']}' (drops {res['days_text']}). "
+                                    f"Remove it from {e['name']}'s page if you'd rather pick something else.")
+    return done
 
 
 def series_known_ended(show):
@@ -4224,6 +4765,10 @@ def run_drip_job(force_show_id=None, skip_cooldown=False):
 
         if force_show_id is None and not dry_run:
             set_setting('last_job_run', now_local().isoformat())
+            try:
+                run_auto_queue()
+            except Exception as e:
+                log.error("Auto-queue failed: %s", e)
 
         # Every run leaves a record, scheduled or manual, so a
         # failed 3am job is visible on the dashboard rather than only in
@@ -4296,6 +4841,148 @@ def detect_missed_run():
     )
 
 
+def _compress_ranges(nums):
+    out, nums = [], sorted(nums)
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    return ', '.join(out)
+
+
+def scan_library_health():
+    """Looks for trouble in the library without touching it: missing folders,
+    gaps in a season's numbering, the same episode in the vault AND Plex or
+    twice in one folder, video files with no SxxExx tag, and pool folders
+    named like release downloads. Returns [{'show', 'id', 'kind', 'detail'}],
+    kind in missing_path / gap / duplicate / unmatched / odd_name."""
+    issues = []
+    for sh in load_shows():
+        if sh['completed_at']:
+            continue
+        name, sid = sh['show_name'], sh['id']
+        vault, plex = sh.get('vault_path') or '', sh.get('plex_path') or ''
+        if vault and not os.path.isdir(vault):
+            issues.append({'show': name, 'id': sid, 'kind': 'missing_path', 'detail': f"vault folder is missing ({vault})"})
+        v_eps = scan_episode_files(vault)
+        p_eps = scan_episode_files(plex)
+        v_tags = {(e['season'], e['episode']) for e in v_eps}
+        p_tags = {(e['season'], e['episode']) for e in p_eps}
+        both = sorted(v_tags & p_tags)
+        if both:
+            issues.append({'show': name, 'id': sid, 'kind': 'duplicate',
+                           'detail': f"{len(both)} episode{'s' if len(both) != 1 else ''} in both the vault and Plex (e.g. S{both[0][0]:02d}E{both[0][1]:02d})"})
+        for label, eps in (('vault', v_eps), ('Plex', p_eps)):
+            seen, dup = set(), set()
+            for e in eps:
+                if os.path.splitext(e['abs_path'])[1].lower() not in VIDEO_EXTENSIONS:
+                    continue
+                key = (e['season'], e['episode'])
+                if key in seen:
+                    dup.add(key)
+                seen.add(key)
+            if dup:
+                d = sorted(dup)[0]
+                issues.append({'show': name, 'id': sid, 'kind': 'duplicate',
+                               'detail': f"{len(dup)} episode{'s' if len(dup) != 1 else ''} appear twice in {label} (e.g. S{d[0]:02d}E{d[1]:02d})"})
+        by_season = {}
+        for se, ep in v_tags | p_tags:
+            if se > 0:
+                by_season.setdefault(se, set()).add(ep)
+        for se in sorted(by_season):
+            gaps = set(range(1, max(by_season[se]) + 1)) - by_season[se]
+            if gaps:
+                issues.append({'show': name, 'id': sid, 'kind': 'gap', 'detail': f"season {se} is missing episode {_compress_ranges(gaps)}"})
+        unm = find_unmatched_files(vault)
+        if unm:
+            issues.append({'show': name, 'id': sid, 'kind': 'unmatched',
+                           'detail': f"{len(unm)} video file{'s' if len(unm) != 1 else ''} with no episode number ({os.path.basename(unm[0]['rel_path'])})"})
+    for folder, _pool in list_pool_folders():
+        if _normalize_show_name_for_tvdb_search(folder) != folder:
+            issues.append({'show': folder, 'id': None, 'kind': 'odd_name', 'detail': 'pool folder is named like a download'})
+    return issues
+
+
+CATCH_UP_MAX_DROPS = 4          # never release more than this many drops' worth in one catch-up
+CATCH_UP_LOOKBACK_DAYS = 14
+
+
+def build_catch_up_plan(today=None):
+    """After downtime: for each show, how many of its release days passed
+    without a drip, and so how many episodes it owes. Counts the days after
+    the last drip check up to today, but never before a show's own latest
+    drip (so a show promoted during the gap isn't double-dripped), and
+    skips shows that already ran today. Returns None when there was no gap.
+    {'since', 'days', 'items': [{'id', 'name', 'owed_drops', 'episodes', 'detail'}]}"""
+    last_iso = get_setting('last_job_run', '')
+    if not last_iso:
+        return None
+    try:
+        last = datetime.fromisoformat(last_iso)
+    except ValueError:
+        return None
+    if (now_local() - last).total_seconds() < 30 * 3600:
+        return None
+    today = today or today_local()
+    start = max(last.date() + timedelta(days=1), today - timedelta(days=CATCH_UP_LOOKBACK_DAYS))
+    items = []
+    with closing(get_db()) as conn:
+        latest = {r['show_id']: _date_of(r['at']) for r in conn.execute(
+            f"SELECT show_id, MAX(dripped_at) AS at FROM {DRIPPED_TABLE} GROUP BY show_id").fetchall()}
+    for sh in load_shows():
+        if sh['paused'] or sh['completed_at'] or sh['episodes_remaining'] <= 0:
+            continue
+        with closing(get_db()) as conn:
+            row = conn.execute(f"SELECT last_run_date FROM {TABLE_NAME} WHERE id = ?", (sh['id'],)).fetchone()
+        if row and row['last_run_date'] == today.isoformat():
+            continue
+        first = start
+        if latest.get(sh['id']):
+            first = max(first, latest[sh['id']] + timedelta(days=1))
+        days = parse_release_days(sh['release_days'])
+        owed = sum(1 for i in range((today - first).days + 1) if (first + timedelta(days=i)).weekday() in days)
+        owed = min(owed, CATCH_UP_MAX_DROPS)
+        if owed <= 0:
+            continue
+        per_drop = max(1, int(sh['episodes_per_drop'] or 1))
+        episodes = min(owed * per_drop, sh['episodes_remaining'])
+        items.append({'id': sh['id'], 'name': sh['show_name'], 'owed_drops': owed, 'episodes': episodes,
+                      'detail': f"{owed} missed drop{'s' if owed != 1 else ''} → {episodes} episode{'s' if episodes != 1 else ''}"})
+    return {'since': last.isoformat(), 'days': (today - last.date()).days, 'items': items}
+
+
+def run_catch_up():
+    """Releases what build_catch_up_plan says is owed. Returns [(name, result)]."""
+    plan = build_catch_up_plan()
+    if not plan:
+        return []
+    out = []
+    conn = get_db()
+    try:
+        for item in plan['items']:
+            row = conn.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (item['id'],)).fetchone()
+            if not row:
+                continue
+            show = dict(row)
+            show['episodes_per_drop'] = item['episodes']
+            try:
+                result = process_show_drip(conn, show)
+                conn.commit()
+                out.append((item['name'], result))
+            except Exception as e:
+                conn.rollback()
+                log.error("Catch-up failed for '%s': %s", item['name'], e)
+                out.append((item['name'], f"failed: {e}"))
+        set_setting('last_job_run', now_local().isoformat())
+    finally:
+        conn.close()
+    sync_discord_schedule_message()
+    return out
+
+
 def start_scheduler():
     hour = int(get_setting('drip_hour', '3') or 3)
     minute = int(get_setting('drip_minute', '0') or 0)
@@ -4314,6 +5001,17 @@ def start_scheduler():
             id=DIGEST_JOB_ID, max_instances=1, coalesce=True,
         )
 
+    if get_setting('weekly_digest_enabled', '1') == '1':
+        scheduler.add_job(
+            run_weekly_digest_job, 'cron', day_of_week='sun', hour=int(get_setting('weekly_digest_hour', '9') or 9), minute=0,
+            id=WEEKLY_DIGEST_JOB_ID, max_instances=1, coalesce=True,
+        )
+    if PLEX_URL and PLEX_TOKEN:
+        scheduler.add_job(
+            run_watch_sync_job, 'interval', minutes=60,
+            id=WATCH_JOB_ID, max_instances=1, coalesce=True,
+        )
+
     scheduler.start()
     _scheduler_holder['scheduler'] = scheduler
     log.info(
@@ -4329,6 +5027,21 @@ def reschedule_drip_job(hour, minute):
         scheduler.reschedule_job(
             SCHEDULER_JOB_ID, trigger='cron', hour=hour, minute=minute, timezone=LOCAL_TZ
         )
+
+
+def reschedule_weekly_digest_job(enabled, hour):
+    scheduler = _scheduler_holder.get('scheduler')
+    if not scheduler:
+        return
+    existing = scheduler.get_job(WEEKLY_DIGEST_JOB_ID)
+    if enabled:
+        if existing:
+            scheduler.reschedule_job(WEEKLY_DIGEST_JOB_ID, trigger='cron', day_of_week='sun', hour=hour, minute=0, timezone=LOCAL_TZ)
+        else:
+            scheduler.add_job(run_weekly_digest_job, 'cron', day_of_week='sun', hour=hour, minute=0,
+                              id=WEEKLY_DIGEST_JOB_ID, max_instances=1, coalesce=True)
+    elif existing:
+        scheduler.remove_job(WEEKLY_DIGEST_JOB_ID)
 
 
 def reschedule_digest_job(enabled, hour, minute):
@@ -5061,7 +5774,7 @@ def index():
     return render_template(
         'index.html', shows=shows, current_sort=sort,
         next_up_map=next_up_map, counts=counts, next_run_iso=next_run_iso,
-        last_run=last_run, undoable=undoable, missed_run_notice=missed_run_notice, ending_notice=shows_ending_without_successor(),
+        last_run=last_run, undoable=undoable, missed_run_notice=missed_run_notice, catch_up=(build_catch_up_plan() if missed_run_notice else None), ending_notice=shows_ending_without_successor(),
         all_tags=all_tags,
     )
 
@@ -5246,9 +5959,79 @@ def build_next_run_plan():
             'dry_run': get_setting('dry_run', '0') == '1'}
 
 
+@app.route('/api/watch-sync', methods=['POST'])
+def api_watch_sync():
+    """Re-reads watch progress from Plex now (the Refresh button)."""
+    status = sync_watch_state()
+    if not status['ok']:
+        return jsonify({"status": "error", "message": status['error']}), 502
+    msg = f"Plex checked: {status['matched']} show(s), {status['watched']} watched episode(s)."
+    if status['unmatched']:
+        msg += f" Not found in Plex: {', '.join(status['unmatched'][:3])}{'…' if len(status['unmatched']) > 3 else ''}."
+    return jsonify({"status": "success", "message": msg})
+
+
+@app.route('/api/weekly-digest/send', methods=['POST'])
+def api_weekly_digest_send():
+    """Settings button: build the weekly digest now and send it (or, with no
+    webhook set, just show it)."""
+    message = build_weekly_digest()
+    if message is None:
+        return jsonify({"status": "success", "message": "Nothing to report yet this week.", "text": ""})
+    sent = bool(get_setting('webhook_url', '').strip())
+    if sent:
+        send_notification('digest', message)
+    return jsonify({"status": "success", "text": message,
+                    "message": "Weekly digest sent." if sent else "No webhook is set, so here is what it would say."})
+
+
+@app.route('/api/pool-marks', methods=['POST'])
+def api_pool_marks():
+    """Bulk label pool folders. JSON: {names: [...], mark: 'shortlist'|'rewatchable'|'animation', value: bool}"""
+    data = request.get_json(silent=True) or {}
+    names, mark = data.get('names') or [], data.get('mark')
+    if mark not in POOL_MARK_FIELDS or not isinstance(names, list) or not names:
+        return jsonify({"status": "error", "message": "Pick at least one show and a valid label."}), 400
+    with closing(get_db()) as conn:
+        set_pool_marks(conn, [str(n) for n in names][:500], mark, bool(data.get('value', True)))
+    return jsonify({"status": "success", "message": f"Updated {len(names)} show{'s' if len(names) != 1 else ''}."})
+
+
+@app.route('/api/library-health', methods=['GET'])
+def api_library_health():
+    issues = scan_library_health()
+    return jsonify({"status": "success", "count": len(issues), "issues": issues})
+
+
+@app.route('/api/catch-up', methods=['GET', 'POST'])
+def api_catch_up():
+    """GET: what a catch-up after downtime would release. POST: do it."""
+    if request.method == 'GET':
+        return jsonify({"status": "success", "plan": build_catch_up_plan()})
+    if get_setting('dry_run', '0') == '1':
+        return jsonify({"status": "error", "message": "Dry-run mode is on, so nothing will be released."}), 400
+    results = run_catch_up()
+    failed = [r for r in results if r[1].startswith('failed')]
+    return jsonify({"status": "error" if failed and len(failed) == len(results) else "success",
+                    "message": f"Caught up {len(results) - len(failed)} show(s)" + (f", {len(failed)} failed" if failed else '') + '.'})
+
+
 @app.route('/api/next-run', methods=['GET'])
 def api_next_run():
     return jsonify(build_next_run_plan())
+
+
+def watch_overview():
+    """For the System page: sync state, overall lag and who is behind."""
+    if not (PLEX_URL and PLEX_TOKEN):
+        return None
+    with closing(get_db()) as conn:
+        stats = watch_stats(conn)
+    threshold = behind_threshold()
+    names = {sh['id']: sh['show_name'] for sh in load_shows()}
+    behind = sorted(((names[i], st['behind']) for i, st in stats.items() if i in names and st['behind'] >= threshold),
+                    key=lambda x: -x[1])
+    return {'status': watch_sync_status(), 'avg_lag': stats[None]['avg_lag'], 'behind': behind, 'threshold': threshold}
 
 
 @app.route('/system')
@@ -5257,7 +6040,7 @@ def system_page():
     overall = 'error' if any(c['status'] == 'error' for c in checks) else \
               ('warn' if any(c['status'] == 'warn' for c in checks) else 'ok')
     return render_template('system.html', checks=checks, overall=overall, app_version=APP_VERSION,
-                           sonarr=sonarr_health_summary(), next_run=build_next_run_plan())
+                           sonarr=sonarr_health_summary(), next_run=build_next_run_plan(), watch=watch_overview())
 
 
 # gather_system_checks() makes a live Sonarr request (and a TVDB token
@@ -5341,7 +6124,13 @@ def pool_page():
     poster_by_show = {s['show_name']: s.get('poster_url') for s in shows}
 
     entries = []
+    f_genre = request.args.get('genre', '').strip().lower()
+    f_status = request.args.get('status', '').strip().lower()      # ended | continuing
+    f_length = request.args.get('length', '').strip().lower()      # short | medium | long
+    f_mark = request.args.get('mark', '').strip().lower()          # shortlist | rewatchable | animation
+    f_watched = request.args.get('watched', '').strip().lower()    # yes | no
     pool_exists = any(os.path.exists(d) for d in pool_dirs())
+    all_genres = set()
     if pool_exists:
         names = list_pool_folders()
 
@@ -5352,8 +6141,25 @@ def pool_page():
         # capped per request rather than run against the whole pool at once.
         scanned = 0
         with closing(get_db()) as conn:
+            marks = get_pool_marks(conn)
+            finished = {r['show_name'].lower() for r in conn.execute(
+                f"SELECT DISTINCT show_name FROM {HISTORY_TABLE} WHERE action = 'graduated'").fetchall()}
             for name, pool in names:
                 if query_lower and query_lower not in name.lower():
+                    continue
+                facts = pool_folder_cached_facts(conn, name)
+                all_genres.update(facts['genres'])
+                mk = marks.get(name.lower(), {})
+                n_eps = count_video_files(os.path.join(pool, name))
+                if f_genre and f_genre not in facts['genres']:
+                    continue
+                if f_status and facts['status'] != f_status:
+                    continue
+                if f_length and not ((f_length == 'short' and n_eps <= 20) or (f_length == 'medium' and 20 < n_eps <= 60) or (f_length == 'long' and n_eps > 60)):
+                    continue
+                if f_mark and not mk.get(f_mark):
+                    continue
+                if f_watched and (name.lower() in finished) != (f_watched == 'yes'):
                     continue
                 already_added = name in active_names
                 if already_added:
@@ -5365,14 +6171,17 @@ def pool_page():
                     poster_url = ''
                 entries.append({
                     'name': name,
-                    'episode_count': count_video_files(os.path.join(pool, name)),
+                    'episode_count': n_eps,
+                    'marks': mk,
+                    'status': facts['status'],
                     'already_added': already_added,
                     'poster_url': poster_url,
                     'pool': 'animation' if (ANIMATION_POOL_DIR and pool == pool_dirs()[-1] and len(pool_dirs()) > 1) else '',
                 })
 
     return render_template(
-        'pool.html', entries=entries, query=query,
+        'pool.html', entries=entries, query=query, all_genres=sorted(all_genres),
+        filters={'genre': f_genre, 'status': f_status, 'length': f_length, 'mark': f_mark, 'watched': f_watched},
         pool_exists=pool_exists, pool_dir=' + '.join(pool_dirs()),
     )
 
@@ -5626,6 +6435,44 @@ def api_suggestions_dismissed():
             f"SELECT show_name, dismissed_until FROM {SUGGESTION_FEEDBACK_TABLE} "
             f"WHERE dismissed_until > ? ORDER BY show_name COLLATE NOCASE", (today_iso,)).fetchall()
     return jsonify({"dismissed": [{"name": r['show_name'], "until": r['dismissed_until']} for r in rows]})
+
+
+@app.route('/api/test-home-showing', methods=['POST'])
+def api_test_home_showing():
+    base = request.form.get('home_showing_url', '').strip()
+    password = request.form.get('home_showing_password', '').strip()
+    if not base:
+        return jsonify({"status": "error", "message": "Home Showing URL is required."}), 400
+    try:
+        data = home_showing_fetch(base, password)
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else '?'
+        msg = "Home Showing wants its password." if code == 401 else f"Home Showing answered {code}."
+        return jsonify({"status": "error", "message": msg}), 502
+    except (requests.RequestException, ValueError) as e:
+        return jsonify({"status": "error", "message": f"Could not reach Home Showing: {e}"}), 502
+    weeks = [w for w in (data.get('weeks') or []) if w.get('film')]
+    this = weeks[0]['film']['title'] if weeks else None
+    return jsonify({"status": "success",
+                    "message": "Home Showing OK" + (f" - this week: {this}." if this else " - nothing planned yet.")})
+
+
+@app.route('/api/lineup', methods=['GET'])
+def api_lineup():
+    """What is on the TV schedule, for Home Showing to avoid duplicating:
+    each active show with its (cached) TVDB genres. Read-only, no secrets."""
+    out = []
+    with closing(get_db()) as conn:
+        for sh in load_shows():
+            if sh['paused'] or sh['completed_at'] or not sh.get('tvdb_id'):
+                continue
+            if not _genre_is_cached(conn, sh['tvdb_id']):
+                continue
+            genres = get_genre_data_for_tvdb_id(conn, sh['tvdb_id'])['genres']
+            if genres:
+                out.append({'name': sh['show_name'], 'genres': sorted(_norm_genre(g) for g in genres if _norm_genre(g)),
+                            'release_days': sh['release_days']})
+    return jsonify({"shows": out})
 
 
 def safe_show_path(root_dir, show_name):
@@ -5980,7 +6827,7 @@ def history_page():
     return render_template(
         'history.html', events=events, total=total, page=page, total_pages=total_pages,
         show_filter=show_filter or '', action_filter=action_filter or '', text_filter=text_filter or '', days_filter=days_filter or 0,
-        all_actions=all_actions,
+        all_actions=all_actions, undoable_ids={d['id'] for d in get_undoable_drips()}, undo_days=UNDO_WINDOW_DAYS,
     )
 
 
@@ -6004,6 +6851,11 @@ def settings_page():
         except ValueError:
             grace = 7
         set_setting('cooldown_grace_days', grace)
+        set_setting('auto_queue_enabled', '1' if request.form.get('auto_queue_enabled') == 'on' else '0')
+        try:
+            set_setting('behind_threshold', max(1, min(50, int(request.form.get('behind_threshold', '3') or 3))))
+        except ValueError:
+            set_setting('behind_threshold', 3)
         set_setting('webhook_url', request.form.get('webhook_url', '').strip())
         set_setting('dry_run', '1' if request.form.get('dry_run') == 'on' else '0')
         new_tvdb_key = request.form.get('tvdb_api_key', '').strip()
@@ -6012,6 +6864,8 @@ def settings_page():
             set_setting('tvdb_token_expires', '')
         set_setting('tvdb_api_key', new_tvdb_key)
         set_setting('tvdb_pin', request.form.get('tvdb_pin', '').strip())
+        set_setting('home_showing_url', request.form.get('home_showing_url', '').strip())
+        set_setting('home_showing_password', request.form.get('home_showing_password', '').strip())
         set_setting('sonarr_url', request.form.get('sonarr_url', '').strip())
         set_setting('sonarr_api_key', request.form.get('sonarr_api_key', '').strip())
         set_setting('sonarr_sync_paths', '1' if request.form.get('sonarr_sync_paths') == 'on' else '0')
@@ -6033,6 +6887,17 @@ def settings_page():
         set_setting('digest_hour', digest_hour)
         set_setting('digest_minute', digest_minute)
         reschedule_digest_job(digest_enabled, digest_hour, digest_minute)
+
+        weekly_enabled = request.form.get('weekly_digest_enabled') == 'on'
+        try:
+            weekly_hour = int(request.form.get('weekly_digest_hour', 9))
+            if not 0 <= weekly_hour <= 23:
+                raise ValueError
+        except ValueError:
+            weekly_hour = 9
+        set_setting('weekly_digest_enabled', '1' if weekly_enabled else '0')
+        set_setting('weekly_digest_hour', weekly_hour)
+        reschedule_weekly_digest_job(weekly_enabled, weekly_hour)
 
         set_setting('auto_backup_enabled', '1' if request.form.get('auto_backup_enabled') == 'on' else '0')
         theme_pref = request.form.get('theme_preference', 'auto')
@@ -6080,8 +6945,12 @@ def settings_page():
         'dry_run': get_setting('dry_run', '0') == '1',
         'tvdb_api_key': get_setting('tvdb_api_key', ''),
         'tvdb_pin': get_setting('tvdb_pin', ''),
+        'home_showing_url': get_setting('home_showing_url', ''),
+        'home_showing_password': get_setting('home_showing_password', ''),
         'sonarr_url': get_setting('sonarr_url', ''),
         'sonarr_api_key': get_setting('sonarr_api_key', ''),
+        'behind_threshold': get_setting('behind_threshold', '3'),
+        'auto_queue_enabled': get_setting('auto_queue_enabled', '0') == '1',
         'sonarr_sync_paths': get_setting('sonarr_sync_paths', '1') == '1',
         'sonarr_path_map': get_setting('sonarr_path_map', ''),
         'sonarr_target': get_setting('sonarr_target', 'plex'),
@@ -6091,6 +6960,8 @@ def settings_page():
         'cooldown_grace_days': get_cooldown_grace_days(),
         'digest_enabled': get_setting('digest_enabled', '0') == '1',
         'digest_hour': get_setting('digest_hour', '8'),
+        'weekly_digest_enabled': get_setting('weekly_digest_enabled', '1') == '1',
+        'weekly_digest_hour': get_setting('weekly_digest_hour', '9'),
         'digest_minute': get_setting('digest_minute', '0'),
         'auto_backup_enabled': get_setting('auto_backup_enabled', '0') == '1',
         'backup_retention_count': get_setting('backup_retention_count', '7'),
@@ -6314,6 +7185,24 @@ def api_bulk_drip_now():
     return jsonify({"status": "success" if ran else "error", "message": ", ".join(parts) or "Nothing happened"})
 
 
+@app.route('/api/undoable-drips', methods=['GET'])
+def api_undoable_drips():
+    return jsonify({"status": "success", "days": UNDO_WINDOW_DAYS, "drips": get_undoable_drips()})
+
+
+@app.route('/api/undo-drip/<int:history_id>', methods=['POST'])
+def api_undo_drip(history_id):
+    """Puts back any drip from the last week (not just the latest)."""
+    if history_id not in {d['id'] for d in get_undoable_drips()}:
+        return jsonify({"status": "error", "message": f"That drip can't be undone - it is older than {UNDO_WINDOW_DAYS} days, was already undone, or its show has gone."}), 400
+    try:
+        ok, message = undo_drip(history_id)
+    except Exception as e:
+        log.error("Undo failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify({"status": "success" if ok else "error", "message": message}), (200 if ok else 400)
+
+
 @app.route('/api/undo-last-drip', methods=['GET', 'POST'])
 def api_undo_last_drip():
     """GET reports whether there's anything undoable (used to decide whether
@@ -6461,6 +7350,76 @@ def api_list_backups():
     return jsonify({"status": "success", "backups": backups})
 
 
+def restore_database_from(path):
+    """Replaces the live database with the contents of the SQLite file at
+    `path`, after taking a safety backup of the current one. The file must be
+    a healthy Unbinge database. Older backups are brought up to the current
+    schema. Returns the safety backup's filename."""
+    probe = sqlite3.connect(path)
+    try:
+        if probe.execute("PRAGMA integrity_check").fetchone()[0] != 'ok':
+            raise ValueError("That file is damaged (it failed SQLite's integrity check).")
+        tables = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    except sqlite3.DatabaseError:
+        raise ValueError("That isn't a database file.")
+    finally:
+        probe.close()
+    if TABLE_NAME not in tables and 'release_schedule' not in tables:
+        raise ValueError("That database has no shows table - it doesn't look like an Unbinge backup.")
+
+    safety = create_db_backup()
+    src = sqlite3.connect(path)
+    dest = sqlite3.connect(DB_FILE)
+    try:
+        with dest:
+            src.backup(dest)
+    finally:
+        src.close()
+        dest.close()
+    init_db()      # brings an older backup up to the current schema
+    try:
+        reschedule_drip_job(int(get_setting('drip_hour', '3') or 3), int(get_setting('drip_minute', '0') or 0))
+        reschedule_digest_job(get_setting('digest_enabled', '0') == '1', int(get_setting('digest_hour', '8') or 8),
+                              int(get_setting('digest_minute', '0') or 0))
+        reschedule_weekly_digest_job(get_setting('weekly_digest_enabled', '1') == '1', int(get_setting('weekly_digest_hour', '9') or 9))
+    except Exception as e:
+        log.warning("Could not reschedule jobs after the restore (restart to pick them up): %s", e)
+    log.info("Database restored from %s (safety copy: %s).", os.path.basename(path), os.path.basename(safety))
+    return os.path.basename(safety)
+
+
+@app.route('/api/restore-backup', methods=['POST'])
+def api_restore_backup():
+    """Restore from a listed backup (filename) or an uploaded .db file."""
+    upload = request.files.get('file')
+    filename = (request.form.get('filename') or '').strip()
+    tmp = None
+    try:
+        if upload and upload.filename:
+            fd, tmp = tempfile.mkstemp(suffix='.db')
+            os.close(fd)
+            upload.save(tmp)
+            path = tmp
+        elif filename:
+            if filename != os.path.basename(filename) or not _is_backup_filename(filename):
+                return jsonify({"status": "error", "message": "That isn't one of the listed backups."}), 400
+            path = os.path.join(BACKUPS_DIR, filename)
+            if not os.path.isfile(path):
+                return jsonify({"status": "error", "message": "That backup no longer exists."}), 404
+        else:
+            return jsonify({"status": "error", "message": "Pick a backup or choose a file."}), 400
+        safety = restore_database_from(path)
+        return jsonify({"status": "success", "message": f"Restored. Your previous data was saved as {safety}."})
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        log.error("Restore failed: %s", e)
+        return jsonify({"status": "error", "message": f"Restore failed: {e}"}), 500
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+
+
 @app.route('/api/backup-db', methods=['GET'])
 def api_backup_db():
     """Downloads a snapshot of the database - dripped_episodes, drip_moves
@@ -6557,6 +7516,10 @@ def build_episode_grid(show_id, show):
     with closing(get_db()) as conn:
         dripped = get_dripped_set(conn, show_id)
         excluded = get_excluded_set(conn, show_id)
+        dripped_at = {(r['season'], r['episode']): r['dripped_at'] for r in conn.execute(
+            f"SELECT season, episode, dripped_at FROM {DRIPPED_TABLE} WHERE show_id = ?", (show_id,)).fetchall()}
+        watched_at = {(r['season'], r['episode']): r['watched_at'] for r in conn.execute(
+            f"SELECT season, episode, watched_at FROM {WATCH_STATE_TABLE} WHERE show_id = ?", (show_id,)).fetchall()}
 
     vault_eps = {(e['season'], e['episode']) for e in scan_episode_files(show['vault_path'])}
     plex_eps = {(e['season'], e['episode']) for e in scan_episode_files(show['plex_path'])}
@@ -6586,7 +7549,13 @@ def build_episode_grid(show_id, show):
             status = 'waiting'
         else:
             status = 'missing'
-        grid.setdefault(season, []).append({'episode': episode, 'status': status})
+        entry = {'episode': episode, 'status': status}
+        if status == 'dripped':
+            d_on, w_on = _date_of(dripped_at.get((season, episode))), _date_of(watched_at.get((season, episode)))
+            entry['dripped_on'] = d_on.strftime('%a %-d %b') if d_on else None
+            entry['watched_on'] = w_on.strftime('%a %-d %b') if w_on else None
+            entry['lag'] = max(0, (w_on - d_on).days) if (d_on and w_on) else None
+        grid.setdefault(season, []).append(entry)
 
     return grid
 
@@ -6620,8 +7589,14 @@ def show_detail(show_id):
         ran_today=(show.get('last_run_date') == today_local().isoformat()),
     )
 
+    with closing(get_db()) as conn:
+        wstats = watch_stats(conn, show_id)
+    show_watch = wstats.get(show_id) or {'dripped': 0, 'watched': 0, 'behind': 0, 'avg_lag': None}
+    show_watch['flag'] = show_watch['behind'] >= behind_threshold()
+    show_watch['synced'] = bool((watch_sync_status() or {}).get('ok'))
+
     return render_template(
-        'show_detail.html', show=show, grid=grid, seasons_sorted=seasons_sorted,
+        'show_detail.html', show=show, grid=grid, seasons_sorted=seasons_sorted, show_watch=show_watch,
         total_eps=total_eps, dripped_count=dripped_count,
         specials_season=SPECIALS_SEASON,
         error=request.args.get('error') if request.args.get('error') in ('duplicate_name', 'invalid_name') else None,
@@ -6684,6 +7659,21 @@ def api_add_to_queue(show_id):
         conn.commit()
 
     return jsonify({"status": "success", "message": f"'{show_name}' queued."})
+
+
+@app.route('/api/queue/<int:show_id>/quick', methods=['POST'])
+def api_queue_quick(show_id):
+    """One-tap queue from a suggestion: start `show_name` when this show
+    finishes, on the best day, no form."""
+    show_name = (request.form.get('show_name') or (request.get_json(silent=True) or {}).get('show_name') or '').strip()
+    if not show_name:
+        return jsonify({"status": "error", "message": "show_name is required"}), 400
+    try:
+        res = queue_successor(show_id, show_name)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 404 if 'not found' in str(e).lower() else 400
+    return jsonify({"status": "success", "entry_id": res['entry_id'], "days_text": res['days_text'],
+                    "message": f"'{show_name}' queued - drops {res['days_text']}. {res['reason']}"})
 
 
 @app.route('/api/queue/entry/<int:entry_id>', methods=['DELETE'])

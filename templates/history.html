@@ -42,7 +42,7 @@
             </td>
             <td data-label="Show">{{ ev.show_name }}</td>
             <td data-label="Action"><span class="action-tag action-{{ ev.action }}">{{ ev.action }}</span></td>
-            <td data-label="Detail" class="cell-muted">{{ ev.detail }}</td>
+            <td data-label="Detail" class="cell-muted">{{ ev.detail }}{% if ev.id in undoable_ids %} <button type="button" class="btn btn-sm" onclick="undoDrip({{ ev.id }}, this)" title="put these episodes back in the vault (drips from the last {{ undo_days }} days)">undo</button>{% endif %}</td>
         </tr>
         {% endfor %}
     </tbody>
@@ -66,6 +66,15 @@
 
 {% block extra_scripts %}
 <script>
+async function undoDrip(id, btn) {
+    const ok = await unbingeConfirm({ title: 'put this drip back?', body: 'the episodes move from plex back to the vault and will drip again on the next release day.', confirmLabel: 'undo it' });
+    if (!ok) return;
+    btn.disabled = true;
+    const res = await fetch('/api/undo-drip/' + id, { method: 'POST', headers: { 'X-CSRFToken': window.UNBINGE_CSRF_TOKEN || '' } });
+    const data = await res.json().catch(() => ({}));
+    unbingeToast(data.message || 'that failed - check the logs.', res.ok ? 'success' : 'error');
+    if (res.ok) setTimeout(() => location.reload(), 900); else btn.disabled = false;
+}
 document.querySelectorAll('.relative-time').forEach(el => {
     const then = new Date(el.title.replace(' ', 'T'));
     const diffSec = Math.floor((new Date() - then) / 1000);

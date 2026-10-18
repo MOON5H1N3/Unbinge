@@ -140,6 +140,13 @@
 
 <div class="panel">
     <h2>episodes <span class="cell-faint" style="font-weight:400;">({{ dripped_count }} / {{ total_eps }} dripped)</span></h2>
+    {% if show_watch.synced and show_watch.dripped %}
+    <div class="watch-strip">
+        <span>watched <strong>{{ show_watch.watched }}</strong> of {{ show_watch.dripped }} dripped</span>
+        {% if show_watch.avg_lag is not none %}<span>usually watched <strong>{{ show_watch.avg_lag }}</strong> day{{ '' if show_watch.avg_lag == 1 else 's' }} after it drips</span>{% endif %}
+        {% if show_watch.flag %}<span class="pill pill-missing">{{ show_watch.behind }} behind</span>{% elif show_watch.behind %}<span class="cell-faint">{{ show_watch.behind }} not watched yet</span>{% endif %}
+    </div>
+    {% endif %}
     <div class="legend">
         <span><i class="dot-sample" style="background:var(--pill-complete-bg);"></i>dripped</span>
         <span><i class="dot-sample" style="background:var(--pill-partial-bg);"></i>waiting in vault</span>
@@ -159,7 +166,7 @@
                 <span class="ep-list-num">{{ ep.episode }}</span>
                 <span class="ep-list-title">S{{ '%02d'|format(season) }}E{{ '%02d'|format(ep.episode) }}</span>
                 <span class="ep-list-status">
-                    {% if ep.status == 'dripped' %}<span class="pill pill-complete">released</span>
+                    {% if ep.status == 'dripped' %}{% if ep.dripped_on %}<span class="ep-dates">dripped {{ ep.dripped_on }}{% if ep.watched_on %} · watched {{ ep.watched_on }}{% if ep.lag %} ({{ ep.lag }}d){% endif %}{% elif show_watch.synced %} · not watched yet{% endif %}</span>{% endif %}<span class="pill {{ 'pill-complete' if ep.watched_on or not show_watch.synced else 'pill-partial' }}">{{ 'watched' if ep.watched_on else 'released' }}</span>
                     {% elif ep.status == 'waiting' %}in vault
                     {% elif ep.status == 'excluded' %}excluded
                     {% else %}missing{% endif %}
@@ -327,7 +334,7 @@ async function loadQueue() {
         row.className = 'queue-entry';
         const label = document.createElement('span');
         const when = entry.trigger_type === 'date' ? `starts ${entry.trigger_date}` : 'starts when this show finishes';
-        label.textContent = `${entry.show_name} - ${when}`;
+        label.textContent = `${entry.show_name} - ${when}${entry.auto ? ' (auto-queued)' : ''}`;
         const btn = document.createElement('button');
         btn.className = 'btn-icon';
         btn.title = 'remove from queue';
@@ -547,12 +554,27 @@ async function loadRecommendations() {
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'btn btn-sm';
-            btn.textContent = 'queue this';
-            btn.onclick = () => {
+            btn.textContent = 'queue it';
+            btn.title = 'start this when the show finishes, on the best day';
+            btn.onclick = async () => {
+                btn.disabled = true;
+                const body = new FormData();
+                body.append('show_name', rec.name);
+                const res = await fetch(`/api/queue/${SHOW_ID}/quick`, { method: 'POST', body, headers: { 'X-CSRFToken': window.UNBINGE_CSRF_TOKEN || '' } });
+                const data = await res.json().catch(() => ({}));
+                unbingeToast(data.message || 'that failed - check the logs.', res.ok ? 'success' : 'error');
+                if (res.ok) { loadQueue(); recAttempts = 0; loadRecommendations(); } else { btn.disabled = false; }
+            };
+            actions.appendChild(btn);
+            const custom = document.createElement('button');
+            custom.type = 'button';
+            custom.className = 'btn btn-sm';
+            custom.textContent = 'choose day…';
+            custom.onclick = () => {
                 document.getElementById('queueShowName').value = rec.name;
                 document.getElementById('queueShowName').scrollIntoView({ behavior: 'smooth', block: 'center' });
             };
-            actions.appendChild(btn);
+            actions.appendChild(custom);
             const no = document.createElement('button');
             no.type = 'button';
             no.className = 'btn btn-sm';
@@ -576,6 +598,9 @@ async function loadRecommendations() {
             hint.textContent = 'still checking ' + pending + ' show' + (pending === 1 ? '' : 's') + ' on tvdb - suggestions will sharpen as it goes…';
             hint.style.display = 'block';
             // each request indexes a batch and caches it; the retry above keeps going until the pool is covered
+        } else if ((data.movies || []).length) {
+            hint.textContent = 'steering around your film: ' + data.movies.join(', ') + (data.planned_with > 0 ? ' · planned together with ' + data.planned_with + ' other ending show' + (data.planned_with === 1 ? '' : 's') : '');
+            hint.style.display = 'block';
         } else if (data.planned_with > 0) {
             hint.textContent = 'planned together with ' + data.planned_with + ' other ending show' + (data.planned_with === 1 ? '' : 's') + ' - no show is offered twice.';
             hint.style.display = 'block';

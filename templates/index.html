@@ -23,7 +23,17 @@
     {% for e in ending_notice[:3] %}<a href="/show/{{ e.id }}" style="color:inherit; font-weight:600;">{{ e.name }}</a>{% if e.state == 'finished' %} (finished){% elif e.ends %} (ends {{ e.ends }}){% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if ending_notice|length > 3 %} and {{ ending_notice|length - 3 }} more{% endif %}.</span></div>
 {% endif %}
 {% if missed_run_notice %}
-<div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>{{ missed_run_notice }}</span></div>
+<div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>{{ missed_run_notice }}{% if catch_up and catch_up['items'] %} Catching up would release {{ catch_up['items']|length }} show{{ 's' if catch_up['items']|length != 1 }}: {% for i in catch_up['items'][:4] %}{{ i.name }} ({{ i.episodes }}){{ ', ' if not loop.last }}{% endfor %}.{% endif %}</span>{% if catch_up and catch_up['items'] %}<button class="btn btn-sm" id="catchUpBtn" type="button">Catch up now</button>{% endif %}</div>
+{% if catch_up and catch_up['items'] %}<script>
+document.getElementById('catchUpBtn').addEventListener('click', async () => {
+  if (!await unbingeConfirm({title: 'Catch up?', body: 'Release the episodes missed while Unbinge was down.', confirmLabel: 'Catch up'})) return;
+  const btn = document.getElementById('catchUpBtn'); btn.disabled = true;
+  const r = await fetch('/api/catch-up', {method: 'POST'});
+  const j = await r.json().catch(() => ({}));
+  unbingeToast(j.message || 'Done');
+  setTimeout(() => location.reload(), 800);
+});
+</script>{% endif %}
 {% endif %}
 
 {% if undoable %}
@@ -171,6 +181,7 @@
                 {% else %}
                     <span class="pill pill-complete">active</span>
                 {% endif %}
+                {% if show.behind_flag and not show.paused %}<span class="pill pill-missing" title="{{ show.behind }} dripped episodes not watched in plex yet">{{ show.behind }} behind</span>{% endif %}
             </td>
             <td data-label="Actions" class="actions-cell" data-show-id="{{ show.id }}" data-show-name="{{ show.show_name }}">
                 <div class="icon-row">

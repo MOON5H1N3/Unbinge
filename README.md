@@ -36,7 +36,10 @@ If episodes reappear in the vault during cooldown, the show resumes instead of g
 - **TVDB** integration for posters, genres and recommendations from your pool
 - **Sonarr** integration to show real upcoming air dates
 - **Database backups** – on demand or automatic, with configurable retention
-- **Missed-run detection** if the container was down at drip time
+- **Missed-run detection** with a one-click **catch up** that releases what you missed
+- **Watch progress** from Plex, weekly digest, one-tap queue and opt-in auto-queue
+- **Library health check** on the System page (gaps, duplicates, odd names)
+- **Pool filters and labels** – shortlist (favoured by suggestions), rewatchable, animation tag, with bulk actions
 - **Optional password login** with CSRF protection
 - `/health` endpoint for Docker healthchecks
 
@@ -109,6 +112,7 @@ All configuration is through environment variables. Integration settings can als
 | `DISCORD_SCHEDULE_WEBHOOK_URL` | No | – | Discord webhook for the live schedule message |
 | `TVDB_API_KEY` / `TVDB_PIN` | No | – | TVDB credentials for posters and metadata |
 | `SONARR_URL` / `SONARR_API_KEY` | No | – | Sonarr connection for real air dates |
+| `HOME_SHOWING_URL` / `HOME_SHOWING_PASSWORD` | No | – | [Home Showing](https://github.com/MOON5H1N3/home-showing) (your weekly film). Suggestions then steer around the film you're watching. Also settable under settings → integrations. Home Showing reads your TV line-up back from `/api/lineup` (set its `UNBINGE_URL`, and `UNBINGE_PASSWORD` if you use a password here) |
 
 The daily drip time defaults to **03:00** and can be changed in Settings.
 
