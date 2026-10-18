@@ -200,8 +200,9 @@
     <div id="queueList"></div>
 
     <div id="recommendationsBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border); display:none;">
-        <div class="season-title">recommended based on this show</div>
+        <div class="season-title">up next ideas · fills gaps in your week</div>
         <div id="recommendationsList" class="poster-grid"></div>
+        <div id="hiddenSuggestions" style="margin-top:10px;"></div>
     </div>
     <p id="recommendationsHint" class="panel-hint" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border); display:none;"></p>
 
@@ -434,6 +435,45 @@ async function matchFile(relPath, location, season, episode) {
     }
 }
 
+async function renderHiddenSuggestions(count) {
+    const box = document.getElementById('hiddenSuggestions');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!count) return;
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'btn btn-sm';
+    toggle.textContent = count + ' hidden · show';
+    const list = document.createElement('div');
+    list.style.display = 'none';
+    toggle.onclick = async () => {
+        if (list.style.display === 'block') { list.style.display = 'none'; return; }
+        const res = await fetch('/api/suggestions/dismissed');
+        const data = await res.json();
+        list.innerHTML = '';
+        data.dismissed.forEach(d => {
+            const row = document.createElement('div');
+            row.className = 'cell-faint';
+            row.style.cssText = 'font-size:12px; margin-top:6px;';
+            row.textContent = d.name + ' (hidden until ' + d.until + ') ';
+            const undo = document.createElement('button');
+            undo.type = 'button';
+            undo.className = 'btn btn-sm';
+            undo.textContent = 'restore';
+            undo.onclick = async () => {
+                await fetch('/api/suggestions/restore', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: d.name})});
+                recAttempts = 0;
+                loadRecommendations();
+            };
+            row.appendChild(undo);
+            list.appendChild(row);
+        });
+        list.style.display = 'block';
+    };
+    box.appendChild(toggle);
+    box.appendChild(list);
+}
+
 let recAttempts = 0;
 async function loadRecommendations() {
     const box = document.getElementById('recommendationsBox');
@@ -454,11 +494,12 @@ async function loadRecommendations() {
             hint.style.display = 'block';
             return;
         }
-        const indexing = data.unindexed > 0 && recAttempts++ < 25;
+        const pending = (data.unindexed || 0) + (data.refining || 0);
+        const indexing = pending > 0 && recAttempts++ < 25;
         if (indexing) setTimeout(loadRecommendations, 400);
         if (!data.recommendations || data.recommendations.length === 0) {
             hint.textContent = indexing
-                ? 'looking through your pool on tvdb (' + data.unindexed + ' folders to go)…'
+                ? 'looking through your pool on tvdb (' + pending + ' to go)…'
                 : "nothing in your pool shares a genre with this show yet.";
             hint.style.display = 'block';
             return;
@@ -492,7 +533,9 @@ async function loadRecommendations() {
             title.textContent = rec.name;
             const meta = document.createElement('div');
             meta.className = 'poster-card-meta';
-            meta.textContent = rec.matched_genres.join(', ');
+            const whyParts = (rec.why && rec.why.length) ? rec.why.slice() : [rec.matched_genres.join(', ')];
+            if (rec.episodes) whyParts.push(rec.episodes + ' eps');
+            meta.textContent = whyParts.filter(Boolean).join(' · ');
             if (rec.season) {
                 const tag = document.createElement('span');
                 tag.className = 'rec-season';
@@ -510,6 +553,17 @@ async function loadRecommendations() {
                 document.getElementById('queueShowName').scrollIntoView({ behavior: 'smooth', block: 'center' });
             };
             actions.appendChild(btn);
+            const no = document.createElement('button');
+            no.type = 'button';
+            no.className = 'btn btn-sm';
+            no.textContent = 'not interested';
+            no.title = 'hide this from suggestions for 90 days';
+            no.onclick = async () => {
+                await fetch('/api/suggestions/dismiss', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: rec.name})});
+                recAttempts = 0;
+                loadRecommendations();
+            };
+            actions.appendChild(no);
 
             body.appendChild(title);
             body.appendChild(meta);
@@ -519,13 +573,17 @@ async function loadRecommendations() {
             list.appendChild(card);
         });
         if (indexing) {
-            hint.textContent = 'still looking up ' + data.unindexed + ' more pool folder' + (data.unindexed === 1 ? '' : 's') + ' on tvdb - suggestions will fill in…';
+            hint.textContent = 'still checking ' + pending + ' show' + (pending === 1 ? '' : 's') + ' on tvdb - suggestions will sharpen as it goes…';
             hint.style.display = 'block';
             // each request indexes a batch and caches it; the retry above keeps going until the pool is covered
+        } else if (data.planned_with > 0) {
+            hint.textContent = 'planned together with ' + data.planned_with + ' other ending show' + (data.planned_with === 1 ? '' : 's') + ' - no show is offered twice.';
+            hint.style.display = 'block';
         } else {
             hint.style.display = 'none';
         }
         box.style.display = 'block';
+        renderHiddenSuggestions(data.dismissed || 0);
     } catch (err) {
         // Quiet failure - recommendations are a convenience, not core to the
         // page, so a network hiccup here shouldn't show an alarming error

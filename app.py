@@ -221,6 +221,8 @@ EXCLUDED_TABLE = 'excluded_episodes'
 QUEUE_TABLE = 'show_queue'
 POOL_TVDB_CACHE_TABLE = 'pool_tvdb_cache'
 TVDB_GENRE_CACHE_TABLE = 'tvdb_genre_cache'
+SUGGESTION_FEEDBACK_TABLE = 'suggestion_feedback'
+TVDB_PROFILE_CACHE_TABLE = 'tvdb_profile_cache'
 TVDB_SERIES_CACHE_TABLE = 'tvdb_series_cache'
 TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 
@@ -231,7 +233,7 @@ TVDB_SERIES_CACHE_MAX_AGE_HOURS = 12
 # graduates back to the pool, so nothing is lost - they just don't get a slot.
 SPECIALS_SEASON = 0
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 18
 
 SCHEDULER_JOB_ID = 'daily_drip_check'
 DIGEST_JOB_ID = 'daily_digest'
@@ -997,6 +999,41 @@ def tvdb_get_series_genres(tvdb_id):
     return _extract_tvdb_genres(series), poster_url, None
 
 
+def tvdb_get_series_profile(tvdb_id):
+    """Airing status, first year, average runtime (minutes) and original
+    network for a series, from one extended-series call. Returns
+    ({'status','year','runtime','network'}, error|None); on failure the
+    values are empty so the caller can cache the miss briefly."""
+    empty = {'status': '', 'year': None, 'runtime': None, 'network': ''}
+    token, err = tvdb_get_token()
+    if not token:
+        return empty, err
+    try:
+        resp = requests.get(f'{TVDB_BASE_URL}/series/{tvdb_id}/extended',
+                            headers={'Authorization': f'Bearer {token}'}, timeout=15)
+        resp.raise_for_status()
+        d = resp.json().get('data') or {}
+    except (requests.RequestException, ValueError) as e:
+        log.error("TVDB profile fetch failed for id %s: %s", tvdb_id, e)
+        return empty, f"TVDB profile fetch failed: {e}"
+    status = d.get('status')
+    status = status.get('name') if isinstance(status, dict) else status
+    network = d.get('originalNetwork')
+    network = network.get('name') if isinstance(network, dict) else (network or '')
+    year = None
+    for raw in (d.get('year'), (d.get('firstAired') or '')[:4]):
+        try:
+            year = int(raw)
+            break
+        except (TypeError, ValueError):
+            continue
+    try:
+        runtime = int(d.get('averageRuntime')) if d.get('averageRuntime') else None
+    except (TypeError, ValueError):
+        runtime = None
+    return {'status': str(status or '').strip().lower(), 'year': year, 'runtime': runtime, 'network': str(network or '')}, None
+
+
 def tvdb_get_series_status(tvdb_id):
     """TVDB's airing status for a series, lower-cased ('ended', 'continuing',
     'upcoming'), or '' when unknown. Returns (status, error|None)."""
@@ -1022,6 +1059,53 @@ def tvdb_get_series_status(tvdb_id):
 GENRE_CACHE_MAX_AGE_DAYS = 30
 POOL_RECOMMENDATION_SCAN_CAP = 40  # TVDB calls per request, for a not-yet-cached pool
 GENERIC_GENRE_THRESHOLD = 0.5  # a genre held by more than this fraction of the scanned pool counts for less
+
+# Suggestion scoring. A candidate's score is how related it is to the show
+# that is ending, plus how much it adds to the rest of your week, minus how
+# closely it duplicates something already on it, minus fatigue for having
+# been shown week after week, plus a nudge for a length you can finish.
+SUGGEST_RELATED_WEIGHT = 4.0
+SUGGEST_GAP_BONUS = 1.5
+SUGGEST_SEASON_SCALE = 2.5      # seasonal bonuses were tuned against the old, smaller scale
+SUGGEST_CROWD_PENALTY = 3.0
+SUGGEST_FATIGUE_STEP = 0.75
+SUGGEST_FATIGUE_MAX_WEEKS = 4
+SUGGEST_JITTER = 0.6            # small weekly shuffle so near-equal picks rotate
+SUGGEST_CONTRAST_MIN_GAP = 0.5  # an unrelated show must be mostly new to your week to be offered
+SUGGEST_FIT_CHECK_LIMIT = 25    # candidates whose folders are counted for length
+SUGGEST_DISMISS_DAYS = 90
+SUGGEST_TASTE_WEIGHT = 1.5            # how much your own watching history counts
+SUGGEST_ENDED_BONUS = 1.0             # a finished series won't stall or need a cooldown
+SUGGEST_CONTINUING_PENALTY = 0.5
+SUGGEST_ERA_BONUS = 0.4               # first aired within 5 years of the show it follows
+SUGGEST_RUNTIME_BONUS = 0.3           # episode length within 10 minutes of it
+SUGGEST_WATCHED_EXCLUDE_DAYS = 365    # finished this recently: not suggested at all
+SUGGEST_WATCHED_MEMORY_DAYS = 1095    # ...and discouraged for a couple of years after
+SUGGEST_WATCHED_PENALTY = 2.0
+SUGGEST_PROFILE_FETCH_CAP = 10        # TVDB profile lookups per request
+SUGGEST_ENRICH_TOP = 8                # candidates checked in detail for each pick
+SUGGEST_LIST_SIZE = 5
+
+
+def _weekly_pace(shows):
+    """Typical episodes per week across the active schedule (default 2)."""
+    rates = []
+    for sh in shows:
+        if sh['paused'] or sh['completed_at']:
+            continue
+        rates.append(max(1, int(sh.get('episodes_per_drop') or 1)) * max(1, len(parse_release_days(sh['release_days']))))
+    return (sum(rates) / len(rates)) if rates else 2.0
+
+
+def _length_fit(weeks_to_finish):
+    """Nudge towards series you can get through at your usual pace."""
+    if weeks_to_finish <= 12:
+        return 1.0
+    if weeks_to_finish <= 26:
+        return 0.5
+    if weeks_to_finish <= 52:
+        return 0.0
+    return -1.0
 
 
 def _genre_cache_is_fresh(cached_at_str):
@@ -1456,122 +1540,369 @@ def return_pool_dir(show):
     return POOL_DIR
 
 
-def get_recommendations_for_show(show_id, today=None):
-    """The recommendation logic behind /api/recommendations/<id>: genre-
-    overlap matches for show_id, drawn only from POOL_DIR (shows you
-    actually have, just not promoted yet - never TVDB's wider catalog).
+def _taste_affinity(shows_genres, generic):
+    """Per-genre sentiment in [-1, 1] from how you actually use the app.
+    shows_genres: [(genre_set, weight)] - weight is positive for shows you
+    watch or finished and negative for ones you turned down. Generic genres
+    are ignored, and a genre seen only once or twice is trusted less."""
+    num, den = {}, {}
+    for genres, w in shows_genres:
+        for g in set(genres) - generic:
+            num[g] = num.get(g, 0.0) + w
+            den[g] = den.get(g, 0.0) + abs(w)
+    return {g: (num[g] / den[g]) * min(1.0, den[g] / 3.0) for g in num if den[g]}
 
-    Every pool folder already in the cache is considered on every call. Only
-    folders that need a fresh TVDB lookup count against
-    POOL_RECOMMENDATION_SCAN_CAP, so a big pool fills in over a few page
-    loads instead of being stuck on its first 40 folders. Anything already
-    queued is left out. Ranking: 2 points per distinguishing genre shared
-    with this show, 1 per generic one, plus a seasonal bonus; ties are
-    ordered by a weekly-rotating key rather than alphabetically.
+
+def _build_suggestion_context(conn, today, leaving_ids):
+    """Everything the suggestion scorer needs, gathered once per request:
+    the resolved pool, what is on your schedule (minus the shows that are
+    leaving it), what you finished and turned down, and your taste."""
+    pool_shows = [n for n, _pool in list_pool_folders()]
+    queued = {r['show_name'].lower() for r in conn.execute(
+        f"SELECT show_name FROM {QUEUE_TABLE} WHERE triggered_at IS NULL").fetchall()}
+
+    candidates, fetches, unindexed = [], 0, 0
+    for folder in pool_shows:
+        if folder.lower() in queued:
+            continue
+        if not _pool_folder_is_cached(conn, folder):
+            if fetches >= POOL_RECOMMENDATION_SCAN_CAP:
+                unindexed += 1
+                continue
+            fetches += 1
+        candidate_tvdb_id = resolve_pool_folder_tvdb_id(conn, folder)
+        if not candidate_tvdb_id:
+            continue
+        if not _genre_is_cached(conn, candidate_tvdb_id):
+            if fetches >= POOL_RECOMMENDATION_SCAN_CAP:
+                unindexed += 1
+                continue
+            fetches += 1
+        data = get_genre_data_for_tvdb_id(conn, candidate_tvdb_id)
+        candidates.append({'name': folder, 'tvdb_id': candidate_tvdb_id,
+                           'genres': frozenset(data['genres']), 'poster_url': data['poster_url']})
+
+    # "drama"/"comedy" sit on nearly every show; a genre counts as generic
+    # once more than GENERIC_GENRE_THRESHOLD of the resolved pool carries it.
+    pool_size = len(candidates) or 1
+    counts = {}
+    for c in candidates:
+        for g in c['genres']:
+            counts[g] = counts.get(g, 0) + 1
+    generic = {g for g, n in counts.items() if n / pool_size > GENERIC_GENRE_THRESHOLD}
+    for c in candidates:
+        c['distinct'] = c['genres'] - generic
+    by_name = {c['name'].lower(): c for c in candidates}
+
+    shows = load_shows()
+    lineup, taste_inputs = [], []
+    for sh in shows:
+        if not sh.get('tvdb_id'):
+            continue
+        try:
+            g = frozenset(get_genre_data_for_tvdb_id(conn, sh['tvdb_id']).get('genres', []))
+        except Exception as e:
+            log.warning("Genres unavailable for '%s' while suggesting: %s", sh['show_name'], e)
+            continue
+        taste_inputs.append((g, 2.0 if sh['completed_at'] else (-0.5 if sh['paused'] else 1.0)))
+        if sh['id'] in leaving_ids or sh['paused'] or sh['completed_at']:
+            continue
+        if g - generic:
+            lineup.append(g - generic)
+
+    # Shows you already watched to the end: they go back to the pool when
+    # they finish, so without this they would be suggested straight away.
+    watched = {}
+    for r in conn.execute(f"SELECT show_name, MAX(occurred_at) AS at FROM {HISTORY_TABLE} "
+                          f"WHERE action = 'graduated' GROUP BY show_name").fetchall():
+        try:
+            watched[r['show_name'].lower()] = (today - datetime.fromisoformat(r['at']).date()).days
+        except (TypeError, ValueError):
+            continue
+    for name in watched:
+        if name in by_name:
+            taste_inputs.append((by_name[name]['genres'], 2.0))
+
+    today_iso = today.isoformat()
+    feedback = {r['name_key']: r for r in conn.execute(f"SELECT * FROM {SUGGESTION_FEEDBACK_TABLE}").fetchall()}
+    hidden = {k for k, r in feedback.items() if r['dismissed_until'] and r['dismissed_until'] > today_iso}
+    for k in hidden:
+        if k in by_name:
+            taste_inputs.append((by_name[k]['genres'], -1.0))
+    affinity = _taste_affinity(taste_inputs, generic)
+
+    eligible = []
+    for c in candidates:
+        key = c['name'].lower()
+        if key in hidden:
+            continue
+        if key in watched and watched[key] <= SUGGEST_WATCHED_EXCLUDE_DAYS:
+            continue
+        c['taste'] = (sum(affinity.get(g, 0.0) for g in c['distinct']) / len(c['distinct'])) if c['distinct'] else 0.0
+        c['watched_before'] = key in watched and watched[key] <= SUGGEST_WATCHED_MEMORY_DAYS
+        fb = feedback.get(key)
+        c['shown_weeks'] = fb['shown_weeks'] if fb else 0
+        c['last_shown_week'] = fb['last_shown_week'] if fb else None
+        eligible.append(c)
+
+    return {
+        'candidates': eligible, 'generic': generic, 'lineup': lineup, 'hidden': len(hidden),
+        'unindexed': unindexed, 'pool_total': len(pool_shows), 'resolved': len(candidates),
+        'pace': _weekly_pace(shows), 'theme': current_seasonal_theme(today), 'today': today,
+        'this_week': f"{today.isocalendar()[0]}-{today.isocalendar()[1]:02d}",
+        'feedback': feedback, 'enrich': {}, 'profile_fetches': 0, 'refining': set(),
+    }
+
+
+def _profile_is_fresh(row):
+    if not row:
+        return False
+    age = (now_local() - datetime.fromisoformat(row['cached_at'])).days
+    if not row['status'] and row['year'] is None:
+        return age < 1                       # a failed lookup: try again tomorrow
+    return age < (90 if row['status'] == 'ended' else 14)
+
+
+def get_profile_for_tvdb_id(conn, tvdb_id, allow_fetch=True):
+    """Airing status, first year, runtime and network for a series, cached.
+    Returns a dict, or None when it is not cached and may not be fetched now."""
+    row = conn.execute(f"SELECT * FROM {TVDB_PROFILE_CACHE_TABLE} WHERE tvdb_id = ?", (tvdb_id,)).fetchone()
+    if _profile_is_fresh(row):
+        return {'status': row['status'], 'year': row['year'], 'runtime': row['runtime'], 'network': row['network']}
+    if not allow_fetch:
+        return None
+    profile, _err = tvdb_get_series_profile(tvdb_id)
+    conn.execute(
+        f"""INSERT INTO {TVDB_PROFILE_CACHE_TABLE} (tvdb_id, status, year, runtime, network, cached_at) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tvdb_id) DO UPDATE SET status = excluded.status, year = excluded.year, runtime = excluded.runtime,
+            network = excluded.network, cached_at = excluded.cached_at""",
+        (tvdb_id, profile['status'], profile['year'], profile['runtime'], profile['network'], now_local().isoformat()))
+    conn.commit()
+    return profile
+
+
+def _enrich_candidate(conn, ctx, c):
+    """Episode count and TVDB profile for one candidate, memoised per request.
+    Profile lookups beyond SUGGEST_PROFILE_FETCH_CAP wait for the next load."""
+    hit = ctx['enrich'].get(c['name'])
+    if hit is not None and not (hit['profile'] is None and ctx['profile_fetches'] < SUGGEST_PROFILE_FETCH_CAP):
+        return hit
+    if hit is None:
+        found = find_pool_for(c['name'])
+        episodes = count_video_files(os.path.join(found, c['name'])) if found else 0
+    else:
+        episodes = hit['episodes']
+    profile = get_profile_for_tvdb_id(conn, c['tvdb_id'], allow_fetch=False)
+    if profile is None and ctx['profile_fetches'] < SUGGEST_PROFILE_FETCH_CAP:
+        ctx['profile_fetches'] += 1
+        profile = get_profile_for_tvdb_id(conn, c['tvdb_id'], allow_fetch=True)
+    if profile is None:
+        ctx['refining'].add(c['name'])
+    else:
+        ctx['refining'].discard(c['name'])
+    ctx['enrich'][c['name']] = {'episodes': episodes, 'profile': profile}
+    return ctx['enrich'][c['name']]
+
+
+def _enrichment_score(ctx, c, info, anchor):
+    """Points from facts that need the disk or a TVDB profile."""
+    pts, why = 0.0, []
+    if info['episodes']:
+        pts += _length_fit(info['episodes'] / ctx['pace'])
+    p = info['profile']
+    if p:
+        if p['status'] == 'ended':
+            pts += SUGGEST_ENDED_BONUS
+            why.append('finished airing')
+        elif p['status'] == 'continuing':
+            pts -= SUGGEST_CONTINUING_PENALTY
+        elif p['status'] == 'upcoming':
+            pts -= 2 * SUGGEST_CONTINUING_PENALTY
+        ap = anchor.get('profile')
+        if ap and p['year'] and ap.get('year') and abs(p['year'] - ap['year']) <= 5:
+            pts += SUGGEST_ERA_BONUS
+        if ap and p['runtime'] and ap.get('runtime') and abs(p['runtime'] - ap['runtime']) <= 10:
+            pts += SUGGEST_RUNTIME_BONUS
+    return pts, why
+
+
+def _plan_suggestions(conn, ctx, anchors):
+    """Picks SUGGEST_LIST_SIZE shows for each anchor (a show that is ending)
+    together, round by round. Every pick joins a virtual line-up, so the next
+    pick - for the same show or another - avoids duplicating it, and nothing
+    is offered twice. The last pick of each list is reserved for something
+    different when a good contrast exists.
+
+    anchors: [{'id', 'genres': set, 'profile': dict|None}]. Returns
+    {anchor_id: [pick, ...]}."""
+    today, theme = ctx['today'], ctx['theme']
+    lineup_sets = list(ctx['lineup'])
+    virtual_union = set().union(*lineup_sets) if lineup_sets else set()
+    crowd = {c['name']: max((len(c['distinct'] & l) / len(c['distinct'] | l) for l in lineup_sets if c['distinct']), default=0.0)
+             for c in ctx['candidates']}
+    claimed, results, seasonal_used = set(), {a['id']: [] for a in anchors}, {a['id']: 0 for a in anchors}
+
+    for rnd in range(SUGGEST_LIST_SIZE):
+        last = rnd == SUGGEST_LIST_SIZE - 1
+        for a in anchors:
+            aset = set(a['genres'])
+            scored = []
+            for c in ctx['candidates']:
+                if c['name'] in claimed:
+                    continue
+                matched = aset & c['genres']
+                seasonal = _seasonal_hit(theme, c['name'], c['genres'])
+                d = c['distinct']
+                gap = len(d - virtual_union) / len(d) if d and lineup_sets else 0.0
+                kind = 'match' if matched or (seasonal and theme['include_unmatched']) else 'contrast'
+                if kind == 'contrast' and gap < SUGGEST_CONTRAST_MIN_GAP:
+                    continue
+                union_w = sum(1 if g in ctx['generic'] else 2 for g in aset | c['genres']) or 1
+                related = SUGGEST_RELATED_WEIGHT * sum(1 if g in ctx['generic'] else 2 for g in matched) / union_w
+                earlier = c['shown_weeks'] - (1 if c['last_shown_week'] == ctx['this_week'] else 0)
+                score = (related + SUGGEST_TASTE_WEIGHT * c['taste'] + SUGGEST_GAP_BONUS * gap
+                         + (theme['bonus'] * SUGGEST_SEASON_SCALE if seasonal else 0)
+                         - SUGGEST_CROWD_PENALTY * crowd[c['name']]
+                         - SUGGEST_FATIGUE_STEP * min(max(earlier, 0), SUGGEST_FATIGUE_MAX_WEEKS)
+                         - (SUGGEST_WATCHED_PENALTY if c['watched_before'] else 0)
+                         + SUGGEST_JITTER * (_rotation_key(c['name'], today) % 1000) / 1000)
+                scored.append({'c': c, 'score': score, 'kind': kind, 'seasonal': bool(seasonal),
+                               'matched': matched, 'gap': gap})
+            if not scored:
+                continue
+            want = 'contrast' if last and any(s['kind'] == 'contrast' for s in scored) else 'match'
+            pool = [s for s in scored if s['kind'] == want] or scored
+            if seasonal_used[a['id']] >= SEASONAL_MAX_SLOTS:
+                pool = [s for s in pool if not s['seasonal']] or pool
+            pool.sort(key=lambda s: -s['score'])
+            for s in pool[:SUGGEST_ENRICH_TOP]:
+                info = _enrich_candidate(conn, ctx, s['c'])
+                s['info'] = info
+                s['extra'], s['extra_why'] = _enrichment_score(ctx, s['c'], info, a)
+            top = [s for s in pool[:SUGGEST_ENRICH_TOP]]
+            best = max(top, key=lambda s: s['score'] + s['extra'])
+            c = best['c']
+            claimed.add(c['name'])
+            if best['seasonal']:
+                seasonal_used[a['id']] += 1
+            new_genres = sorted(c['distinct'] - virtual_union) if lineup_sets else []
+            why = []
+            if best['kind'] == 'contrast':
+                why.append('something different' + (': ' + ', '.join(new_genres[:2]) if new_genres else ''))
+            else:
+                if best['matched']:
+                    ordered = sorted(best['matched'], key=lambda g: (g in ctx['generic'], g))
+                    why.append('shares ' + ', '.join(ordered[:2]))
+                if new_genres:
+                    why.append('adds ' + ', '.join(new_genres[:2]) + ' to your week')
+            why += best['extra_why']
+            if c['taste'] > 0.4:
+                why.append('fits what you watch')
+            matched_sorted = sorted(best['matched'] - ctx['generic']) + sorted(best['matched'] & ctx['generic'])
+            results[a['id']].append({
+                'name': c['name'], 'genres': sorted(c['genres']), 'matched_genres': matched_sorted,
+                'poster_url': c['poster_url'], 'season': theme['label'] if best['seasonal'] else None,
+                'kind': best['kind'], 'new_genres': new_genres,
+                'episodes': best['info']['episodes'] or None,
+                'status': (best['info']['profile'] or {}).get('status') or None,
+                'why': why,
+            })
+            lineup_sets.append(c['distinct'])
+            virtual_union |= c['distinct']
+            for other in ctx['candidates']:
+                if other['distinct'] and c['distinct']:
+                    j = len(other['distinct'] & c['distinct']) / len(other['distinct'] | c['distinct'])
+                    if j > crowd[other['name']]:
+                        crowd[other['name']] = j
+    return results
+
+
+def _suggestion_anchors(conn, shows_by_id, ids):
+    """Anchor dicts (genres + TVDB profile) for the given show ids, skipping
+    any without a TVDB link or genres."""
+    out = []
+    for sid in ids:
+        sh = shows_by_id.get(sid)
+        if not sh or not sh.get('tvdb_id'):
+            continue
+        genres = get_genre_data_for_tvdb_id(conn, sh['tvdb_id'])['genres']
+        if not genres:
+            continue
+        out.append({'id': sid, 'genres': set(genres), 'profile': get_profile_for_tvdb_id(conn, sh['tvdb_id'], allow_fetch=False)})
+    return out
+
+
+def get_recommendations_for_show(show_id, today=None):
+    """The recommendation logic behind /api/recommendations/<id>: shows from
+    your pool (never TVDB's wider catalog) ranked for the show on this page.
+
+    A pick scores: how related it is to this show (share of genres in
+    common), how well it fits what you have finished and turned down, how
+    much it adds to - or duplicates - the rest of your week, whether the
+    series has ended and finishes at your pace, and a seasonal nudge, minus
+    fatigue for having been shown week after week. Shows you finished in the
+    last year, turned down, or have queued are left out.
+
+    Picks are made one at a time, each joining a virtual line-up, so a list
+    is varied rather than five of the same. When the show is one of several
+    ending soon with nothing queued, all their lists are planned together:
+    nothing is offered twice and the lists complement each other.
 
     Returns {'status': 'ok', 'anchor_genres', 'recommendations': [{'name',
-    'genres', 'matched_genres', 'poster_url', 'season'}], 'season': label|None,
-    'scanned', 'pool_total', 'unindexed'} or {'status': 'no_tvdb_link' |
-    'no_genres' | 'not_found', 'message'}."""
+    'genres', 'matched_genres', 'poster_url', 'season', 'kind', 'why',
+    'episodes', 'status', 'new_genres'}], 'season', 'scanned', 'pool_total',
+    'unindexed', 'refining', 'dismissed', 'planned_with'} or {'status':
+    'no_tvdb_link' | 'no_genres' | 'not_found', 'message'}."""
     today = today or today_local()
     with closing(get_db()) as conn:
         show = conn.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (show_id,)).fetchone()
         if not show:
             return {'status': 'not_found', 'message': 'Show not found.'}
-
         tvdb_id = show['tvdb_id'] if 'tvdb_id' in show.keys() else None
         if not tvdb_id:
-            return {
-                'status': 'no_tvdb_link',
-                'message': "use 'link poster' (from the dashboard's more menu, on this show) to get genre-based recommendations.",
-            }
-
+            return {'status': 'no_tvdb_link',
+                    'message': "use 'link poster' (from the dashboard's more menu, on this show) to get genre-based recommendations."}
         anchor_genres = get_genre_data_for_tvdb_id(conn, tvdb_id)['genres']
         if not anchor_genres:
-            return {
-                'status': 'no_genres',
-                'message': "TVDB doesn't list any genres for this show, so nothing to match against yet.",
-            }
+            return {'status': 'no_genres',
+                    'message': "TVDB doesn't list any genres for this show, so nothing to match against yet."}
 
-        pool_shows = [n for n, _pool in list_pool_folders()]
+        shows_by_id = {sh['id']: sh for sh in load_shows()}
+        ending_ids = [e['id'] for e in shows_ending_without_successor()]
+        plan_ids = ending_ids if show_id in ending_ids else [show_id]
+        anchors = _suggestion_anchors(conn, shows_by_id, plan_ids)
+        if show_id not in {a['id'] for a in anchors}:
+            anchors = _suggestion_anchors(conn, shows_by_id, [show_id])
+            plan_ids = [show_id]
 
-        queued = {r['show_name'].lower() for r in conn.execute(
-            f"SELECT show_name FROM {QUEUE_TABLE} WHERE triggered_at IS NULL").fetchall()}
+        ctx = _build_suggestion_context(conn, today, set(plan_ids))
+        results = _plan_suggestions(conn, ctx, anchors)
+        picks = results.get(show_id, [])
 
-        anchor_set = set(anchor_genres)
-        candidates = []  # every resolved pool folder, matched or not - needed to tell a common genre from a rare one
-        fetches = unindexed = 0
-        for folder in pool_shows:
-            if folder.lower() in queued:
-                continue
-            if not _pool_folder_is_cached(conn, folder):
-                if fetches >= POOL_RECOMMENDATION_SCAN_CAP:
-                    unindexed += 1
-                    continue
-                fetches += 1
-            candidate_tvdb_id = resolve_pool_folder_tvdb_id(conn, folder)
-            if not candidate_tvdb_id:
-                continue
-            if not _genre_is_cached(conn, candidate_tvdb_id):
-                if fetches >= POOL_RECOMMENDATION_SCAN_CAP:
-                    unindexed += 1
-                    continue
-                fetches += 1
-            candidate_data = get_genre_data_for_tvdb_id(conn, candidate_tvdb_id)
-            candidates.append({'name': folder, 'genres': candidate_data['genres'], 'poster_url': candidate_data['poster_url']})
-
-        # "drama"/"comedy" sit on nearly every show, so matching on them
-        # alone says little about THIS anchor. A genre counts as "generic"
-        # once more than GENERIC_GENRE_THRESHOLD of your resolved pool
-        # carries it; generic matches still count, but for less.
-        pool_size = len(candidates) or 1
-        genre_pool_counts = {}
-        for c in candidates:
-            for g in set(c['genres']):
-                genre_pool_counts[g] = genre_pool_counts.get(g, 0) + 1
-        generic_genres = {g for g, n in genre_pool_counts.items() if (n / pool_size) > GENERIC_GENRE_THRESHOLD}
-
-        theme = current_seasonal_theme(today)
-        scored = []
-        for c in candidates:
-            matched = anchor_set & set(c['genres'])
-            seasonal = _seasonal_hit(theme, c['name'], c['genres'])
-            if not matched and not (seasonal and theme['include_unmatched']):
-                continue
-            specific_matches = sorted(matched - generic_genres)
-            generic_matches = sorted(matched & generic_genres)
-            score = 2 * len(specific_matches) + len(generic_matches) + (theme['bonus'] if seasonal else 0)
-            scored.append({
-                'name': c['name'],
-                'genres': sorted(c['genres']),
-                'matched_genres': specific_matches + generic_matches,
-                'poster_url': c['poster_url'],
-                'season': theme['label'] if seasonal else None,
-                '_score': score,
-            })
-
-        scored.sort(key=lambda r: (-r['_score'], _rotation_key(r['name'], today)))
-        for r in scored:
-            del r['_score']
-        # Keep the nudge gentle: at most SEASONAL_MAX_SLOTS of the five go to
-        # in-season picks while other good matches exist; leftovers backfill.
-        picked, overflow, seasonal_used = [], [], 0
-        for r in scored:
-            if r['season'] and seasonal_used >= SEASONAL_MAX_SLOTS:
-                overflow.append(r)
-                continue
-            seasonal_used += 1 if r['season'] else 0
-            picked.append(r)
-        scored = picked + overflow
+        # Remember what was shown, once per show per week (fatigue).
+        week = ctx['this_week']
+        for r in picks:
+            key = r['name'].lower()
+            row = ctx['feedback'].get(key)
+            if row is None:
+                conn.execute(f"INSERT INTO {SUGGESTION_FEEDBACK_TABLE} (name_key, show_name, shown_weeks, last_shown_week) VALUES (?, ?, 1, ?)",
+                             (key, r['name'], week))
+            elif row['last_shown_week'] != week:
+                conn.execute(f"UPDATE {SUGGESTION_FEEDBACK_TABLE} SET shown_weeks = shown_weeks + 1, last_shown_week = ? WHERE name_key = ?",
+                             (week, key))
+        conn.commit()
 
         return {
             'status': 'ok',
             'anchor_genres': sorted(anchor_genres),
-            'recommendations': scored[:5],
-            'season': theme['label'] if theme else None,
-            'scanned': len(candidates),
-            'pool_total': len(pool_shows),
-            'unindexed': unindexed,
+            'recommendations': picks,
+            'dismissed': ctx['hidden'],
+            'planned_with': len(anchors) - 1 if len(anchors) > 1 else 0,
+            'season': ctx['theme']['label'] if ctx['theme'] else None,
+            'scanned': ctx['resolved'],
+            'pool_total': ctx['pool_total'],
+            'unindexed': ctx['unindexed'],
+            'refining': len(ctx['refining']),
         }
 
 
@@ -2364,6 +2695,12 @@ def run_migrations(conn):
     if current < 16:
         _migrate_v16_pool_dir(conn)
 
+    if current < 17:
+        _migrate_v17_suggestion_feedback(conn)
+
+    if current < 18:
+        _migrate_v18_tvdb_profile_cache(conn)
+
     conn.execute(
         f"INSERT INTO {SETTINGS_TABLE} (key, value) VALUES ('schema_version', ?) "
         f"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2560,6 +2897,39 @@ def _migrate_v15_target_end_date(conn):
     if 'plan_mode' not in existing_cols:
         conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN plan_mode TEXT;")
         log.info("Added plan_mode column.")
+
+
+def _migrate_v18_tvdb_profile_cache(conn):
+    """Airing status, first year, runtime and network per TVDB series, for
+    ranking suggestions (finished series first, similar era and length)."""
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TVDB_PROFILE_CACHE_TABLE} (
+            tvdb_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT '',
+            year INTEGER,
+            runtime INTEGER,
+            network TEXT DEFAULT '',
+            cached_at TEXT NOT NULL
+        );
+    """)
+    log.info("Added tvdb_profile_cache table.")
+
+
+def _migrate_v17_suggestion_feedback(conn):
+    """Memory for the 'up next' suggestions: a show you said 'not interested'
+    in is hidden until dismissed_until, and shown_weeks counts how many
+    different weeks a pool show has been suggested, so one that keeps being
+    ignored gradually gives way to fresher picks."""
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {SUGGESTION_FEEDBACK_TABLE} (
+            name_key TEXT PRIMARY KEY,
+            show_name TEXT NOT NULL,
+            dismissed_until TEXT,
+            shown_weeks INTEGER NOT NULL DEFAULT 0,
+            last_shown_week TEXT
+        );
+    """)
+    log.info("Added suggestion_feedback table.")
 
 
 def _migrate_v16_pool_dir(conn):
@@ -5219,6 +5589,43 @@ def api_recommendations(show_id):
     if result['status'] == 'not_found':
         return jsonify(result), 404
     return jsonify(result), 200
+
+
+@app.route('/api/suggestions/dismiss', methods=['POST'])
+def api_suggestion_dismiss():
+    """'Not interested': hide a pool show from suggestions for 90 days."""
+    name = ((request.get_json(silent=True) or {}).get('name') or '').strip()
+    if not name:
+        return jsonify({"status": "error", "message": "name is required"}), 400
+    until = (today_local() + timedelta(days=SUGGEST_DISMISS_DAYS)).isoformat()
+    with closing(get_db()) as conn:
+        conn.execute(
+            f"""INSERT INTO {SUGGESTION_FEEDBACK_TABLE} (name_key, show_name, dismissed_until) VALUES (?, ?, ?)
+                ON CONFLICT(name_key) DO UPDATE SET dismissed_until = excluded.dismissed_until""",
+            (name.lower(), name, until))
+        conn.commit()
+    return jsonify({"status": "success", "until": until})
+
+
+@app.route('/api/suggestions/restore', methods=['POST'])
+def api_suggestion_restore():
+    name = ((request.get_json(silent=True) or {}).get('name') or '').strip()
+    if not name:
+        return jsonify({"status": "error", "message": "name is required"}), 400
+    with closing(get_db()) as conn:
+        conn.execute(f"UPDATE {SUGGESTION_FEEDBACK_TABLE} SET dismissed_until = NULL, shown_weeks = 0 WHERE name_key = ?", (name.lower(),))
+        conn.commit()
+    return jsonify({"status": "success"})
+
+
+@app.route('/api/suggestions/dismissed', methods=['GET'])
+def api_suggestions_dismissed():
+    today_iso = today_local().isoformat()
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            f"SELECT show_name, dismissed_until FROM {SUGGESTION_FEEDBACK_TABLE} "
+            f"WHERE dismissed_until > ? ORDER BY show_name COLLATE NOCASE", (today_iso,)).fetchall()
+    return jsonify({"dismissed": [{"name": r['show_name'], "until": r['dismissed_until']} for r in rows]})
 
 
 def safe_show_path(root_dir, show_name):

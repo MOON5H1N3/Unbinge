@@ -774,7 +774,10 @@ def _fake_tvdb(monkeypatch, genres_by_name):
 
     def genres(tvdb_id):
         calls['genres'] += 1
-        name = next(n for n, i in ids.items() if i == tvdb_id) if tvdb_id in ids.values() else 'ANCHOR'
+        if tvdb_id in ids.values():
+            name = next(n for n, i in ids.items() if i == tvdb_id)
+        else:
+            name = f'ID{tvdb_id}' if f'ID{tvdb_id}' in genres_by_name else 'ANCHOR'
         return genres_by_name.get(name, ['drama']), '', None
 
     monkeypatch.setattr(unbinge, 'tvdb_search_series', search)
@@ -832,7 +835,10 @@ def test_halloween_nudge_applies_only_in_season(harness, monkeypatch):
     assert next(r for r in october['recommendations'] if r['name'] == 'Spooky Hollow')['season'] == 'Halloween'
     june = unbinge.get_recommendations_for_show(sid, today=date(2026, 6, 1))
     assert june['season'] == 'Summer'                       # a broad season, not the Halloween event
-    assert [r['name'] for r in june['recommendations']] == ['Sunny Days']   # the horror show isn't pulled in
+    recs = june['recommendations']
+    assert recs[0]['name'] == 'Sunny Days'
+    # the horror show is only ever the "something different" slot, never a seasonal pick
+    assert all(r['season'] is None for r in recs if r['name'] == 'Spooky Hollow')
 
 
 def test_strong_genre_match_can_still_beat_the_seasonal_bonus(harness, monkeypatch):
@@ -1135,3 +1141,220 @@ def test_upgrading_a_v15_database_adds_the_pool_dir_column(harness):
     with closing(unbinge.get_db()) as conn:
         cols = {r['name'] for r in conn.execute(f"PRAGMA table_info({unbinge.TABLE_NAME})")}
     assert 'pool_dir' in cols
+
+
+# ---------------------------------------------------------------------------
+# Suggestions: line-up awareness, dismiss, fatigue, length
+# ---------------------------------------------------------------------------
+
+def _names(rec):
+    return [r['name'] for r in rec['recommendations']]
+
+
+def test_suggestions_avoid_lookalikes_of_whats_already_dripping(harness, monkeypatch):
+    # Genres here are deliberately outside every seasonal theme.
+    for n in ('Another Western', 'Gentle Western Musical', 'Filler One', 'Filler Two'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    genres = {'ANCHOR': ['western', 'sport'], 'Another Western': ['western', 'biography'],
+              'Gentle Western Musical': ['western', 'sport', 'musical'],
+              'Filler One': ['drama'], 'Filler Two': ['drama'], 'ID5000': ['western', 'biography']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    other = harness.add_show('Running Western')   # already dripping, same genres as 'Another Western'
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 5000 WHERE id = ?", (other,))
+        conn.commit()
+    names = _names(unbinge.get_recommendations_for_show(sid))
+    assert 'Another Western' in names and names[0] != 'Another Western', names
+
+
+def test_not_interested_hides_a_show_and_restore_brings_it_back(harness, client, monkeypatch):
+    for n in ('Keep Me', 'Hide Me'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Keep Me': ['crime'], 'Hide Me': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    assert 'Hide Me' in _names(unbinge.get_recommendations_for_show(sid))
+    assert client.post('/api/suggestions/dismiss', json={'name': 'Hide Me'}).status_code == 200
+    rec = unbinge.get_recommendations_for_show(sid)
+    assert 'Hide Me' not in _names(rec) and rec['dismissed'] == 1
+    assert [d['name'] for d in client.get('/api/suggestions/dismissed').get_json()['dismissed']] == ['Hide Me']
+    client.post('/api/suggestions/restore', json={'name': 'Hide Me'})
+    assert 'Hide Me' in _names(unbinge.get_recommendations_for_show(sid))
+
+
+def test_a_dismissal_expires_after_90_days(harness, client, monkeypatch):
+    from datetime import date, timedelta
+    harness.make_show_in_pool('Old News', [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Old News': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    client.post('/api/suggestions/dismiss', json={'name': 'Old News'})
+    later = unbinge.today_local() + timedelta(days=unbinge.SUGGEST_DISMISS_DAYS + 1)
+    assert 'Old News' in _names(unbinge.get_recommendations_for_show(sid, today=later))
+
+
+def test_repeatedly_shown_picks_sink_but_reloading_in_a_week_changes_nothing(harness, monkeypatch):
+    from datetime import date, timedelta
+    for i in range(8):
+        harness.make_show_in_pool(f"Equal {i}", [(1, 1)])
+    genres = {'ANCHOR': ['crime'], **{f"Equal {i}": ['crime'] for i in range(8)}}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    d = date(2026, 3, 2)
+    first = _names(unbinge.get_recommendations_for_show(sid, today=d))
+    assert _names(unbinge.get_recommendations_for_show(sid, today=d + timedelta(days=2))) == first
+    seen = set(first)
+    for wk in range(1, 4):
+        seen |= set(_names(unbinge.get_recommendations_for_show(sid, today=d + timedelta(weeks=wk))))
+    assert len(seen) > 5        # picks rotate instead of the same five every week
+
+
+def test_short_series_beat_endless_ones_when_otherwise_equal(harness, monkeypatch):
+    harness.make_show_in_pool('Short Run', [(1, e) for e in range(1, 9)])
+    harness.make_show_in_pool('Endless', [(s, e) for s in range(1, 9) for e in range(1, 21)])
+    genres = {'ANCHOR': ['crime'], 'Short Run': ['crime'], 'Endless': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    rec = unbinge.get_recommendations_for_show(sid)
+    assert _names(rec)[0] == 'Short Run'
+    assert next(r for r in rec['recommendations'] if r['name'] == 'Short Run')['episodes'] == 8
+
+
+# ---------------------------------------------------------------------------
+# Suggestions: shared plan, ended boost, taste, watched memory
+# ---------------------------------------------------------------------------
+
+def _fake_profiles(monkeypatch, by_name_or_id):
+    """Stub the TVDB profile lookup: {tvdb_id|folder name: dict}. Pool folders
+    get ids from _fake_tvdb, so match on name through the search cache."""
+    seen = []
+
+    def prof(tvdb_id):
+        seen.append(tvdb_id)
+        return dict({'status': '', 'year': None, 'runtime': None, 'network': ''}, **by_name_or_id.get(tvdb_id, {})), None
+
+    monkeypatch.setattr(unbinge, 'tvdb_get_series_profile', prof)
+    return seen
+
+
+def _ending_anchor(harness, name, tvdb_id):
+    sid = harness.add_show(name)
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = ?, completed_at = ? WHERE id = ?",
+                     (tvdb_id, unbinge.now_local().isoformat(), sid))
+        conn.commit()
+    return sid
+
+
+def test_two_ending_shows_are_planned_together_with_no_repeats(harness, monkeypatch):
+    for i in range(8):
+        harness.make_show_in_pool(f"Crime {i}", [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'ID7001': ['crime'], **{f"Crime {i}": ['crime'] for i in range(8)}}
+    _fake_tvdb(monkeypatch, genres)
+    a = _ending_anchor(harness, 'Ending A', 7000)
+    b = _ending_anchor(harness, 'Ending B', 7001)
+    ra, rb = unbinge.get_recommendations_for_show(a), unbinge.get_recommendations_for_show(b)
+    na, nb = _names(ra), _names(rb)
+    assert na and nb and not (set(na) & set(nb))      # nothing offered twice
+    assert ra['planned_with'] == 1 and rb['planned_with'] == 1
+
+
+def test_a_show_that_is_not_ending_is_planned_on_its_own(harness, monkeypatch):
+    harness.make_show_in_pool('Solo Pick', [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Solo Pick': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    _ending_anchor(harness, 'Other Ending', 7000)
+    sid = _anchor_show(harness, genres)
+    rec = unbinge.get_recommendations_for_show(sid)
+    assert rec['planned_with'] == 0 and _names(rec) == ['Solo Pick']
+
+
+def test_a_list_is_varied_not_five_of_the_same(harness, monkeypatch):
+    for i in range(5):
+        harness.make_show_in_pool(f"Cop Drama {i}", [(1, 1)])
+    harness.make_show_in_pool('Cosy Baking', [(1, 1)])
+    genres = {'ANCHOR': ['crime', 'comedy'], **{f"Cop Drama {i}": ['crime', 'thriller'] for i in range(5)},
+              'Cosy Baking': ['crime', 'reality']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    names = _names(unbinge.get_recommendations_for_show(sid, today=__import__('datetime').date(2026, 3, 2)))
+    assert 'Cosy Baking' in names[:3]      # the odd one out is pulled up once a cop drama is already in the list
+
+
+def test_finished_series_beat_continuing_ones(harness, monkeypatch):
+    harness.make_show_in_pool('Done And Dusted', [(1, e) for e in range(1, 7)])
+    harness.make_show_in_pool('Still Airing', [(1, e) for e in range(1, 7)])
+    genres = {'ANCHOR': ['crime'], 'Done And Dusted': ['crime'], 'Still Airing': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    with closing(unbinge.get_db()) as conn:      # resolve ids so the profiles can be keyed
+        pass
+    unbinge.get_recommendations_for_show(sid)
+    with closing(unbinge.get_db()) as conn:
+        ids = {r['folder_name']: r['tvdb_id'] for r in conn.execute(f"SELECT * FROM {unbinge.POOL_TVDB_CACHE_TABLE}")}
+        conn.execute(f"DELETE FROM {unbinge.TVDB_PROFILE_CACHE_TABLE}")
+        conn.commit()
+    _fake_profiles(monkeypatch, {ids['Done And Dusted']: {'status': 'ended'}, ids['Still Airing']: {'status': 'continuing'}})
+    rec = unbinge.get_recommendations_for_show(sid)
+    assert _names(rec)[0] == 'Done And Dusted'
+    assert 'finished airing' in rec['recommendations'][0]['why']
+
+
+def test_profiles_are_cached_and_capped_per_request(harness, monkeypatch):
+    for i in range(30):
+        harness.make_show_in_pool(f"Many {i:02d}", [(1, 1)])
+    genres = {'ANCHOR': ['crime'], **{f"Many {i:02d}": ['crime'] for i in range(30)}}
+    _fake_tvdb(monkeypatch, genres)
+    seen = _fake_profiles(monkeypatch, {})
+    sid = _anchor_show(harness, genres)
+    first = unbinge.get_recommendations_for_show(sid)
+    assert len(seen) <= unbinge.SUGGEST_PROFILE_FETCH_CAP
+    assert first['refining'] >= 0
+    unbinge.get_recommendations_for_show(sid)
+    # a failed (empty) lookup is remembered for a day rather than retried every load
+    again = len(seen)
+    unbinge.get_recommendations_for_show(sid)
+    assert len(seen) - again <= unbinge.SUGGEST_PROFILE_FETCH_CAP
+
+
+def test_shows_you_just_finished_are_not_suggested_again(harness, monkeypatch):
+    harness.make_show_in_pool('Just Watched', [(1, 1)])
+    harness.make_show_in_pool('Fresh Pick', [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Just Watched': ['crime'], 'Fresh Pick': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    with closing(unbinge.get_db()) as conn:
+        unbinge.log_history(conn, None, 'Just Watched', 'graduated', 'Returned to the pool')
+        conn.commit()
+    assert _names(unbinge.get_recommendations_for_show(sid)) == ['Fresh Pick']
+    later = unbinge.today_local() + __import__('datetime').timedelta(days=unbinge.SUGGEST_WATCHED_EXCLUDE_DAYS + 5)
+    assert 'Just Watched' in _names(unbinge.get_recommendations_for_show(sid, today=later))   # allowed again, if discouraged
+
+
+def test_turning_a_show_down_cools_similar_ones(harness, client, monkeypatch):
+    for n in ('Gritty Cop', 'Gritty Cop 2', 'Quiet Garden'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    genres = {'ANCHOR': ['crime', 'drama'], 'Gritty Cop': ['crime', 'noir'], 'Gritty Cop 2': ['crime', 'noir'],
+              'Quiet Garden': ['crime', 'family']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = _anchor_show(harness, genres)
+    client.post('/api/suggestions/dismiss', json={'name': 'Gritty Cop'})
+    names = _names(unbinge.get_recommendations_for_show(sid, today=__import__('datetime').date(2026, 3, 2)))
+    assert 'Gritty Cop' not in names and names.index('Quiet Garden') < names.index('Gritty Cop 2')
+
+
+def test_a_big_pool_with_several_ending_shows_stays_quick(harness, monkeypatch):
+    import time, random
+    rnd = random.Random(3)
+    pool_genres = ['crime', 'drama', 'comedy', 'sci-fi', 'fantasy', 'horror', 'romance', 'reality', 'history', 'western', 'sport']
+    genres = {'ANCHOR': ['crime', 'drama']}
+    for i in range(150):
+        harness.make_show_in_pool(f"Big {i:03d}", [(1, 1)])
+        genres[f"Big {i:03d}"] = rnd.sample(pool_genres, 3)
+    _fake_tvdb(monkeypatch, genres)
+    ids = [_ending_anchor(harness, f"Ending {k}", 7000 + k) for k in range(4)]
+    unbinge.get_recommendations_for_show(ids[0])      # warm the caches
+    start = time.time()
+    unbinge.get_recommendations_for_show(ids[1])
+    assert time.time() - start < 3.0
