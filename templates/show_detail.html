@@ -140,13 +140,6 @@
 
 <div class="panel">
     <h2>episodes <span class="cell-faint" style="font-weight:400;">({{ dripped_count }} / {{ total_eps }} dripped)</span></h2>
-    {% if show_watch.synced and show_watch.dripped %}
-    <div class="watch-strip">
-        <span>watched <strong>{{ show_watch.watched }}</strong> of {{ show_watch.dripped }} dripped</span>
-        {% if show_watch.avg_lag is not none %}<span>usually watched <strong>{{ show_watch.avg_lag }}</strong> day{{ '' if show_watch.avg_lag == 1 else 's' }} after it drips</span>{% endif %}
-        {% if show_watch.flag %}<span class="pill pill-missing">{{ show_watch.behind }} behind</span>{% elif show_watch.behind %}<span class="cell-faint">{{ show_watch.behind }} not watched yet</span>{% endif %}
-    </div>
-    {% endif %}
     <div class="legend">
         <span><i class="dot-sample" style="background:var(--pill-complete-bg);"></i>dripped</span>
         <span><i class="dot-sample" style="background:var(--pill-partial-bg);"></i>waiting in vault</span>
@@ -166,7 +159,7 @@
                 <span class="ep-list-num">{{ ep.episode }}</span>
                 <span class="ep-list-title">S{{ '%02d'|format(season) }}E{{ '%02d'|format(ep.episode) }}</span>
                 <span class="ep-list-status">
-                    {% if ep.status == 'dripped' %}{% if ep.dripped_on %}<span class="ep-dates">dripped {{ ep.dripped_on }}{% if ep.watched_on %} · watched {{ ep.watched_on }}{% if ep.lag %} ({{ ep.lag }}d){% endif %}{% elif show_watch.synced %} · not watched yet{% endif %}</span>{% endif %}<span class="pill {{ 'pill-complete' if ep.watched_on or not show_watch.synced else 'pill-partial' }}">{{ 'watched' if ep.watched_on else 'released' }}</span>
+                    {% if ep.status == 'dripped' %}{% if ep.dripped_on %}<span class="ep-dates">dripped {{ ep.dripped_on }}</span>{% endif %}<span class="pill pill-complete">released</span>
                     {% elif ep.status == 'waiting' %}in vault
                     {% elif ep.status == 'excluded' %}excluded
                     {% else %}missing{% endif %}
@@ -624,7 +617,7 @@ const heroReturnBtn = document.getElementById('heroReturnBtn');
 if (heroReturnBtn) heroReturnBtn.addEventListener('click', async (e) => {
     const ok = await unbingeConfirm({ title: 'return to the pool now?', body: 'this show has finished. its files go back to the pool straight away instead of waiting out the cooldown. if new episodes have turned up, it resumes instead.', confirmLabel: 'return to pool' });
     if (!ok) return;
-    const button = e.currentTarget;
+    const button = heroReturnBtn;
     button.disabled = true;
     try {
         const res = await fetch(`/api/return-to-pool/${SHOW_ID}`, { method: 'POST' });

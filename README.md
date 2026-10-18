@@ -37,7 +37,7 @@ If episodes reappear in the vault during cooldown, the show resumes instead of g
 - **Sonarr** integration to show real upcoming air dates
 - **Database backups** – on demand or automatic, with configurable retention
 - **Missed-run detection** with a one-click **catch up** that releases what you missed
-- **Watch progress** from Plex, weekly digest, one-tap queue and opt-in auto-queue
+- **Weekly digest**, one-tap queue and opt-in auto-queue
 - **Library health check** on the System page (gaps, duplicates, odd names)
 - **Pool filters and labels** – shortlist (favoured by suggestions), rewatchable, animation tag, with bulk actions
 - **Optional password login** with CSRF protection

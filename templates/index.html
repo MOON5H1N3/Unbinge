@@ -12,45 +12,65 @@
 {% block content %}
 <div class="page-header">
     <h1 class="mast">series</h1>
-    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        {% set run_failed = last_run and last_run.error_count > 0 %}
+{% set attention = (1 if ending_notice else 0) + (1 if missed_run_notice else 0) + (1 if run_failed else 0) %}
+<div class="bell-wrap" id="bellWrap">
+    <button type="button" class="btn bell-btn" id="bellBtn" aria-haspopup="true" aria-expanded="false" title="notifications">
+        {{ icon('bell', 15) }}{% if attention %}<span class="bell-badge">{{ attention }}</span>{% endif %}
+    </button>
+    <div class="bell-panel" id="bellPanel" hidden>
+        <div class="bell-head">notifications</div>
+        {% if ending_notice %}
+        <div class="bell-item bell-warn">
+            <div class="bell-title">nothing queued to follow</div>
+            <div class="bell-body">{% for e in ending_notice[:4] %}<a href="/show/{{ e.id }}">{{ e.name }}</a>{% if e.state == 'finished' %} (finished){% elif e.ends %} (ends {{ e.ends }}){% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if ending_notice|length > 4 %} and {{ ending_notice|length - 4 }} more{% endif %}</div>
+        </div>
+        {% endif %}
+        {% if missed_run_notice %}
+        <div class="bell-item bell-warn">
+            <div class="bell-title">missed drip run</div>
+            <div class="bell-body">{{ missed_run_notice }}{% if catch_up and catch_up['items'] %} Catching up would release {% for i in catch_up['items'][:4] %}{{ i.name }} ({{ i.episodes }}){{ ', ' if not loop.last }}{% endfor %}.{% endif %}</div>
+            {% if catch_up and catch_up['items'] %}<button class="btn btn-sm" id="catchUpBtn" type="button">catch up now</button>{% endif %}
+        </div>
+        {% endif %}
+        {% if undoable %}
+        <div class="bell-item">
+            <div class="bell-title">last drip</div>
+            <div class="bell-body">{{ undoable.show_name }} - {{ undoable.detail }}</div>
+            <button type="button" class="btn btn-sm" onclick="undoLastDrip(this)">undo</button>
+        </div>
+        {% endif %}
+        {% if last_run %}
+        <div class="bell-item {{ 'bell-error' if run_failed }}">
+            <div class="bell-title">last run</div>
+            <div class="bell-body">{{ last_run.started_at.replace('T', ' ')[:16] }}{% if last_run.forced_show_id %} (manual){% endif %}: {{ last_run.detail }}{% if run_failed %} <a href="/history">view details</a>{% endif %}</div>
+        </div>
+        {% endif %}
+        {% if not (ending_notice or missed_run_notice or undoable or last_run) %}<div class="bell-empty">all quiet.</div>{% endif %}
+    </div>
+</div>
+<script>
+(function () {
+    const btn = document.getElementById('bellBtn'), panel = document.getElementById('bellPanel');
+    btn.addEventListener('click', (e) => { e.stopPropagation(); panel.hidden = !panel.hidden; btn.setAttribute('aria-expanded', String(!panel.hidden)); });
+    document.addEventListener('click', (e) => { if (!panel.hidden && !document.getElementById('bellWrap').contains(e.target)) { panel.hidden = true; btn.setAttribute('aria-expanded', 'false'); } });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { panel.hidden = true; } });
+    const catchUp = document.getElementById('catchUpBtn');
+    if (catchUp) catchUp.addEventListener('click', async () => {
+        if (!await unbingeConfirm({ title: 'catch up?', body: 'release the episodes missed while unbinge was down.', confirmLabel: 'catch up' })) return;
+        catchUp.disabled = true;
+        const r = await fetch('/api/catch-up', { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        unbingeToast(j.message || 'done.', r.ok ? 'success' : 'error');
+        setTimeout(() => location.reload(), 800);
+    });
+})();
+</script>
         {% if shows|length > 1 %}<button type="button" class="btn" id="balanceWeekBtn" onclick="balanceWeek()">{{ icon('calendar', 14) }}balance the week</button>{% endif %}
         <button type="button" class="btn btn-primary" onclick="openPoolModal()">{{ icon('plus', 14) }}add series</button>
     </div>
 </div>
-
-{% if ending_notice %}
-<div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>nothing is queued to follow
-    {% for e in ending_notice[:3] %}<a href="/show/{{ e.id }}" style="color:inherit; font-weight:600;">{{ e.name }}</a>{% if e.state == 'finished' %} (finished){% elif e.ends %} (ends {{ e.ends }}){% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if ending_notice|length > 3 %} and {{ ending_notice|length - 3 }} more{% endif %}.</span></div>
-{% endif %}
-{% if missed_run_notice %}
-<div class="banner banner-warning">{{ icon('alert-triangle', 15) }}<span>{{ missed_run_notice }}{% if catch_up and catch_up['items'] %} Catching up would release {{ catch_up['items']|length }} show{{ 's' if catch_up['items']|length != 1 }}: {% for i in catch_up['items'][:4] %}{{ i.name }} ({{ i.episodes }}){{ ', ' if not loop.last }}{% endfor %}.{% endif %}</span>{% if catch_up and catch_up['items'] %}<button class="btn btn-sm" id="catchUpBtn" type="button">Catch up now</button>{% endif %}</div>
-{% if catch_up and catch_up['items'] %}<script>
-document.getElementById('catchUpBtn').addEventListener('click', async () => {
-  if (!await unbingeConfirm({title: 'Catch up?', body: 'Release the episodes missed while Unbinge was down.', confirmLabel: 'Catch up'})) return;
-  const btn = document.getElementById('catchUpBtn'); btn.disabled = true;
-  const r = await fetch('/api/catch-up', {method: 'POST'});
-  const j = await r.json().catch(() => ({}));
-  unbingeToast(j.message || 'Done');
-  setTimeout(() => location.reload(), 800);
-});
-</script>{% endif %}
-{% endif %}
-
-{% if undoable %}
-<div class="banner banner-info">
-    {{ icon('undo', 15) }}
-    <span>last drip: {{ undoable.show_name }} - {{ undoable.detail }}</span>
-    <button type="button" class="banner-action" onclick="undoLastDrip(this)">undo</button>
-</div>
-{% endif %}
-
-{% if last_run %}
-<div class="banner {{ 'banner-error' if last_run.error_count > 0 else 'banner-info' }}">
-    <span class="dot {{ 'dot-off' if last_run.error_count > 0 else 'dot-ok' }}"></span>
-    <span>last run {{ last_run.started_at.replace('T', ' ')[:16] }}{% if last_run.forced_show_id %} (manual){% endif %}: {{ last_run.detail }}</span>
-    {% if last_run.error_count > 0 %}<a href="/history" class="banner-action">view details →</a>{% endif %}
-</div>
-{% endif %}
 
 {% if next_run_iso %}
 <div class="status-line" id="nextRunNote" data-next-run="{{ next_run_iso }}">
@@ -181,7 +201,6 @@ document.getElementById('catchUpBtn').addEventListener('click', async () => {
                 {% else %}
                     <span class="pill pill-complete">active</span>
                 {% endif %}
-                {% if show.behind_flag and not show.paused %}<span class="pill pill-missing" title="{{ show.behind }} dripped episodes not watched in plex yet">{{ show.behind }} behind</span>{% endif %}
             </td>
             <td data-label="Actions" class="actions-cell" data-show-id="{{ show.id }}" data-show-name="{{ show.show_name }}">
                 <div class="icon-row">

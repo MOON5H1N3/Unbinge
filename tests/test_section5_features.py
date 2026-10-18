@@ -888,14 +888,14 @@ def test_warns_about_shows_ending_with_nothing_queued(harness, client):
     harness.make_episode(show_dir, 'Ending Show', 1, 1, subdir='Season 01')
     sid = harness.add_show('Ending Show', release_days='0,1,2,3,4,5,6')
     assert [x['name'] for x in unbinge.shows_ending_without_successor()] == ['Ending Show']
-    assert 'nothing is queued to follow' in client.get('/').get_data(as_text=True)
+    assert 'nothing queued to follow' in client.get('/').get_data(as_text=True)
     with closing(unbinge.get_db()) as conn:
         conn.execute(f"""INSERT INTO {unbinge.QUEUE_TABLE}
             (show_name, trigger_type, trigger_show_id, release_days, episodes_per_drop, created_at)
             VALUES ('Next One', 'after_show', ?, '0', 1, ?)""", (sid, unbinge.now_local().isoformat()))
         conn.commit()
     assert unbinge.shows_ending_without_successor() == []
-    assert 'nothing is queued to follow' not in client.get('/').get_data(as_text=True)
+    assert 'nothing queued to follow' not in client.get('/').get_data(as_text=True)
 
 
 def test_seasonal_picks_take_at_most_two_of_five_slots(harness, monkeypatch):
@@ -1456,31 +1456,9 @@ def test_lineup_accepts_the_app_password_as_basic_auth_for_home_showing(harness,
 
 
 # ---------------------------------------------------------------------------
-# Plex watch progress
+# Test helpers
 # ---------------------------------------------------------------------------
 from datetime import datetime as _dt, timedelta as _td
-
-
-class _PlexEp:
-    def __init__(self, season, ep, watched_on=None):
-        self.parentIndex, self.index = season, ep
-        self.viewCount = 1 if watched_on else 0
-        self.lastViewedAt = watched_on
-
-
-class _PlexShow:
-    def __init__(self, title, folder, eps, tvdb=None):
-        self.title, self.locations, self._eps = title, [folder], eps
-        self.guids = [type('G', (), {'id': f'tvdb://{tvdb}'})()] if tvdb else []
-
-    def episodes(self):
-        return self._eps
-
-
-class _PlexServerStub:
-    def __init__(self, shows):
-        sec = type('Sec', (), {'all': lambda _s: shows, 'type': 'show'})()
-        self.library = type('Lib', (), {'sectionByID': lambda _s, i: sec, 'sections': lambda _s: [sec]})()
 
 
 def _drip(sid, season, episode, days_ago):
@@ -1491,100 +1469,6 @@ def _drip(sid, season, episode, days_ago):
         conn.commit()
 
 
-def _with_plex(monkeypatch, shows):
-    monkeypatch.setattr(unbinge, 'PLEX_URL', 'http://plex.test:32400')
-    monkeypatch.setattr(unbinge, 'PLEX_TOKEN', 'tok')
-    monkeypatch.setattr(unbinge, '_plex_server_for_watch', lambda: _PlexServerStub(shows))
-
-
-def test_watch_sync_records_when_episodes_were_watched(harness, monkeypatch):
-    sid = harness.add_show('Slow Burn')
-    for e, ago in ((1, 10), (2, 8), (3, 6), (4, 5)):
-        _drip(sid, 1, e, ago)
-    seen1 = unbinge.now_local() - _td(days=8)       # episode 1: dripped 10 days ago, watched 8 days ago (lag 2)
-    seen2 = unbinge.now_local() - _td(days=3)       # episode 2: dripped 8 days ago, watched 3 days ago (lag 5)
-    _with_plex(monkeypatch, [_PlexShow('Slow Burn', '/tv/Slow Burn', [_PlexEp(1, 1, seen1), _PlexEp(1, 2, seen2), _PlexEp(1, 3), _PlexEp(1, 4)])])
-    status = unbinge.sync_watch_state()
-    assert status['ok'] and status['matched'] == 1 and status['watched'] == 2
-    with closing(unbinge.get_db()) as conn:
-        st = unbinge.watch_stats(conn, sid)[sid]
-    assert (st['dripped'], st['watched'], st['behind'], st['avg_lag']) == (4, 2, 2, 3.5)
-
-
-def test_an_episode_dripped_today_is_not_behind(harness, monkeypatch):
-    sid = harness.add_show('Fresh')
-    _drip(sid, 1, 1, 0)
-    _with_plex(monkeypatch, [_PlexShow('Fresh', 'C:\\TV\\Fresh', [_PlexEp(1, 1)])])
-    unbinge.sync_watch_state()
-    with closing(unbinge.get_db()) as conn:
-        assert unbinge.watch_stats(conn, sid)[sid]['behind'] == 0
-
-
-def test_a_watch_before_the_drip_counts_as_no_lag_and_unwatching_clears_it(harness, monkeypatch):
-    sid = harness.add_show('Rewatch')
-    _drip(sid, 1, 1, 2)
-    early = unbinge.now_local() - _td(days=30)
-    _with_plex(monkeypatch, [_PlexShow('Rewatch', '/tv/Rewatch', [_PlexEp(1, 1, early)])])
-    unbinge.sync_watch_state()
-    with closing(unbinge.get_db()) as conn:
-        assert unbinge.watch_stats(conn, sid)[sid]['avg_lag'] == 0
-    _with_plex(monkeypatch, [_PlexShow('Rewatch', '/tv/Rewatch', [_PlexEp(1, 1)])])   # marked unwatched in Plex
-    unbinge.sync_watch_state()
-    with closing(unbinge.get_db()) as conn:
-        assert unbinge.watch_stats(conn, sid)[sid]['watched'] == 0
-
-
-def test_shows_are_matched_by_folder_then_title_then_tvdb(harness, monkeypatch):
-    a, b, c = harness.add_show('By Folder'), harness.add_show('By Title'), harness.add_show('By Tvdb')
-    with closing(unbinge.get_db()) as conn:
-        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 555 WHERE id = ?", (c,))
-        conn.commit()
-    for sid in (a, b, c):
-        _drip(sid, 1, 1, 3)
-    now = unbinge.now_local()
-    _with_plex(monkeypatch, [_PlexShow('Different', '/x/By Folder', [_PlexEp(1, 1, now)]),
-                             _PlexShow('by title', '/x/other', [_PlexEp(1, 1, now)]),
-                             _PlexShow('Whatever', '/y/z', [_PlexEp(1, 1, now)], tvdb=555)])
-    status = unbinge.sync_watch_state()
-    assert status['matched'] == 3 and status['unmatched'] == []
-
-
-def test_unmatched_and_unconfigured_are_reported_not_fatal(harness, monkeypatch):
-    sid = harness.add_show('Ghost')
-    _drip(sid, 1, 1, 3)
-    _with_plex(monkeypatch, [])
-    status = unbinge.sync_watch_state()
-    assert status['ok'] and status['unmatched'] == ['Ghost']
-    monkeypatch.setattr(unbinge, 'PLEX_TOKEN', '')
-    monkeypatch.setattr(unbinge, '_plex_server_for_watch', lambda: None)
-    assert unbinge.sync_watch_state()['error']
-
-
-def test_behind_badge_and_episode_dates_show_up(harness, client, monkeypatch):
-    sid = harness.add_show('Falling Behind')
-    for e in range(1, 5):
-        _drip(sid, 1, e, 10 - e)
-    _with_plex(monkeypatch, [_PlexShow('Falling Behind', '/tv/Falling Behind',
-                                       [_PlexEp(1, 1, unbinge.now_local() - _td(days=7)), _PlexEp(1, 2), _PlexEp(1, 3), _PlexEp(1, 4)])])
-    unbinge.sync_watch_state()
-    html = client.get('/').get_data(as_text=True)
-    assert '3 behind' in html
-    page = client.get(f'/show/{sid}').get_data(as_text=True)
-    assert 'watched <strong>1</strong> of 4 dripped' in page and 'not watched yet' in page and '3 behind' in page
-    assert client.post('/api/watch-sync').status_code == 200
-    assert 'watching progress' in client.get('/system').get_data(as_text=True)
-
-
-def test_threshold_is_configurable(harness, monkeypatch):
-    sid = harness.add_show('Slightly Behind')
-    for e in range(1, 3):
-        _drip(sid, 1, e, 5)
-    unbinge.set_setting('behind_threshold', '5')
-    assert not next(s for s in unbinge.load_shows() if s['id'] == sid)['behind_flag']
-    unbinge.set_setting('behind_threshold', '2')
-    assert next(s for s in unbinge.load_shows() if s['id'] == sid)['behind_flag']
-
-
 # ---------------------------------------------------------------------------
 # Weekly digest
 # ---------------------------------------------------------------------------
@@ -1593,12 +1477,18 @@ def test_weekly_digest_summarises_the_week(harness, monkeypatch):
     sid = harness.add_show('Busy Show')
     for e in range(1, 6):
         _drip(sid, 1, e, 2)
-    _with_plex(monkeypatch, [_PlexShow('Busy Show', '/tv/Busy Show', [_PlexEp(1, 1, unbinge.now_local() - _td(days=1)), _PlexEp(1, 2), _PlexEp(1, 3), _PlexEp(1, 4), _PlexEp(1, 5)])])
-    unbinge.sync_watch_state()
     text = unbinge.build_weekly_digest()
     assert text.startswith('weekly digest')
-    assert 'dripped: 5 episode(s) — Busy Show ×5' in text and 'watched: 1 episode(s) — Busy Show ×1' in text
-    assert 'falling behind: Busy Show (4 unwatched)' in text and 'usually watch' in text
+    assert 'dripped: 5 episode(s) — Busy Show ×5' in text
+    assert 'watched' not in text and 'behind' not in text
+
+
+def test_no_plex_watch_tracking_remains(harness, client):
+    sid = harness.add_show('Plain Show')
+    _drip(sid, 1, 1, 3)
+    assert client.post('/api/watch-sync').status_code in (404, 405)
+    assert 'watching progress' not in client.get('/system').get_data(as_text=True)
+    assert ' behind' not in client.get('/').get_data(as_text=True)
 
 
 def test_weekly_digest_names_ending_shows_and_what_could_follow(harness, monkeypatch):
@@ -1904,3 +1794,63 @@ def test_pool_length_filter(harness, client):
         harness.make_episode(harness.pool / 'Medium', 'Medium', 1, e, subdir='Season 01')
     html = client.get('/pool?length=short').get_data(as_text=True)
     assert 'value="Tiny"' in html and 'value="Medium"' not in html
+
+
+def test_show_detail_scripts_have_valid_syntax(harness, client, tmp_path):
+    import re, subprocess, shutil
+    if not shutil.which('node'):
+        return
+    sid = harness.add_show('Cooling Show', completed_at=unbinge.now_local().isoformat())
+    html = client.get(f'/show/{sid}').get_data(as_text=True)
+    assert 'heroReturnBtn' in html
+    for i, block in enumerate(re.findall(r'<script>(.*?)</script>', html, re.S)):
+        f = tmp_path / f's{i}.js'
+        f.write_text(block)
+        r = subprocess.run(['node', '--check', str(f)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[:500]
+
+
+def test_return_to_pool_handler_does_not_read_current_target_after_awaiting(harness, client):
+    """event.currentTarget is null once the handler has awaited the confirm
+    dialog, which made the 'return to pool now' button silently do nothing."""
+    sid = harness.add_show('Cooling Show 2', completed_at=unbinge.now_local().isoformat())
+    html = client.get(f'/show/{sid}').get_data(as_text=True)
+    start = html.index("heroReturnBtn.addEventListener")
+    handler = html[start:html.index("heroDripBtn", start)]
+    after_await = handler.split("await unbingeConfirm", 1)[1]
+    assert 'currentTarget' not in after_await
+
+
+def test_dashboard_notifications_live_in_the_bell(harness, client):
+    sid = harness.add_show('Wrapping Up B')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET completed_at = ? WHERE id = ?", (unbinge.now_local().isoformat(), sid))
+        conn.commit()
+    html = client.get('/').get_data(as_text=True)
+    assert 'id="bellBtn"' in html and 'nothing queued to follow' in html
+    assert 'class="banner banner-warning">' not in html.split('bellWrap', 1)[0].split('<main', 1)[-1]
+
+
+# ---------------------------------------------------------------------------
+# Speed: compression, per-request settings memo
+# ---------------------------------------------------------------------------
+
+def test_large_pages_are_gzipped_when_the_browser_accepts_it(harness, client):
+    for i in range(30):
+        (harness.pool / f'Folder {i}').mkdir()
+    plain = client.get('/pool').get_data()
+    r = client.get('/pool', headers={'Accept-Encoding': 'gzip'})
+    assert r.headers.get('Content-Encoding') == 'gzip'
+    import gzip
+    assert gzip.decompress(r.get_data()) == plain
+    assert len(r.get_data()) < len(plain)
+    assert client.get('/api/pool', headers={'Accept-Encoding': 'gzip'}).status_code == 200
+
+
+def test_a_setting_saved_during_a_request_is_read_back_fresh(harness, client):
+    unbinge.set_setting('behind_probe', 'one')
+    with unbinge.app.test_request_context('/'):
+        assert unbinge.get_setting('behind_probe') == 'one'
+        unbinge.set_setting('behind_probe', 'two')
+        assert unbinge.get_setting('behind_probe') == 'two'
+    assert unbinge.get_setting('behind_probe') == 'two'
