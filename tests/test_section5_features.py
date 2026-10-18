@@ -1759,3 +1759,12 @@ def test_a_setting_saved_during_a_request_is_read_back_fresh(harness, client):
         unbinge.set_setting('behind_probe', 'two')
         assert unbinge.get_setting('behind_probe') == 'two'
     assert unbinge.get_setting('behind_probe') == 'two'
+
+
+def test_a_daily_show_is_never_blamed_for_a_clash(harness, monkeypatch):
+    spec = [("Coven Daily", '0,1,2,3,4,5,6', ['fantasy']), ("Witches", 5, ['fantasy']),
+            ("Other A", 5, []), ("Other B", 5, [])]
+    _balance_setup(harness, monkeypatch, spec)
+    plan = unbinge.plan_week_balance()
+    assert plan['moves'], "three shows on Saturday should still be spread out"
+    assert not any('Coven Daily' in m['why'] for m in plan['moves'])

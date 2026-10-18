@@ -1375,7 +1375,11 @@ def plan_week_balance(shows=None):
             load[d] += 1
     before = list(load)
     mov_ids = sorted((sh['id'] for sh in movable), key=lambda i: name[i].lower())
-    similar = {i: [j for j in ids if j != i and sims[(i, j)] > 0] for i in ids}
+    # A show that drops most days of the week is on every day, so no move can
+    # get away from it: it must not count as a clashing neighbour (nor be
+    # named as the reason for a move).
+    EVERYWHERE = 5
+    similar = {i: [j for j in ids if j != i and sims[(i, j)] > 0 and len(days_of[j]) < EVERYWHERE] for i in ids}
     # pen[i][d]: total similarity penalty for show i if it sat on day d.
     pen = {i: [sum(sims[(i, j)] * near_pen(d, j) for j in similar[i]) for d in range(7)] for i in ids}
 
