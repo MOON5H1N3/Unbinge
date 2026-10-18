@@ -1768,3 +1768,129 @@ def test_a_daily_show_is_never_blamed_for_a_clash(harness, monkeypatch):
     plan = unbinge.plan_week_balance()
     assert plan['moves'], "three shows on Saturday should still be spread out"
     assert not any('Coven Daily' in m['why'] for m in plan['moves'])
+
+
+# ---------------------------------------------------------------------------
+# Suggestions load quickly: TVDB lookups run in parallel and can be pre-warmed
+# ---------------------------------------------------------------------------
+
+def _threadsafe_slow_tvdb(monkeypatch, delay=0.05):
+    import threading, time as _t
+    lock, ids, calls = threading.Lock(), {}, {'search': 0, 'genres': 0, 'profile': 0}
+
+    def search(query):
+        _t.sleep(delay)
+        with lock:
+            calls['search'] += 1
+            ids.setdefault(query, 5000 + len(ids))
+            return [{'tvdb_id': ids[query], 'name': query, 'year': '', 'image_url': '', 'overview': ''}], None
+
+    def genres(tvdb_id):
+        _t.sleep(delay)
+        with lock:
+            calls['genres'] += 1
+        return ['crime', 'thriller'], '', None
+
+    def profile(tvdb_id):
+        _t.sleep(delay)
+        with lock:
+            calls['profile'] += 1
+        return {'status': 'ended', 'year': 2010, 'runtime': 45, 'network': 'X'}, None
+
+    monkeypatch.setattr(unbinge, 'tvdb_search_series', search)
+    monkeypatch.setattr(unbinge, 'tvdb_get_series_genres', genres)
+    monkeypatch.setattr(unbinge, 'tvdb_get_series_profile', profile)
+    monkeypatch.setattr(unbinge, 'tvdb_get_token', lambda *a, **k: ('tok', None))
+    return calls
+
+
+def test_a_cold_pool_is_indexed_in_parallel_not_one_by_one(harness, monkeypatch):
+    import time as _t
+    for i in range(24):
+        harness.make_show_in_pool(f'Pool Show {i}', [(1, 1)])
+    calls = _threadsafe_slow_tvdb(monkeypatch)
+    monkeypatch.setattr(unbinge, 'TVDB_PARALLEL_WORKERS', 8)
+    with closing(unbinge.get_db()) as conn:
+        t = _t.time()
+        unbinge._prefetch_pool_lookups(conn, [f'Pool Show {i}' for i in range(24)], 40)
+        took = _t.time() - t
+        assert all(unbinge._pool_folder_is_cached(conn, f'Pool Show {i}') for i in range(24))
+    assert calls['search'] == 24 and calls['genres'] == 24
+    assert took < 48 * 0.05 * 0.6          # well under what 48 serial calls would take
+
+
+def test_warming_fills_every_cache_and_only_one_run_at_a_time(harness, monkeypatch):
+    for i in range(12):
+        harness.make_show_in_pool(f'Warm {i}', [(1, 1)])
+    calls = _threadsafe_slow_tvdb(monkeypatch, delay=0.01)
+    monkeypatch.setattr(unbinge, 'TVDB_PARALLEL_WORKERS', 6)
+    unbinge.set_setting('tvdb_api_key', 'k')
+    unbinge.warm_suggestion_caches()
+    assert calls['search'] == 12 and calls['genres'] == 12 and calls['profile'] == 12
+    before = dict(calls)
+    unbinge.warm_suggestion_caches()                    # everything cached: no more web calls
+    assert calls == before
+    unbinge._warm_lock.acquire()
+    try:
+        unbinge.warm_suggestion_caches()                # another run in progress: returns at once
+    finally:
+        unbinge._warm_lock.release()
+    assert calls == before
+
+
+def test_warming_does_nothing_without_a_tvdb_key(harness, monkeypatch):
+    harness.make_show_in_pool('No Key', [(1, 1)])
+    calls = _threadsafe_slow_tvdb(monkeypatch, delay=0)
+    unbinge.warm_suggestion_caches()
+    assert calls['search'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Seasonal picks follow the date the new show will start, not today's
+# ---------------------------------------------------------------------------
+
+def test_start_date_is_the_end_plus_cooldown_unless_the_series_has_ended(harness):
+    from datetime import date, timedelta
+    today = date(2026, 10, 18)
+    sh = {'completed_at': None, 'estimated_end': date(2026, 12, 1)}
+    grace = unbinge.get_cooldown_grace_days()
+    assert unbinge._suggestion_start_date(sh, {'status': 'continuing'}, today) == date(2026, 12, 1) + timedelta(days=grace)
+    assert unbinge._suggestion_start_date(sh, {'status': 'ended'}, today) == date(2026, 12, 1)
+    assert unbinge._suggestion_start_date({'completed_at': None, 'estimated_end': None}, None, today) == today
+
+
+def test_a_show_that_finishes_after_halloween_gets_no_halloween_picks(harness, monkeypatch):
+    from datetime import date
+    today = date(2026, 10, 18)
+    monkeypatch.setattr(unbinge, 'today_local', lambda: today)
+    for i in range(60):
+        harness.make_episode(harness.vault / 'Long Runner', 'Long Runner', 1 + i // 20, 1 + i % 20, subdir=f'Season {1 + i // 20:02d}')
+    for n in ('Haunted House', 'Plain Crime'):
+        harness.make_show_in_pool(n, [(1, 1)])
+    genres = {'ANCHOR': ['crime'], 'Haunted House': ['horror'], 'Plain Crime': ['crime']}
+    _fake_tvdb(monkeypatch, genres)
+    sid = harness.add_show('Long Runner', release_days='0,1,2,3,4,5,6')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 1 WHERE id = ?", (sid,))
+        conn.commit()
+    res = unbinge.get_recommendations_for_show(sid, today=today)
+    assert res['starts'] >= '2026-12-01'
+    assert res['season'] in ('Christmas', 'Winter')
+    assert not any(r['season'] == 'Halloween' for r in res['recommendations'])
+
+
+def test_a_show_finishing_this_month_still_gets_halloween_picks(harness, monkeypatch):
+    from datetime import date
+    today = date(2026, 10, 18)
+    monkeypatch.setattr(unbinge, 'today_local', lambda: today)
+    harness.make_episode(harness.vault / 'Short One', 'Short One', 1, 1, subdir='Season 01')
+    harness.make_show_in_pool('Haunted House', [(1, 1)])
+    _fake_tvdb(monkeypatch, {'ANCHOR': ['crime'], 'Haunted House': ['horror']})
+    sid = harness.add_show('Short One', release_days='0,1,2,3,4,5,6')
+    with closing(unbinge.get_db()) as conn:
+        conn.execute(f"UPDATE {unbinge.TABLE_NAME} SET tvdb_id = 1 WHERE id = ?", (sid,))
+        conn.commit()
+    res = unbinge.get_recommendations_for_show(sid, today=today)
+    assert res['starts'] <= '2026-11-01'
+    assert res['season'] == 'Halloween'
+    assert any(r['season'] == 'Halloween' for r in res['recommendations'])

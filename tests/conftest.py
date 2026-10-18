@@ -134,6 +134,8 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(unbinge, 'POSTERS_DIR', str(tmp_path / 'config' / 'posters'))
     monkeypatch.setattr(unbinge, 'BACKUPS_DIR', str(tmp_path / 'config' / 'backups'))
     monkeypatch.setattr(unbinge, 'AUTH_PASSWORD', '')
+    monkeypatch.setattr(unbinge, 'TVDB_PARALLEL_WORKERS', 1)      # keeps the fakes deterministic
+    monkeypatch.setattr(unbinge, 'BACKGROUND_WARMING', False)
 
     # No network, no Plex, no Discord.
     monkeypatch.setattr(unbinge, 'trigger_plex_refresh', lambda *a, **k: None)

@@ -591,6 +591,10 @@ async function loadRecommendations() {
             hint.textContent = 'still checking ' + pending + ' show' + (pending === 1 ? '' : 's') + ' on tvdb - suggestions will sharpen as it goes…';
             hint.style.display = 'block';
             // each request indexes a batch and caches it; the retry above keeps going until the pool is covered
+        } else if (data.starts && data.starts > new Date(Date.now() + 8 * 864e5).toISOString().slice(0, 10)) {
+            const when = new Date(data.starts + 'T12:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+            hint.textContent = 'picked for when this show finishes, around ' + when + (data.season ? ' · ' + data.season.toLowerCase() + ' picks' : '') + (data.planned_with > 0 ? ' · planned together with ' + data.planned_with + ' other ending show' + (data.planned_with === 1 ? '' : 's') : '');
+            hint.style.display = 'block';
         } else if (data.planned_with > 0) {
             hint.textContent = 'planned together with ' + data.planned_with + ' other ending show' + (data.planned_with === 1 ? '' : 's') + ' - no show is offered twice.';
             hint.style.display = 'block';

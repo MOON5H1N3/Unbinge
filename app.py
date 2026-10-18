@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, date, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1194,7 +1195,7 @@ SUGGEST_RUNTIME_BONUS = 0.3           # episode length within 10 minutes of it
 SUGGEST_WATCHED_EXCLUDE_DAYS = 365    # finished this recently: not suggested at all
 SUGGEST_WATCHED_MEMORY_DAYS = 1095    # ...and discouraged for a couple of years after
 SUGGEST_WATCHED_PENALTY = 2.0
-SUGGEST_PROFILE_FETCH_CAP = 10        # TVDB profile lookups per request
+SUGGEST_PROFILE_FETCH_CAP = 24        # TVDB profile lookups per request (made in parallel)
 SUGGEST_ENRICH_TOP = 8                # candidates checked in detail for each pick
 SUGGEST_LIST_SIZE = 5
 
@@ -1715,6 +1716,131 @@ def _taste_affinity(shows_genres, generic):
     return {g: (num[g] / den[g]) * min(1.0, den[g] / 3.0) for g in num if den[g]}
 
 
+# ---------------------------------------------------------------------------
+# Warming the TVDB caches. Suggestions need genres for every pool folder and a
+# profile for the front-runners; each is one slow web call. They are made
+# several at a time, and a background thread fills the caches ahead of time
+# (at start-up and after the nightly run) so a page rarely waits on TVDB.
+# ---------------------------------------------------------------------------
+TVDB_PARALLEL_WORKERS = 8
+BACKGROUND_WARMING = True
+_warm_lock = threading.Lock()
+
+
+def _run_parallel(fn, items):
+    """Calls fn(item) for every item, several at a time, each on its own
+    thread (so fn should open its own database connection). Returns False
+    without doing anything when parallelism is switched off."""
+    items = list(items)
+    if TVDB_PARALLEL_WORKERS < 2 or len(items) < 2:
+        return False
+    tvdb_get_token()      # log in once up front rather than once per worker
+
+    def safe(item):
+        try:
+            fn(item)
+        except Exception as e:
+            log.warning("TVDB lookup failed for %r: %s", item, e)
+
+    with ThreadPoolExecutor(max_workers=min(TVDB_PARALLEL_WORKERS, len(items))) as pool:
+        list(pool.map(safe, items))
+    return True
+
+
+def _prefetch_pool_lookups(conn, folders, limit):
+    """Resolves up to `limit` uncached pool folders to TVDB ids, then fetches
+    genres for up to `limit` uncached ids, in parallel. The normal serial pass
+    that follows then finds those cached."""
+    def resolve(folder):
+        with closing(get_db()) as c:
+            resolve_pool_folder_tvdb_id(c, folder)
+
+    def genres(tvdb_id):
+        with closing(get_db()) as c:
+            get_genre_data_for_tvdb_id(c, tvdb_id)
+
+    todo = [f for f in folders if not _pool_folder_is_cached(conn, f)][:limit]
+    _run_parallel(resolve, todo)
+    ids, seen = [], set()
+    for f in folders:
+        row = conn.execute(f"SELECT tvdb_id FROM {POOL_TVDB_CACHE_TABLE} WHERE folder_name = ?", (f,)).fetchone()
+        tid = row['tvdb_id'] if row else None
+        if tid and tid not in seen and not _genre_is_cached(conn, tid):
+            seen.add(tid)
+            ids.append(tid)
+    _run_parallel(genres, ids[:limit])
+
+
+def _prefetch_profiles(conn, ctx, cands):
+    """Fetches the TVDB profiles that scoring is about to ask for, in
+    parallel, within the per-request budget."""
+    room = SUGGEST_PROFILE_FETCH_CAP - ctx['profile_fetches']
+    need, seen = [], set()
+    for c in cands:
+        if c['name'] in ctx['enrich'] or c['tvdb_id'] in seen:
+            continue
+        seen.add(c['tvdb_id'])
+        if get_profile_for_tvdb_id(conn, c['tvdb_id'], allow_fetch=False) is None:
+            need.append(c['tvdb_id'])
+    need = need[:max(room, 0)]
+
+    def profile(tvdb_id):
+        with closing(get_db()) as c:
+            get_profile_for_tvdb_id(c, tvdb_id, allow_fetch=True)
+
+    if _run_parallel(profile, need):
+        ctx['profile_fetches'] += len(need)
+
+
+def warm_suggestion_caches(max_seconds=900):
+    """Fills the genre and profile caches for the whole pool ahead of time.
+    One run at a time; stops after max_seconds. Safe to call repeatedly."""
+    if not _warm_lock.acquire(blocking=False):
+        return
+    try:
+        if not get_setting('tvdb_api_key', '').strip():
+            return
+        deadline = time.monotonic() + max_seconds
+        with closing(get_db()) as conn:
+            folders = [n for n, _p in list_pool_folders()]
+            while time.monotonic() < deadline:
+                before = sum(1 for f in folders if not _pool_folder_is_cached(conn, f))
+                _prefetch_pool_lookups(conn, folders, limit=80)
+                after = sum(1 for f in folders if not _pool_folder_is_cached(conn, f))
+                if after == 0 or after >= before:
+                    break
+            ids, seen = [], set()
+            for f in folders:
+                row = conn.execute(f"SELECT tvdb_id FROM {POOL_TVDB_CACHE_TABLE} WHERE folder_name = ?", (f,)).fetchone()
+                tid = row['tvdb_id'] if row else None
+                if tid and tid not in seen and get_profile_for_tvdb_id(conn, tid, allow_fetch=False) is None:
+                    seen.add(tid)
+                    ids.append(tid)
+
+            def profile(tvdb_id):
+                if time.monotonic() < deadline:
+                    with closing(get_db()) as c:
+                        get_profile_for_tvdb_id(c, tvdb_id, allow_fetch=True)
+            _run_parallel(profile, ids[:400])
+        log.info("Suggestion caches warmed.")
+    except Exception as e:
+        log.warning("Warming the suggestion caches failed: %s", e)
+    finally:
+        _warm_lock.release()
+
+
+def warm_suggestion_caches_async(delay=0):
+    """Runs warm_suggestion_caches on a background thread."""
+    if not BACKGROUND_WARMING:
+        return
+
+    def run():
+        if delay:
+            time.sleep(delay)
+        warm_suggestion_caches()
+    threading.Thread(target=run, name='warm-suggestions', daemon=True).start()
+
+
 def _build_suggestion_context(conn, today, leaving_ids):
     """Everything the suggestion scorer needs, gathered once per request:
     the resolved pool, what is on your schedule (minus the shows that are
@@ -1722,6 +1848,8 @@ def _build_suggestion_context(conn, today, leaving_ids):
     pool_shows = [n for n, _pool in list_pool_folders()]
     queued = {r['show_name'].lower() for r in conn.execute(
         f"SELECT show_name FROM {QUEUE_TABLE} WHERE triggered_at IS NULL").fetchall()}
+
+    _prefetch_pool_lookups(conn, [f for f in pool_shows if f.lower() not in queued], POOL_RECOMMENDATION_SCAN_CAP)
 
     candidates, fetches, unindexed = [], 0, 0
     for folder in pool_shows:
@@ -1900,7 +2028,7 @@ def _plan_suggestions(conn, ctx, anchors):
 
     anchors: [{'id', 'genres': set, 'profile': dict|None}]. Returns
     {anchor_id: [pick, ...]}."""
-    today, theme = ctx['today'], ctx['theme']
+    today = ctx['today']
     lineup_sets = list(ctx['lineup'])
     virtual_union = set().union(*lineup_sets) if lineup_sets else set()
     crowd = {c['name']: max((len(c['distinct'] & l) / len(c['distinct'] | l) for l in lineup_sets if c['distinct']), default=0.0)
@@ -1910,6 +2038,10 @@ def _plan_suggestions(conn, ctx, anchors):
     for rnd in range(SUGGEST_LIST_SIZE):
         last = rnd == SUGGEST_LIST_SIZE - 1
         for a in anchors:
+            # The season that counts is the one the new show will start in,
+            # not today's: a Halloween pick for a show that finishes in
+            # December would arrive after Halloween.
+            theme = a['theme'] if 'theme' in a else ctx['theme']
             aset = set(a['genres'])
             scored = []
             for c in ctx['candidates']:
@@ -1941,6 +2073,7 @@ def _plan_suggestions(conn, ctx, anchors):
             if seasonal_used[a['id']] >= SEASONAL_MAX_SLOTS:
                 pool = [s for s in pool if not s['seasonal']] or pool
             pool.sort(key=lambda s: -s['score'])
+            _prefetch_profiles(conn, ctx, [s['c'] for s in pool[:SUGGEST_ENRICH_TOP]])
             for s in pool[:SUGGEST_ENRICH_TOP]:
                 info = _enrich_candidate(conn, ctx, s['c'])
                 s['info'] = info
@@ -1983,7 +2116,21 @@ def _plan_suggestions(conn, ctx, anchors):
     return results
 
 
-def _suggestion_anchors(conn, shows_by_id, ids):
+def _suggestion_start_date(sh, profile, today):
+    """When a show queued after `sh` would begin: once `sh` has finished and
+    left (straight away if TVDB says it has ended, otherwise after the
+    cooldown wait). A show already cooling down starts when that wait is over.
+    Falls back to today when the end can't be worked out."""
+    if sh.get('completed_at'):
+        return max(today, cooldown_graduation_date(sh['completed_at']) or today)
+    end = sh.get('estimated_end')
+    if not end:
+        return today
+    ended = bool(profile) and profile.get('status') == 'ended'
+    return max(today, end + (timedelta(0) if ended else timedelta(days=get_cooldown_grace_days())))
+
+
+def _suggestion_anchors(conn, shows_by_id, ids, today=None):
     """Anchor dicts (genres + TVDB profile) for the given show ids, skipping
     any without a TVDB link or genres."""
     out = []
@@ -1994,7 +2141,10 @@ def _suggestion_anchors(conn, shows_by_id, ids):
         genres = get_genre_data_for_tvdb_id(conn, sh['tvdb_id'])['genres']
         if not genres:
             continue
-        out.append({'id': sid, 'genres': set(genres), 'profile': get_profile_for_tvdb_id(conn, sh['tvdb_id'], allow_fetch=False)})
+        profile = get_profile_for_tvdb_id(conn, sh['tvdb_id'], allow_fetch=False)
+        starts = _suggestion_start_date(sh, profile, today or today_local())
+        out.append({'id': sid, 'genres': set(genres), 'profile': profile,
+                    'starts': starts, 'theme': current_seasonal_theme(starts)})
     return out
 
 
@@ -2036,14 +2186,15 @@ def get_recommendations_for_show(show_id, today=None):
         shows_by_id = {sh['id']: sh for sh in load_shows()}
         ending_ids = [e['id'] for e in shows_ending_without_successor()]
         plan_ids = ending_ids if show_id in ending_ids else [show_id]
-        anchors = _suggestion_anchors(conn, shows_by_id, plan_ids)
+        anchors = _suggestion_anchors(conn, shows_by_id, plan_ids, today)
         if show_id not in {a['id'] for a in anchors}:
-            anchors = _suggestion_anchors(conn, shows_by_id, [show_id])
+            anchors = _suggestion_anchors(conn, shows_by_id, [show_id], today)
             plan_ids = [show_id]
 
         ctx = _build_suggestion_context(conn, today, set(plan_ids))
         results = _plan_suggestions(conn, ctx, anchors)
         picks = results.get(show_id, [])
+        this_anchor = next((a for a in anchors if a['id'] == show_id), {})
 
         # Remember what was shown, once per show per week (fatigue).
         week = ctx['this_week']
@@ -2064,7 +2215,8 @@ def get_recommendations_for_show(show_id, today=None):
             'recommendations': picks,
             'dismissed': ctx['hidden'],
             'planned_with': len(anchors) - 1 if len(anchors) > 1 else 0,
-            'season': ctx['theme']['label'] if ctx['theme'] else None,
+            'season': (this_anchor['theme'] or {}).get('label') if this_anchor.get('theme') else None,
+            'starts': this_anchor['starts'].isoformat() if this_anchor.get('starts') else None,
             'scanned': ctx['resolved'],
             'pool_total': ctx['pool_total'],
             'unindexed': ctx['unindexed'],
@@ -4586,6 +4738,7 @@ def run_drip_job(force_show_id=None, skip_cooldown=False):
 
         if force_show_id is None and not dry_run:
             set_setting('last_job_run', now_local().isoformat())
+            warm_suggestion_caches_async()
             try:
                 run_auto_queue()
             except Exception as e:
@@ -4912,6 +5065,7 @@ if _should_start_background_work():
         log.info("Startup path reconciliation repaired %d path(s).", len(startup_repairs))
     start_scheduler()
     sync_discord_schedule_message_async()
+    warm_suggestion_caches_async(delay=20)
 
 
 # ---------------------------------------------------------------------------
