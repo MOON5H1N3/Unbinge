@@ -1894,3 +1894,35 @@ def test_a_show_finishing_this_month_still_gets_halloween_picks(harness, monkeyp
     assert res['starts'] <= '2026-11-01'
     assert res['season'] == 'Halloween'
     assert any(r['season'] == 'Halloween' for r in res['recommendations'])
+
+
+# ---- Sonarr setup checks / path reconcile ----
+
+def test_suggest_map_rule_copies_sibling_mapping():
+    rules = [('/media/A/tv', '/data/media/otherdrives/TV/tv')]
+    assert unbinge._suggest_map_rule('/media/A/animation', rules) == '/media/A/animation=/data/media/otherdrives/TV/animation'
+    assert unbinge._suggest_map_rule('/elsewhere/x', rules) == ''
+
+
+def test_setup_checks_flag_uncovered_folder_and_plex_target(harness):
+    mm = MagicMock()
+    mm.raise_for_status = lambda: None
+    mm.json = lambda: {'autoUnmonitorPreviouslyDownloadedEpisodes': False, 'deleteEmptyFolders': True}
+    shows = [{'name': 'Airing Show', 'airing': True}]
+    with patch.object(unbinge.requests, 'get', return_value=mm):
+        checks = unbinge.sonarr_setup_checks('http://x', 'k', '/nowhere=/else', 'plex', shows, 30)
+    by = {c['label']: c for c in checks}
+    assert by['new episodes']['status'] == 'warn'
+    assert by['sonarr speed']['status'] == 'warn'
+    assert by['sonarr: delete empty folders']['status'] == 'warn'
+    assert any(c['label'].startswith('path mapping') and c['status'] == 'warn' for c in checks)
+
+
+def test_setup_checks_vault_target_wants_unmonitor_on(harness):
+    mm = MagicMock()
+    mm.raise_for_status = lambda: None
+    mm.json = lambda: {'autoUnmonitorPreviouslyDownloadedEpisodes': False}
+    with patch.object(unbinge.requests, 'get', return_value=mm):
+        checks = unbinge.sonarr_setup_checks('http://x', 'k', '', 'vault', [], 1)
+    by = {c['label']: c for c in checks}
+    assert by['sonarr: unmonitor deleted episodes']['status'] == 'warn'

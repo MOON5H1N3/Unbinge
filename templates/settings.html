@@ -443,6 +443,18 @@ document.getElementById('test-sonarr-btn').addEventListener('click', async (e) =
             dg.textContent = data.report.mapping_diag;
             box.append(dg);
         }
+        (data.report.checks || []).forEach(ch => {
+            const row = document.createElement('div');
+            row.className = 'sonarr-row';
+            const dot = document.createElement('span');
+            dot.className = 'sonarr-dot sonarr-' + (ch.status === 'ok' ? 'ok' : ch.status === 'warn' ? 'path-differs' : 'none');
+            const name = document.createElement('span');
+            name.className = 'sonarr-row-name'; name.textContent = ch.label;
+            const det = document.createElement('span');
+            det.className = 'sonarr-row-detail'; det.textContent = ch.detail;
+            row.append(dot, name, det);
+            box.append(row);
+        });
         data.report.shows.forEach(sh => {
             const row = document.createElement('div');
             row.className = 'sonarr-row';

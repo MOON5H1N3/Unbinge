@@ -4739,6 +4739,7 @@ def run_drip_job(force_show_id=None, skip_cooldown=False):
         if force_show_id is None and not dry_run:
             set_setting('last_job_run', now_local().isoformat())
             warm_suggestion_caches_async()
+            reconcile_sonarr_paths_async(delay=120)
             try:
                 run_auto_queue()
             except Exception as e:
@@ -5269,16 +5270,27 @@ def sonarr_set_series_path(show_name, tvdb_id, old_path, new_path):
 
     headers = {'X-Api-Key': api_key}
     try:
-        all_series = sonarr_fetch_series(base, api_key)
-
         def norm(p):
             return (p or '').rstrip('/')
 
         matches, how = [], ''
-        for how, fn in sonarr_match_steps(show_name, tvdb_id, old_s):
-            matches = [x for x in all_series if fn(x)]
-            if matches:
-                break
+        # A single-series lookup by TVDB id is quick even when Sonarr takes
+        # minutes to list a big library, so it goes first.
+        if tvdb_id:
+            try:
+                quick = requests.get(f"{base}/api/v3/series", params={'tvdbId': tvdb_id}, headers=headers, timeout=(10, 30))
+                quick.raise_for_status()
+                found = quick.json()
+                if isinstance(found, list) and len(found) == 1:
+                    matches, how = found, 'TVDB id'
+            except (requests.RequestException, ValueError) as e:
+                log.info("Quick Sonarr lookup by TVDB id failed for '%s' (%s) - trying the full list.", show_name, e)
+        if not matches:
+            all_series = sonarr_fetch_series(base, api_key)
+            for how, fn in sonarr_match_steps(show_name, tvdb_id, old_s):
+                matches = [x for x in all_series if fn(x)]
+                if matches:
+                    break
         if len(matches) != 1:
             return 'skipped', (
                 f"no unambiguous Sonarr series for '{show_name}'" if not matches
@@ -5419,7 +5431,7 @@ def sonarr_match_series(all_series, show_name, tvdb_id, path):
     return None, '', 0
 
 
-def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=False):
+def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=False, with_checks=False):
     """Live check: Sonarr version plus, per active show, whether Unbinge can
     find its Sonarr series and whether the folder Sonarr has matches ours.
     Raises requests.RequestException / ValueError on connection problems."""
@@ -5427,7 +5439,9 @@ def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=Fal
     st = requests.get(f'{base}/api/v3/system/status', headers=headers, timeout=15)
     st.raise_for_status()
     version = (st.json() or {}).get('version', '?')
+    fetch_started = time.monotonic()
     all_series = sonarr_fetch_series(base, api_key, use_cache=use_cache)
+    fetch_seconds = time.monotonic() - fetch_started
 
     conn = get_db()
     try:
@@ -5446,7 +5460,8 @@ def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=Fal
             else:
                 state, detail = 'none', 'not found in sonarr'
             shows.append({'name': r['show_name'], 'state': state, 'detail': detail,
-                          'ours': ours, 'theirs': (series or {}).get('path', '')})
+                          'ours': ours, 'theirs': (series or {}).get('path', ''),
+                          'airing': ((series or {}).get('status') or '').lower() == 'continuing'})
     finally:
         conn.close()
     text = get_setting('sonarr_path_map', '') if mapping is None else mapping
@@ -5467,8 +5482,95 @@ def sonarr_status_report(base, api_key, mapping=None, target=None, use_cache=Fal
                     f"(rule has {best[n:n + 8]!r}, path has {vp[n:n + 8]!r}).")
     except Exception as e:
         log.warning("Sonarr mapping diagnosis failed: %s", e)
-    return {'version': version, 'series_count': len(all_series), 'shows': shows,
-            'mapping_rules': rules, 'mapping_diag': diag}
+    report = {'version': version, 'series_count': len(all_series), 'shows': shows,
+              'mapping_rules': rules, 'mapping_diag': diag}
+    if with_checks:
+        try:
+            report['checks'] = sonarr_setup_checks(base, api_key, text, target, shows, fetch_seconds)
+        except Exception as e:
+            log.warning("Sonarr setup checks failed: %s", e)
+            report['checks'] = []
+    return report
+
+
+
+def _suggest_map_rule(missing_dir, rules):
+    """A likely 'ours=theirs' line for a folder no rule covers, by copying how
+    a sibling folder (same parent) is mapped. '' when there is nothing to copy."""
+    parent = os.path.dirname(missing_dir.rstrip('/'))
+    for ours, theirs in rules:
+        if os.path.dirname(ours.rstrip('/')) == parent:
+            return f"{missing_dir}={os.path.dirname(theirs.rstrip('/'))}/{os.path.basename(missing_dir.rstrip('/'))}"
+    return ''
+
+
+def sonarr_setup_checks(base, api_key, mapping_text, target, shows, fetch_seconds):
+    """Settings and paths worth getting right on both ends, each as
+    {'label', 'status': ok|warn|info, 'detail'}. Read-only."""
+    checks = []
+    rules = []
+    for line in (mapping_text or '').splitlines():
+        if '=' in line:
+            ours, theirs = (part.strip().rstrip('/') for part in line.split('=', 1))
+            if ours:
+                rules.append((ours, theirs))
+
+    # 1. Every folder Unbinge moves shows between has to be one Sonarr can see.
+    folders = [('vault', VAULT_DIR), ('plex folder', PLEX_BASE_DIR), ('pool', POOL_DIR)]
+    if ANIMATION_POOL_DIR and os.path.normpath(ANIMATION_POOL_DIR) != os.path.normpath(POOL_DIR):
+        folders.append(('animation pool', ANIMATION_POOL_DIR))
+    for label, folder in folders:
+        folder = (folder or '').rstrip('/')
+        covered = any(folder == o or folder.startswith(o + '/') for o, _t in rules)
+        if covered or not rules:
+            continue
+        hint = _suggest_map_rule(folder, rules)
+        checks.append({'label': f'path mapping: {label}', 'status': 'warn',
+                       'detail': f"no rule covers {folder}, so Sonarr would be given a path it can't see."
+                                 + (f" Add this line: {hint}" if hint else '')})
+    if rules and not any(c['label'].startswith('path mapping') for c in checks):
+        checks.append({'label': 'path mapping', 'status': 'ok', 'detail': 'every folder Unbinge uses is covered by a rule'})
+
+    # 2. Where new episodes land.
+    airing = [x['name'] for x in shows if x.get('airing')]
+    if sonarr_target_field(target) == 'plex_path' and airing:
+        checks.append({'label': 'new episodes', 'status': 'warn',
+                       'detail': f"{len(airing)} show{'s are' if len(airing) != 1 else ' is'} still airing ({', '.join(airing[:3])}"
+                                 f"{'…' if len(airing) > 3 else ''}). With Sonarr pointed at the plex folder, each new episode "
+                                 "it downloads lands straight in Plex and skips the drip. Point Sonarr at the vault instead."})
+    elif airing:
+        checks.append({'label': 'new episodes', 'status': 'ok',
+                       'detail': 'Sonarr is pointed at the vault, so new episodes wait there for their turn'})
+
+    # 3. Sonarr's own setting that stops it re-downloading what Unbinge moved out.
+    try:
+        resp = requests.get(f'{base}/api/v3/config/mediamanagement', headers={'X-Api-Key': api_key}, timeout=15)
+        resp.raise_for_status()
+        mm = resp.json() or {}
+        auto = mm.get('autoUnmonitorPreviouslyDownloadedEpisodes')
+        if auto is not None:
+            if sonarr_target_field(target) == 'vault_path':
+                checks.append({'label': 'sonarr: unmonitor deleted episodes', 'status': 'ok' if auto else 'warn',
+                               'detail': 'on - episodes Unbinge moves out of the vault are not downloaded again' if auto else
+                               "off - once Unbinge moves an episode out of the vault, Sonarr sees it as missing and downloads it again. "
+                               "Turn on Settings > Media Management > Unmonitor Deleted Episodes."})
+            else:
+                checks.append({'label': 'sonarr: unmonitor deleted episodes', 'status': 'info',
+                               'detail': 'on' if auto else 'off (only matters when Sonarr is pointed at the vault)'})
+        for key, label, want, why in (('deleteEmptyFolders', 'sonarr: delete empty folders', False,
+                                       "on - Sonarr can delete a show's folder when Unbinge has moved everything out of it"),):
+            val = mm.get(key)
+            if val is not None and bool(val) != want:
+                checks.append({'label': label, 'status': 'warn', 'detail': why})
+    except (requests.RequestException, ValueError) as e:
+        checks.append({'label': 'sonarr: media management', 'status': 'info', 'detail': f"could not read Sonarr's settings ({e})"})
+
+    # 4. A slow Sonarr makes path updates time out, so new episodes go to the old folder.
+    if fetch_seconds >= 20:
+        checks.append({'label': 'sonarr speed', 'status': 'warn',
+                       'detail': f"listing the library took {fetch_seconds:.0f}s. Path updates can time out (Unbinge waits 90s); "
+                                 "a nightly check puts any missed ones right."})
+    return checks
 
 
 def sonarr_repoint_plan(base, api_key, mapping=None, target=None):
@@ -5532,6 +5634,67 @@ def api_sonarr_repoint():
     if failed:
         return jsonify({"status": "error", "message": msg + " Failed: " + ", ".join(failed[:5])}), 502
     return jsonify({"status": "success", "message": msg, "done": done})
+
+
+def sonarr_apply_path(base, api_key, series_id, new_path):
+    """Sets a Sonarr series' folder without moving anything. Raises
+    requests.RequestException / ValueError. Returns the path it replaced."""
+    headers = {'X-Api-Key': api_key}
+    full = requests.get(f"{base}/api/v3/series/{series_id}", headers=headers, timeout=30)
+    full.raise_for_status()
+    body = full.json()
+    previous = body.get('path')
+    body['path'] = new_path
+    put = requests.put(f"{base}/api/v3/series/{series_id}", params={'moveFiles': 'false'},
+                       headers=headers, json=body, timeout=(10, 120))
+    put.raise_for_status()
+    return previous
+
+
+def reconcile_sonarr_paths():
+    """Puts right any show whose Sonarr folder differs from where Unbinge
+    keeps it (a path update that timed out or failed earlier, a show Sonarr
+    was re-pointed on by hand). Runs nightly after the drip and shortly after
+    start-up; does nothing unless Sonarr is set up with path sync on.
+    Returns the number of shows it fixed."""
+    base = get_setting('sonarr_url', '').strip().rstrip('/')
+    key = get_setting('sonarr_api_key', '').strip()
+    if not base or not key or get_setting('sonarr_sync_paths', '1') != '1':
+        return 0
+    fixed = 0
+    try:
+        plan = sonarr_repoint_plan(base, key)
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Sonarr path check skipped - could not read Sonarr: %s", e)
+        return 0
+    for item in plan:
+        try:
+            previous = sonarr_apply_path(base, key, item['series_id'], item['to'])
+            with closing(get_db()) as conn:
+                log_history(conn, item['show_id'], item['name'], 'sonarr',
+                            f"Sonarr series path {previous} -> {item['to']} (put right by the nightly path check, no files moved)")
+                conn.commit()
+            fixed += 1
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Could not put Sonarr's path right for '%s': %s", item['name'], e)
+    if fixed:
+        _SONARR_SERIES_CACHE['data'] = None
+        log.info("Sonarr path check fixed %d show(s).", fixed)
+    return fixed
+
+
+def reconcile_sonarr_paths_async(delay=0):
+    if not BACKGROUND_WARMING:
+        return
+
+    def run():
+        if delay:
+            time.sleep(delay)
+        try:
+            reconcile_sonarr_paths()
+        except Exception as e:
+            log.warning("Sonarr path check failed: %s", e)
+    threading.Thread(target=run, name='sonarr-path-check', daemon=True).start()
 
 
 def _sonarr_creds_from_form():
@@ -5688,7 +5851,7 @@ def api_test_sonarr():
     if not base or not api_key:
         return jsonify({"status": "error", "message": "Sonarr URL and API key are both required."}), 400
     try:
-        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'))
+        report = sonarr_status_report(base, api_key, request.form.get('sonarr_path_map'), request.form.get('sonarr_target'), with_checks=True)
     except requests.RequestException as e:
         log.warning("Sonarr test connection failed: %s", e)
         return jsonify({"status": "error", "message": f"Could not reach Sonarr: {e}"}), 502
@@ -7856,6 +8019,9 @@ def delete_show(show_id):
 
     return redirect(url_for('index', flash=flash_msg, flash_kind=flash_kind))
 
+
+if _should_start_background_work():
+    reconcile_sonarr_paths_async(delay=60)
 
 if __name__ == '__main__':
     debug_mode = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
